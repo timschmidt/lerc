@@ -7,13 +7,14 @@ use lerc::{
     compute_lerc2_tiled_raw_byte_len, decode_lerc1, decode_lerc2_bands_supported,
     decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
     decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_constant,
-    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, finalize_lerc2_checksum,
-    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
-    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
-    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
-    write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
-    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
+    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_tiled_raw,
+    finalize_lerc2_checksum, get_lerc1_header_info, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
+    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
+    write_lerc2_one_sweep, write_lerc2_tiled_raw, BitMask, BitStuffer2, DataType, DecodeIntoSpec,
+    EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -520,6 +521,19 @@ fn main() {
                 0.5,
                 Some(black_box(&encode_mask)),
                 6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-tiled-raw-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_tiled_raw(
+                constant_encode_spec,
+                black_box(&encode_one_sweep_data),
+                0.0,
+                Some(black_box(&encode_mask)),
+                6,
+                2,
             )
             .unwrap(),
         );
