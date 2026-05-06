@@ -2019,7 +2019,11 @@ mod tests {
         let info = get_lerc_info(&out[..written as usize]).unwrap();
         assert!(decoded.header.has_no_data_values());
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
-        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+        assert_eq!(decoded.mask.count_valid_bits(), 5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
+        );
         assert_eq!(info.n_uses_no_data_value, 1);
     }
 

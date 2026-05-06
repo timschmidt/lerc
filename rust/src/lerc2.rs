@@ -789,8 +789,9 @@ pub fn encode_lerc2_one_sweep_bands(
 /// This helper carries version 6+ no-data metadata for bands whose
 /// `uses_no_data` entry is nonzero. The source data is expected to already
 /// contain the per-band no-data sentinel value wherever no-data should be
-/// preserved; this does not yet implement the C++ encoder's sentinel
-/// replacement heuristics.
+/// represented. Pixels whose every depth equals the sentinel are marked invalid;
+/// mixed-depth sentinel samples are remapped to an internal sentinel when needed
+/// and restored to the original sentinel during decode.
 pub fn encode_lerc2_one_sweep_bands_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -848,17 +849,6 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
             }
             None => None,
         };
-        let encode_mask = if band == 0 {
-            true
-        } else if spec.n_masks == 1 {
-            false
-        } else {
-            match (&mask, &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
-        };
         let n_blobs_more = if version >= 6 {
             i32::try_from(spec.n_bands - 1 - band)
                 .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
@@ -870,19 +860,58 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
             .filter(|&uses| uses != 0)
             .and_then(|_| no_data_values.and_then(|values| values.get(band).copied()))
             .map(|value| (value, value));
+        let band_data = &data[data_start..data_start + band_data_len];
+        let prepared = if let Some((_, no_data_orig)) = no_data {
+            Some(prepare_no_data_band_for_encode(
+                band_spec,
+                band_data,
+                mask.as_ref(),
+                no_data_orig,
+                max_z_error,
+            )?)
+        } else {
+            None
+        };
+        let prepared_data = prepared
+            .as_ref()
+            .map(|prepared| prepared.data.as_slice())
+            .unwrap_or(band_data);
+        let prepared_mask = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.mask.as_ref())
+            .or(mask.as_ref());
+        let prepared_no_data = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.no_data)
+            .or(no_data);
+        let encode_mask = if band == 0 {
+            true
+        } else if spec.n_masks == 1 && prepared.is_none() {
+            false
+        } else {
+            match (prepared_mask, &previous_mask) {
+                (Some(mask), Some(previous)) => mask != previous,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        };
+        let encode_band_spec = EncodeSpec {
+            n_masks: usize::from(prepared_mask.is_some()),
+            ..band_spec
+        };
 
         let band_blob = encode_lerc2_one_sweep_band(
-            band_spec,
-            &data[data_start..data_start + band_data_len],
+            encode_band_spec,
+            prepared_data,
             max_z_error,
-            mask.as_ref(),
+            prepared_mask,
             version,
             n_blobs_more,
             encode_mask,
-            no_data,
+            prepared_no_data,
         )?;
         blob.extend_from_slice(&band_blob);
-        previous_mask = mask;
+        previous_mask = prepared_mask.cloned();
     }
 
     Ok(blob)
@@ -2073,6 +2102,182 @@ fn data_values_are_integer(data_type: DataType, data: &[u8]) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+struct PreparedNoDataBand {
+    data: Vec<u8>,
+    mask: Option<BitMask>,
+    no_data: Option<(f64, f64)>,
+}
+
+fn prepare_no_data_band_for_encode(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    no_data_orig: f64,
+    max_z_error: f64,
+) -> Result<PreparedNoDataBand> {
+    let mut data = data.to_vec();
+    let mut mask = effective_encode_mask(spec, mask)?;
+    let value_size = spec.data_type.size_in_bytes();
+    let no_data_orig = cast_no_data_value(spec.data_type, no_data_orig)?;
+    let mut min_valid = f64::INFINITY;
+    let mut max_valid = f64::NEG_INFINITY;
+    let mut need_no_data = false;
+    let mut modified_mask = false;
+
+    for row in 0..spec.n_rows {
+        for col in 0..spec.n_cols {
+            let pixel_idx = row * spec.n_cols + col;
+            if !mask.is_valid(pixel_idx)? {
+                continue;
+            }
+
+            let mut no_data_count = 0usize;
+            for depth in 0..spec.n_depth {
+                let offset = (pixel_idx * spec.n_depth + depth) * value_size;
+                let value =
+                    read_value_from_bytes(spec.data_type, &data[offset..offset + value_size]);
+                if values_equal_for_no_data(spec.data_type, value, no_data_orig) {
+                    no_data_count += 1;
+                } else {
+                    min_valid = min_valid.min(value);
+                    max_valid = max_valid.max(value);
+                }
+            }
+
+            if no_data_count == spec.n_depth {
+                mask.set_invalid(pixel_idx)?;
+                modified_mask = true;
+            } else if no_data_count > 0 {
+                need_no_data = true;
+            }
+        }
+    }
+
+    if !need_no_data {
+        return Ok(PreparedNoDataBand {
+            data,
+            mask: Some(mask).filter(|_| modified_mask),
+            no_data: None,
+        });
+    }
+
+    let no_data_internal = choose_internal_no_data_value(
+        spec.data_type,
+        no_data_orig,
+        min_valid,
+        max_valid,
+        max_z_error,
+    )?;
+    if !values_equal_for_no_data(spec.data_type, no_data_internal, no_data_orig) {
+        replace_no_data_value(spec, &mut data, &mask, no_data_orig, no_data_internal)?;
+    }
+
+    Ok(PreparedNoDataBand {
+        data,
+        mask: Some(mask),
+        no_data: Some((no_data_internal, no_data_orig)),
+    })
+}
+
+fn replace_no_data_value(
+    spec: EncodeSpec,
+    data: &mut [u8],
+    mask: &BitMask,
+    old_value: f64,
+    new_value: f64,
+) -> Result<()> {
+    let value_size = spec.data_type.size_in_bytes();
+    let new_bytes = encode_value_as_bytes(spec.data_type, new_value);
+    for row in 0..spec.n_rows {
+        for col in 0..spec.n_cols {
+            let pixel_idx = row * spec.n_cols + col;
+            if !mask.is_valid(pixel_idx)? {
+                continue;
+            }
+            for depth in 0..spec.n_depth {
+                let offset = (pixel_idx * spec.n_depth + depth) * value_size;
+                let value =
+                    read_value_from_bytes(spec.data_type, &data[offset..offset + value_size]);
+                if values_equal_for_no_data(spec.data_type, value, old_value) {
+                    data[offset..offset + value_size].copy_from_slice(&new_bytes);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn choose_internal_no_data_value(
+    data_type: DataType,
+    no_data_orig: f64,
+    min_valid: f64,
+    max_valid: f64,
+    max_z_error: f64,
+) -> Result<f64> {
+    if !min_valid.is_finite() || !max_valid.is_finite() {
+        return Ok(no_data_orig);
+    }
+
+    let (type_min, type_max) = data_type_range(data_type);
+    let int_type = (data_type as i32) < (DataType::Float as i32);
+    let dist = if int_type {
+        max_z_error.max(0.5).floor() + 1.0
+    } else {
+        (2.0 * max_z_error).max(0.0001)
+    };
+    if no_data_orig < min_valid - dist || no_data_orig > max_valid + dist {
+        return Ok(no_data_orig);
+    }
+
+    let below = min_valid - dist;
+    if below >= type_min {
+        return cast_no_data_value(data_type, below);
+    }
+
+    let above = max_valid + dist;
+    if above <= type_max {
+        return cast_no_data_value(data_type, above);
+    }
+
+    Err(LercError::Unsupported(
+        "Lerc2 no-data encode could not find an internal sentinel",
+    ))
+}
+
+fn cast_no_data_value(data_type: DataType, value: f64) -> Result<f64> {
+    let (min_value, max_value) = data_type_range(data_type);
+    if value < min_value || value > max_value {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data value is outside the data type range",
+        ));
+    }
+    Ok(read_value_from_bytes(
+        data_type,
+        &encode_value_as_bytes(data_type, value),
+    ))
+}
+
+fn values_equal_for_no_data(data_type: DataType, lhs: f64, rhs: f64) -> bool {
+    if matches!(data_type, DataType::Float | DataType::Double) {
+        lhs.to_bits() == rhs.to_bits()
+    } else {
+        lhs == rhs
+    }
+}
+
+fn data_type_range(data_type: DataType) -> (f64, f64) {
+    match data_type {
+        DataType::Char => (i8::MIN as f64, i8::MAX as f64),
+        DataType::UChar => (u8::MIN as f64, u8::MAX as f64),
+        DataType::Short => (i16::MIN as f64, i16::MAX as f64),
+        DataType::UShort => (u16::MIN as f64, u16::MAX as f64),
+        DataType::Int => (i32::MIN as f64, i32::MAX as f64),
+        DataType::UInt => (u32::MIN as f64, u32::MAX as f64),
+        DataType::Float => (f32::MIN as f64, f32::MAX as f64),
+        DataType::Double => (f64::MIN, f64::MAX),
+    }
 }
 
 fn validate_decode_into_spec(spec: DecodeIntoSpec, has_mask_output: bool) -> Result<()> {
@@ -4215,12 +4420,49 @@ mod tests {
         assert!(decoded.header.has_no_data_values());
         assert_eq!(decoded.header.no_data_val, 255.0);
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
-        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+        assert_eq!(decoded.mask.count_valid_bits(), 5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
+        );
         assert_eq!(no_data.uses_no_data, [1]);
         assert_eq!(no_data.no_data_values, [255.0]);
         assert_eq!(
             get_lerc2_data_ranges(&blob).unwrap_err(),
             LercError::HasNoData
+        );
+    }
+
+    #[test]
+    fn encodes_one_sweep_lerc2_no_data_with_internal_sentinel_remap() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 5, 5, 3, 4, 5, 6, 7, 8, 9, 10];
+        let blob = encode_lerc2_one_sweep_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[5.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 0.0);
+        assert_eq!(decoded.header.no_data_val_orig, 5.0);
+        assert_eq!(decoded.mask.count_valid_bits(), 5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 9, 10])
         );
     }
 
