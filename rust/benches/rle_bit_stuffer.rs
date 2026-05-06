@@ -5,13 +5,13 @@ use lerc::{
     compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
     compute_lerc2_min_max_ranges_byte_len, decode_lerc1, decode_lerc2_bands_supported,
     decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_typed_values, finalize_lerc2_checksum,
-    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
-    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
-    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
-    write_lerc2_mask, write_lerc2_min_max_ranges, BitMask, BitStuffer2, DataType, DecodeIntoSpec,
-    EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
+    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_constant,
+    finalize_lerc2_checksum, get_lerc1_header_info, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
+    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
+    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -81,6 +81,14 @@ fn main() {
         n_cols: 3,
         n_rows: 2,
         n_bands: 2,
+        n_masks: 1,
+    };
+    let constant_encode_spec = EncodeSpec {
+        data_type: DataType::UChar,
+        n_depth: 2,
+        n_cols: 3,
+        n_rows: 2,
+        n_bands: 1,
         n_masks: 1,
     };
     let encode_header = HeaderInfo {
@@ -430,6 +438,18 @@ fn main() {
                 black_box(&encode_header),
                 black_box(&encode_ranges),
                 black_box(&mut encode_range_bytes),
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-constant-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_constant(
+                constant_encode_spec,
+                7.0,
+                0.5,
+                Some(black_box(&encode_mask)),
+                6,
             )
             .unwrap(),
         );

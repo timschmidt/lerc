@@ -10,7 +10,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 //! Lerc2 metadata readers and supported-subset decoders.
 
-use crate::types::{DataType, LercError, Result};
+use crate::types::{DataType, EncodeSpec, LercError, Result};
 use crate::{decode_lerc1, decode_typed_values, read_lerc1_z_stats, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
 
@@ -538,6 +538,100 @@ pub fn write_lerc2_min_max_ranges(
         writer.write_bytes(&encode_value_as_bytes(header.data_type, value))?;
     }
     Ok(writer.pos)
+}
+
+/// Encodes a single-band constant Lerc2 blob.
+///
+/// This is the first narrow encode path: all valid pixels and depths are
+/// represented by the same scalar value, so the blob contains only a header and
+/// mask section. The returned blob is finalized with a valid checksum for
+/// version 3 and newer.
+pub fn encode_lerc2_constant(
+    spec: EncodeSpec,
+    value: f64,
+    max_z_error: f64,
+    mask: Option<&BitMask>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    spec.validate()?;
+    if spec.n_bands != 1 {
+        return Err(LercError::WrongParam(
+            "constant Lerc2 encode currently supports one band",
+        ));
+    }
+    if spec.n_masks > 1 {
+        return Err(LercError::WrongParam(
+            "constant Lerc2 encode mask count must be 0 or 1",
+        ));
+    }
+    if max_z_error < 0.0 {
+        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
+    }
+    if !(0..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam("unsupported Lerc2 encode version"));
+    }
+    if version < 4 && spec.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 encode can only store depth 1",
+        ));
+    }
+    if mask.is_some() && spec.n_masks == 0 {
+        return Err(LercError::WrongParam(
+            "constant Lerc2 encode mask count must be nonzero when a mask is supplied",
+        ));
+    }
+
+    let total_pixels = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam("Lerc2 encode pixel count overflow"))?;
+    let num_valid_pixel = match mask {
+        Some(mask) => {
+            if mask.cols() != spec.n_cols || mask.rows() != spec.n_rows {
+                return Err(LercError::WrongParam(
+                    "Lerc2 encode mask dimensions do not match spec",
+                ));
+            }
+            mask.count_valid_bits()
+        }
+        None => total_pixels,
+    };
+
+    let mut header = HeaderInfo {
+        version,
+        checksum: 0,
+        n_rows: spec.n_rows as i32,
+        n_cols: spec.n_cols as i32,
+        n_depth: spec.n_depth as i32,
+        num_valid_pixel: num_valid_pixel as i32,
+        micro_block_size: 8,
+        blob_size: 1,
+        n_blobs_more: 0,
+        b_pass_no_data_values: 0,
+        b_is_int: u8::from(value.fract() == 0.0),
+        b_reserved_3: 0,
+        b_reserved_4: 0,
+        data_type: spec.data_type,
+        max_z_error,
+        z_min: value,
+        z_max: value,
+        no_data_val: 0.0,
+        no_data_val_orig: 0.0,
+        header_size: compute_lerc2_header_byte_len(version)?,
+    };
+
+    let mask_len = compute_lerc2_mask_byte_len(&header, mask, mask.is_some())?;
+    header.blob_size = header
+        .header_size
+        .checked_add(mask_len)
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or(LercError::WrongParam("Lerc2 constant blob size overflow"))?;
+
+    let mut blob = vec![0; header.blob_size as usize];
+    let header_len = write_lerc2_header(&header, &mut blob)?;
+    write_lerc2_mask(&header, mask, mask.is_some(), &mut blob[header_len..])?;
+    finalize_lerc2_checksum(&mut blob)?;
+    Ok(blob)
 }
 
 /// Reads and decodes the Lerc2 mask section.
@@ -2403,15 +2497,16 @@ mod tests {
         compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
         compute_lerc2_min_max_ranges_byte_len, decode_lerc2_bands_supported,
         decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-        decode_lerc_supported_to_f64, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
-        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
-        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, DecodeIntoSpec,
-        HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        decode_lerc_supported_to_f64, encode_lerc2_constant, finalize_lerc2_checksum,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
+        DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        FILE_KEY,
     };
-    use crate::{BitMask, BitStuffer2, DataType, DecodedData, LercError, Rle};
+    use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
     use std::path::PathBuf;
 
@@ -3297,6 +3392,101 @@ mod tests {
         assert_eq!(finalize_lerc2_checksum(&mut blob).unwrap(), 0);
         assert_eq!(blob, before);
         assert_eq!(validate_lerc2_checksum(&blob).unwrap().version, 2);
+    }
+
+    #[test]
+    fn encodes_constant_lerc2_blob_all_valid() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let blob = encode_lerc2_constant(spec, 7.0, 0.5, None, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 6);
+        assert_eq!(decoded.header.n_depth, 2);
+        assert_eq!(decoded.header.num_valid_pixel, 6);
+        assert_eq!(decoded.header.z_min, 7.0);
+        assert_eq!(decoded.header.z_max, 7.0);
+        assert_eq!(decoded.mask.count_valid_bits(), 6);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(
+            validate_lerc2_checksum(&blob).unwrap().blob_size as usize,
+            blob.len()
+        );
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![7; spec.n_cols * spec.n_rows * spec.n_depth])
+        );
+    }
+
+    #[test]
+    fn encodes_constant_lerc2_blob_with_partial_mask() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let blob = encode_lerc2_constant(spec, -2.5, 0.0, Some(&mask), 4).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 4);
+        assert_eq!(decoded.header.num_valid_pixel, 4);
+        assert_eq!(decoded.mask, mask);
+        assert_eq!(
+            decoded.data,
+            DecodedData::Float(vec![-2.5, 0.0, -2.5, -2.5, -2.5, 0.0])
+        );
+        assert_eq!(
+            validate_lerc2_checksum(&blob).unwrap().checksum,
+            decoded.header.checksum
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_constant_lerc2_encode_inputs() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        assert_eq!(
+            encode_lerc2_constant(spec, 1.0, -1.0, None, 6).unwrap_err(),
+            LercError::WrongParam("max_z_error must be nonnegative")
+        );
+        assert_eq!(
+            encode_lerc2_constant(spec, 1.0, 0.0, None, 3).unwrap_err(),
+            LercError::WrongParam("pre-v4 Lerc2 encode can only store depth 1")
+        );
+
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        assert_eq!(
+            encode_lerc2_constant(spec, 1.0, 0.0, Some(&mask), 6).unwrap_err(),
+            LercError::WrongParam(
+                "constant Lerc2 encode mask count must be nonzero when a mask is supplied"
+            )
+        );
+
+        let multi_band = EncodeSpec {
+            n_bands: 2,
+            n_masks: 1,
+            ..spec
+        };
+        assert_eq!(
+            encode_lerc2_constant(multi_band, 1.0, 0.0, None, 6).unwrap_err(),
+            LercError::WrongParam("constant Lerc2 encode currently supports one band")
+        );
     }
 
     #[test]
