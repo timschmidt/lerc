@@ -153,6 +153,11 @@ fn main() {
     let mut ffi_decode_double_4d_mask = vec![0; 6];
     let mut ffi_decode_double_4d_uses_no_data = vec![0; 1];
     let mut ffi_decode_double_4d_no_data_values = vec![0.0f64; 1];
+    let ffi_constant_encode_data = [7u8; 12];
+    let ffi_constant_encode_mask = [1u8, 0, 1, 1, 1, 1];
+    let mut ffi_constant_encode_size = 0u32;
+    let mut ffi_constant_encode_out = [0u8; 128];
+    let mut ffi_constant_encode_written = 0u32;
     let mut ffi_float_fixture_data = vec![0.0f32; 160_000];
     let mut ffi_float_fixture_mask = vec![0; 160_000];
     let mut ffi_float_fixture_double_data = vec![0.0f64; 160_000];
@@ -453,6 +458,42 @@ fn main() {
             )
             .unwrap(),
         );
+    });
+    bench("ffi-compute-size-constant-encode-v6", 100_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_computeCompressedSizeForVersion(
+                black_box(ffi_constant_encode_data.as_ptr().cast()),
+                6,
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                1,
+                black_box(ffi_constant_encode_mask.as_ptr()),
+                0.5,
+                black_box(&mut ffi_constant_encode_size),
+            )
+        });
+    });
+    bench("ffi-constant-encode-v6", 100_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_encodeForVersion(
+                black_box(ffi_constant_encode_data.as_ptr().cast()),
+                6,
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                1,
+                black_box(ffi_constant_encode_mask.as_ptr()),
+                0.5,
+                black_box(ffi_constant_encode_out.as_mut_ptr()),
+                ffi_constant_encode_out.len() as u32,
+                black_box(&mut ffi_constant_encode_written),
+            )
+        });
     });
     bench("lerc2-supported-decode-into-v4-synthetic", 100_000, || {
         black_box(

@@ -11,9 +11,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! C ABI entry points backed by the safe Rust implementation.
 
 use crate::{
-    decode_lerc_supported_into, decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec,
-    EncodeSpec, ErrCode, LercError,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
+    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info,
+    BitMask, DataType, DecodeIntoSpec, EncodeSpec, ErrCode, LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -21,8 +21,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// C ABI equivalent of `lerc_computeCompressedSize`.
 ///
-/// Encoding is not ported yet. Valid calls currently zero `num_bytes` and
-/// return [`ErrCode::Failed`].
+/// Constant single-band inputs are encoded by the Rust constant Lerc2 path.
+/// Other valid inputs currently zero `num_bytes` and return
+/// [`ErrCode::Failed`].
 ///
 /// # Safety
 ///
@@ -64,8 +65,9 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
 
 /// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
 ///
-/// Encoding is not ported yet. Valid calls currently zero `num_bytes` and
-/// return [`ErrCode::Failed`].
+/// Constant single-band inputs are encoded by the Rust constant Lerc2 path.
+/// Other valid inputs currently zero `num_bytes` and return
+/// [`ErrCode::Failed`].
 ///
 /// # Safety
 ///
@@ -106,8 +108,9 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
 
 /// C ABI equivalent of `lerc_encode`.
 ///
-/// Encoding is not ported yet. Valid calls currently zero `n_bytes_written`
-/// and return [`ErrCode::Failed`].
+/// Constant single-band inputs are encoded by the Rust constant Lerc2 path.
+/// Other valid inputs currently zero `n_bytes_written` and return
+/// [`ErrCode::Failed`].
 ///
 /// # Safety
 ///
@@ -153,8 +156,9 @@ pub unsafe extern "C" fn lerc_encode(
 
 /// C ABI equivalent of `lerc_encodeForVersion`.
 ///
-/// Encoding is not ported yet. Valid calls currently zero `n_bytes_written`
-/// and return [`ErrCode::Failed`].
+/// Constant single-band inputs are encoded by the Rust constant Lerc2 path.
+/// Other valid inputs currently zero `n_bytes_written` and return
+/// [`ErrCode::Failed`].
 ///
 /// # Safety
 ///
@@ -520,7 +524,7 @@ pub unsafe extern "C" fn lerc_decodeToDouble_4D(
 
 unsafe fn lerc_compute_compressed_size_impl(
     p_data: *const c_void,
-    _codec_version: i32,
+    codec_version: i32,
     data_type: u32,
     n_depth: i32,
     n_cols: i32,
@@ -540,7 +544,7 @@ unsafe fn lerc_compute_compressed_size_impl(
         *num_bytes = 0;
     }
 
-    match validate_encode_shape(
+    let spec = match validate_encode_shape(
         p_data,
         data_type,
         n_depth,
@@ -551,19 +555,37 @@ unsafe fn lerc_compute_compressed_size_impl(
         p_valid_bytes,
         max_z_err,
     ) {
-        Ok(()) => {}
+        Ok(spec) => spec,
         Err(err) => return err as u32,
-    }
+    };
     if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
         return ErrCode::WrongParam as u32;
     }
 
-    ErrCode::Failed as u32
+    match try_encode_constant_blob(
+        p_data,
+        spec,
+        p_valid_bytes,
+        max_z_err,
+        normalize_encode_version(codec_version),
+    ) {
+        Ok(Some(blob)) => match u32::try_from(blob.len()) {
+            Ok(len) => {
+                unsafe {
+                    *num_bytes = len;
+                }
+                ErrCode::Ok as u32
+            }
+            Err(_) => ErrCode::BufferTooSmall as u32,
+        },
+        Ok(None) => ErrCode::Failed as u32,
+        Err(err) => err.err_code() as u32,
+    }
 }
 
 unsafe fn lerc_encode_impl(
     p_data: *const c_void,
-    _codec_version: i32,
+    codec_version: i32,
     data_type: u32,
     n_depth: i32,
     n_cols: i32,
@@ -585,7 +607,7 @@ unsafe fn lerc_encode_impl(
         *n_bytes_written = 0;
     }
 
-    match validate_encode_shape(
+    let spec = match validate_encode_shape(
         p_data,
         data_type,
         n_depth,
@@ -596,9 +618,9 @@ unsafe fn lerc_encode_impl(
         p_valid_bytes,
         max_z_err,
     ) {
-        Ok(()) => {}
+        Ok(spec) => spec,
         Err(err) => return err as u32,
-    }
+    };
     if p_out_buffer.is_null() || out_buffer_size == 0 {
         return ErrCode::WrongParam as u32;
     }
@@ -606,7 +628,26 @@ unsafe fn lerc_encode_impl(
         return ErrCode::WrongParam as u32;
     }
 
-    ErrCode::Failed as u32
+    match try_encode_constant_blob(
+        p_data,
+        spec,
+        p_valid_bytes,
+        max_z_err,
+        normalize_encode_version(codec_version),
+    ) {
+        Ok(Some(blob)) => {
+            if blob.len() > out_buffer_size as usize {
+                return ErrCode::BufferTooSmall as u32;
+            }
+            unsafe {
+                slice::from_raw_parts_mut(p_out_buffer, blob.len()).copy_from_slice(&blob);
+                *n_bytes_written = blob.len() as u32;
+            }
+            ErrCode::Ok as u32
+        }
+        Ok(None) => ErrCode::Failed as u32,
+        Err(err) => err.err_code() as u32,
+    }
 }
 
 fn validate_encode_shape(
@@ -619,7 +660,7 @@ fn validate_encode_shape(
     n_masks: i32,
     p_valid_bytes: *const u8,
     max_z_err: f64,
-) -> core::result::Result<(), ErrCode> {
+) -> core::result::Result<EncodeSpec, ErrCode> {
     if p_data.is_null()
         || n_depth <= 0
         || n_cols <= 0
@@ -651,7 +692,74 @@ fn validate_encode_shape(
     spec.validate().map_err(|err| err.err_code())?;
     spec.data_byte_len().map_err(|err| err.err_code())?;
     spec.mask_byte_len().map_err(|err| err.err_code())?;
-    Ok(())
+    Ok(spec)
+}
+
+fn normalize_encode_version(codec_version: i32) -> i32 {
+    if codec_version < 0 {
+        6
+    } else {
+        codec_version
+    }
+}
+
+unsafe fn try_encode_constant_blob(
+    p_data: *const c_void,
+    spec: EncodeSpec,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    version: i32,
+) -> crate::Result<Option<Vec<u8>>> {
+    if spec.n_bands != 1 {
+        return Ok(None);
+    }
+
+    let data = unsafe { slice::from_raw_parts(p_data.cast::<u8>(), spec.data_byte_len()?) };
+    let value = match constant_value_as_f64(spec.data_type, data)? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let mask = if spec.n_masks > 0 {
+        let mask_bytes = unsafe { slice::from_raw_parts(p_valid_bytes, spec.mask_byte_len()?) };
+        Some(BitMask::from_byte_mask(
+            mask_bytes,
+            spec.n_cols,
+            spec.n_rows,
+        )?)
+    } else {
+        None
+    };
+
+    encode_lerc2_constant(spec, value, max_z_err, mask.as_ref(), version).map(Some)
+}
+
+fn constant_value_as_f64(data_type: DataType, data: &[u8]) -> crate::Result<Option<f64>> {
+    let value_size = data_type.size_in_bytes();
+    if data.len() < value_size || data.len() % value_size != 0 {
+        return Err(LercError::WrongParam(
+            "encode data byte length does not match type",
+        ));
+    }
+    let first = scalar_value_as_f64(data_type, &data[..value_size]);
+    for chunk in data[value_size..].chunks_exact(value_size) {
+        if chunk != &data[..value_size] {
+            return Ok(None);
+        }
+    }
+    Ok(Some(first))
+}
+
+fn scalar_value_as_f64(data_type: DataType, bytes: &[u8]) -> f64 {
+    match data_type {
+        DataType::Char => i8::from_le_bytes(bytes[..1].try_into().unwrap()) as f64,
+        DataType::UChar => bytes[0] as f64,
+        DataType::Short => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as f64,
+        DataType::UShort => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as f64,
+        DataType::Int => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::UInt => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::Float => f32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::Double => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
+    }
 }
 
 fn validate_no_data_inputs(
@@ -1065,8 +1173,9 @@ mod tests {
         lerc_getDataRanges,
     };
     use crate::{
-        compute_checksum_fletcher32, get_lerc2_blob_info_arrays, get_lerc2_data_ranges, DataType,
-        ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        compute_checksum_fletcher32, decode_lerc2_supported, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, DataType, DecodedData, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1449,6 +1558,94 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn c_abi_compute_size_supports_constant_encode() {
+        let data = [7u8; 12];
+        let valid = [1, 0, 1, 1, 1, 1];
+        let mut num_bytes = 0u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                1,
+                valid.as_ptr(),
+                0.5,
+                &mut num_bytes,
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert!(num_bytes > 0);
+    }
+
+    #[test]
+    fn c_abi_encode_supports_constant_input() {
+        let data = [7u8; 12];
+        let valid = [1, 0, 1, 1, 1, 1];
+        let mut out = [0u8; 128];
+        let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                1,
+                valid.as_ptr(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.header.version, 6);
+        assert_eq!(decoded.header.num_valid_pixel, 5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![7, 7, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7])
+        );
+    }
+
+    #[test]
+    fn c_abi_encode_constant_reports_buffer_too_small() {
+        let data = [7u8; 6];
+        let mut out = [0u8; 8];
+        let mut written = 123u32;
+
+        let status = unsafe {
+            lerc_encode(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(status, ErrCode::BufferTooSmall as u32);
         assert_eq!(written, 0);
     }
 
