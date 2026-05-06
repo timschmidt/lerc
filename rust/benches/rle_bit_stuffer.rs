@@ -538,6 +538,19 @@ fn main() {
             .unwrap(),
         );
     });
+    bench("lerc2-tiled-raw-encode-mode0-v6", 100_000, || {
+        black_box(
+            encode_lerc2_tiled_raw(
+                constant_encode_spec,
+                black_box(&encode_one_sweep_data),
+                0.5,
+                Some(black_box(&encode_mask)),
+                6,
+                2,
+            )
+            .unwrap(),
+        );
+    });
     bench("lerc2-tiled-raw-bands-encode-v6", 100_000, || {
         black_box(
             encode_lerc2_tiled_raw_bands(

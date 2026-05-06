@@ -598,6 +598,14 @@ pub fn write_lerc2_one_sweep(
 /// flag per tile and depth, and one scalar value for each valid pixel in each
 /// depth plane.
 pub fn compute_lerc2_tiled_raw_byte_len(header: &HeaderInfo, mask: &BitMask) -> Result<usize> {
+    compute_lerc2_tiled_raw_byte_len_with_mode_prefix(header, mask, false)
+}
+
+fn compute_lerc2_tiled_raw_byte_len_with_mode_prefix(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    include_image_mode: bool,
+) -> Result<usize> {
     validate_lerc2_tiled_raw_for_write(header, mask, None)?;
 
     let n_depth = header.n_depth as usize;
@@ -619,7 +627,8 @@ pub fn compute_lerc2_tiled_raw_byte_len(header: &HeaderInfo, mask: &BitMask) -> 
         ))?;
 
     1usize
-        .checked_add(tile_flag_count)
+        .checked_add(usize::from(include_image_mode))
+        .and_then(|len| len.checked_add(tile_flag_count))
         .and_then(|len| len.checked_add(data_len))
         .ok_or(LercError::WrongParam(
             "Lerc2 raw tiled payload byte count overflow",
@@ -637,8 +646,19 @@ pub fn write_lerc2_tiled_raw(
     data: &[u8],
     output: &mut [u8],
 ) -> Result<usize> {
+    write_lerc2_tiled_raw_with_mode_prefix(header, mask, data, false, output)
+}
+
+fn write_lerc2_tiled_raw_with_mode_prefix(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &[u8],
+    include_image_mode: bool,
+    output: &mut [u8],
+) -> Result<usize> {
     validate_lerc2_tiled_raw_for_write(header, mask, Some(data))?;
-    let byte_len = compute_lerc2_tiled_raw_byte_len(header, mask)?;
+    let byte_len =
+        compute_lerc2_tiled_raw_byte_len_with_mode_prefix(header, mask, include_image_mode)?;
     if output.len() < byte_len {
         return Err(LercError::BufferTooSmall);
     }
@@ -653,6 +673,9 @@ pub fn write_lerc2_tiled_raw(
     let mut writer = Writer::new(output);
 
     writer.write_bytes(&[0])?;
+    if include_image_mode {
+        writer.write_bytes(&[0])?;
+    }
     for i_tile in 0..tiles_vert {
         let i0 = i_tile * mb_size;
         let i1 = (i0 + mb_size).min(n_rows);
@@ -760,8 +783,8 @@ pub fn encode_lerc2_one_sweep(
 /// This safe encode path writes version 4 and newer blobs only. It computes
 /// per-depth min/max ranges from the input bytes, writes the header, mask,
 /// range section, raw tiled payload, and final checksum. Header configurations
-/// that use the C++ Huffman-probe image mode prefix are not emitted by this
-/// helper yet.
+/// that use the C++ Huffman-probe envelope are emitted with image mode 0,
+/// keeping the tiled payload raw and uncompressed.
 pub fn encode_lerc2_tiled_raw(
     spec: EncodeSpec,
     data: &[u8],
@@ -840,11 +863,7 @@ fn encode_lerc2_tiled_raw_band(
         no_data_val_orig: 0.0,
         header_size,
     };
-    if try_huffman_int(&header) || try_huffman_float(&header) {
-        return Err(LercError::Unsupported(
-            "raw tiled Lerc2 encode does not emit Huffman-probe image mode prefixes yet",
-        ));
-    }
+    let include_image_mode = try_huffman_int(&header) || try_huffman_float(&header);
 
     let encode_mask = encode_partial_mask && mask.count_valid_bits() < spec.n_cols * spec.n_rows;
     let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
@@ -854,7 +873,7 @@ fn encode_lerc2_tiled_raw_band(
         0
     };
     let payload_len = if has_valid && header.z_min != header.z_max && !ranges.min_max_equal {
-        compute_lerc2_tiled_raw_byte_len(&header, &mask)?
+        compute_lerc2_tiled_raw_byte_len_with_mode_prefix(&header, &mask, include_image_mode)?
     } else {
         0
     };
@@ -873,7 +892,13 @@ fn encode_lerc2_tiled_raw_band(
         offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
     }
     if payload_len > 0 {
-        offset += write_lerc2_tiled_raw(&header, &mask, data, &mut blob[offset..])?;
+        offset += write_lerc2_tiled_raw_with_mode_prefix(
+            &header,
+            &mask,
+            data,
+            include_image_mode,
+            &mut blob[offset..],
+        )?;
     }
     debug_assert_eq!(offset, blob.len());
     finalize_lerc2_checksum(&mut blob)?;
@@ -4745,6 +4770,29 @@ mod tests {
     }
 
     #[test]
+    fn encodes_raw_tiled_lerc2_huffman_probe_mode_zero_prefix() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 3, 4];
+        let blob = encode_lerc2_tiled_raw(spec, &data, 0.5, None, 6, 2).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        let (header, _, _) = read_lerc2_min_max_ranges(&blob).unwrap();
+        let payload_offset = header.header_size
+            + compute_lerc2_mask_byte_len(&header, None, false).unwrap()
+            + compute_lerc2_min_max_ranges_byte_len(&header).unwrap();
+
+        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(&blob[payload_offset..payload_offset + 2], &[0, 0]);
+    }
+
+    #[test]
     fn encodes_one_sweep_lerc2_all_depths_constant_as_range_only_blob() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -5026,13 +5074,6 @@ mod tests {
             encode_lerc2_tiled_raw(spec, &[1, 2, 3], 0.0, None, 6, 2).unwrap_err(),
             LercError::WrongParam("Lerc2 encode data length mismatch")
         );
-        assert_eq!(
-            encode_lerc2_tiled_raw(spec, &data, 0.5, None, 6, 2).unwrap_err(),
-            LercError::Unsupported(
-                "raw tiled Lerc2 encode does not emit Huffman-probe image mode prefixes yet"
-            )
-        );
-
         let band_spec = EncodeSpec {
             n_bands: 2,
             n_masks: 0,
