@@ -1037,10 +1037,7 @@ fn auto_byte_huffman_max_z_error_is_lossless_byte(
     max_z_error: f64,
     masks: Option<&[u8]>,
 ) -> Result<bool> {
-    if max_z_error == 0.5 {
-        return Ok(true);
-    }
-    if max_z_error >= 0.0 || !matches!(spec.data_type, DataType::UChar | DataType::Char) {
+    if !matches!(spec.data_type, DataType::UChar | DataType::Char) {
         return Ok(false);
     }
 
@@ -2062,7 +2059,7 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
 pub fn encode_lerc2_constant(
     spec: EncodeSpec,
     value: f64,
-    max_z_error: f64,
+    mut max_z_error: f64,
     mask: Option<&BitMask>,
     version: i32,
 ) -> Result<Vec<u8>> {
@@ -2077,9 +2074,7 @@ pub fn encode_lerc2_constant(
             "constant Lerc2 encode mask count must be 0 or 1",
         ));
     }
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
+    max_z_error = normalize_constant_lerc2_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if !(0..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam("unsupported Lerc2 encode version"));
     }
@@ -3322,6 +3317,9 @@ fn normalize_lerc2_max_z_error_for_encode(
     max_z_error: f64,
 ) -> Result<f64> {
     if max_z_error >= 0.0 {
+        if is_integer_data_type(spec.data_type) {
+            return Ok(max_z_error.floor().max(0.5));
+        }
         if max_z_error > 0.0 && is_floating_point_data_type(spec.data_type) {
             return Ok(
                 try_raise_lerc2_float_max_z_error(spec, data, mask, max_z_error)?
@@ -3333,6 +3331,21 @@ fn normalize_lerc2_max_z_error_for_encode(
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     let inferred = try_lerc2_bit_plane_max_z_error(spec, data, mask, -max_z_error)?.unwrap_or(0.0);
     Ok(inferred.floor().max(0.5))
+}
+
+fn normalize_constant_lerc2_max_z_error_for_encode(
+    data_type: DataType,
+    max_z_error: f64,
+) -> Result<f64> {
+    if is_integer_data_type(data_type) {
+        return Ok(max_z_error.floor().max(0.5));
+    }
+    if max_z_error < 0.0 {
+        return Err(LercError::WrongParam(
+            "negative max_z_error bit-plane encode requires integer data",
+        ));
+    }
+    Ok(max_z_error)
 }
 
 fn is_integer_data_type(data_type: DataType) -> bool {
@@ -7319,9 +7332,10 @@ mod tests {
             n_bands: 1,
             n_masks: 0,
         };
+        let negative = encode_lerc2_constant(spec, 1.0, -1.0, None, 6).unwrap();
         assert_eq!(
-            encode_lerc2_constant(spec, 1.0, -1.0, None, 6).unwrap_err(),
-            LercError::WrongParam("max_z_error must be nonnegative")
+            get_lerc2_header_info(&negative).unwrap().header.max_z_error,
+            0.5
         );
         assert_eq!(
             encode_lerc2_constant(spec, 1.0, 0.0, None, 3).unwrap_err(),
@@ -7625,6 +7639,13 @@ mod tests {
         assert!(auto.len() < uncompressed.len());
         assert_eq!(decoded.data, DecodedData::UChar(data.clone()));
         assert_eq!(decoded.bytes_consumed, auto.len());
+
+        let zero_auto = encode_lerc2_auto(spec, &data, 0.0, None, 6).unwrap();
+        let zero_uncompressed = encode_lerc2_uncompressed(spec, &data, 0.0, None, 6).unwrap();
+        let zero_decoded = decode_lerc2_supported(&zero_auto).unwrap();
+        assert!(zero_auto.len() < zero_uncompressed.len());
+        assert_eq!(zero_decoded.header.max_z_error, 0.5);
+        assert_eq!(zero_decoded.data, DecodedData::UChar(data.clone()));
 
         let negative_auto = encode_lerc2_auto(spec, &data, -0.2, None, 6).unwrap();
         let negative_uncompressed = encode_lerc2_uncompressed(spec, &data, -0.2, None, 6).unwrap();
