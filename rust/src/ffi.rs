@@ -1161,10 +1161,48 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_get_blob_info_matches_safe_helper_for_lerc2_fixtures() {
+    fn c_abi_get_blob_info_fills_legacy_lerc1_arrays() {
+        let blob = fixture("world.lerc1");
+        let mut info = [123u32; BLOB_INFO_ARRAY_LEN];
+        let mut ranges = [123.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+
+        let status = unsafe {
+            lerc_getBlobInfo(
+                blob.as_ptr(),
+                blob.len() as u32,
+                info.as_mut_ptr(),
+                ranges.as_mut_ptr(),
+                info.len() as i32,
+                ranges.len() as i32,
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(
+            info,
+            [
+                0,
+                DataType::Float as u32,
+                1,
+                257,
+                257,
+                1,
+                65_025,
+                blob.len() as u32,
+                1,
+                1,
+                0,
+            ]
+        );
+        assert_eq!(ranges, [-27.458_635_330_200_195, 5474.172_851_562_5, 0.1]);
+    }
+
+    #[test]
+    fn c_abi_get_blob_info_matches_safe_helper_for_metadata_fixtures() {
         for fixture_name in [
             "bluemarble_256_256_3_byte.lerc2",
             "california_400_400_1_float.lerc2",
+            "world.lerc1",
         ] {
             let blob = fixture(fixture_name);
             let mut expected_info = [0u32; BLOB_INFO_ARRAY_LEN];
@@ -1244,7 +1282,29 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_get_data_ranges_matches_safe_helper_for_lerc2_fixtures() {
+    fn c_abi_get_data_ranges_fills_legacy_lerc1_arrays() {
+        let blob = fixture("world.lerc1");
+        let mut mins = [123.0f64; 1];
+        let mut maxs = [123.0f64; 1];
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                1,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mins, [-27.458_635_330_200_195]);
+        assert_eq!(maxs, [5474.172_851_562_5]);
+    }
+
+    #[test]
+    fn c_abi_get_data_ranges_matches_safe_helper_for_metadata_fixtures() {
         for (fixture_name, n_depth, n_bands) in [
             ("bluemarble_256_256_3_byte.lerc2", 1, 3),
             ("california_400_400_1_float.lerc2", 1, 1),

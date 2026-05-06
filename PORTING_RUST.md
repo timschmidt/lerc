@@ -36,7 +36,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added encode-side C ABI placeholders for `lerc_computeCompressedSize`, `lerc_computeCompressedSizeForVersion`, `lerc_computeCompressedSize_4D`, `lerc_encode`, `lerc_encodeForVersion`, and `lerc_encode_4D`; these validate arguments, zero output counters, and return `Failed` until the Rust encoder is ported.
 - Promoted the real `california_400_400_1_float.lerc2` fixture into supported-subset decode coverage, including safe Rust decode plus `lerc_decode` and `lerc_decodeToDouble` FFI output checks.
 - Configured the Rust crate to build `rlib`, `cdylib`, and `staticlib` outputs.
-- Added unit tests for RLE round trips, RLE boundary counters, pinned RLE literal/repeated byte streams, bit widths, LUT streams, bit-mask packing, pinned BitMask byte conversion, typed decoded values, checked decoded output copying, decoded `f64` conversion, C API-style decode-into validation, C API-style blob info arrays across Lerc2 fixtures and the Lerc1 fixture, encode-side C ABI placeholder validation, the `lerc_getBlobInfo`, `lerc_getDataRanges`, `lerc_decode`, `lerc_decodeToDouble`, `lerc_decode_4D`, and `lerc_decodeToDouble_4D` C ABI wrappers, Lerc1 fixture header parsing, Lerc1 count-mask decoding, Lerc1 z-stat decoding, Lerc1 data-range reporting, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, fixture data ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, integer and floating-point diff tiled simple/LUT/constant expansion, high-level supported decode dispatch, real fixture supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
+- Added unit tests for RLE round trips, RLE boundary counters, pinned RLE literal/repeated byte streams, bit widths, LUT streams, bit-mask packing, pinned BitMask byte conversion, typed decoded values, checked decoded output copying, decoded `f64` conversion, C API-style decode-into validation, C API-style blob info arrays across Lerc2 fixtures and the Lerc1 fixture, encode-side C ABI placeholder validation, the `lerc_getBlobInfo`, `lerc_getDataRanges`, `lerc_decode`, `lerc_decodeToDouble`, `lerc_decode_4D`, and `lerc_decodeToDouble_4D` C ABI wrappers, direct legacy Lerc1 C ABI blob-info and data-range array checks, Lerc1 fixture header parsing, Lerc1 count-mask decoding, Lerc1 z-stat decoding, Lerc1 data-range reporting, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, fixture data ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, integer and floating-point diff tiled simple/LUT/constant expansion, high-level supported decode dispatch, real fixture supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -54,7 +54,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - `decode_lerc2_supported_into` is a safe Rust internal equivalent of the output-buffer validation needed by `lerc_decode`: it requires `n_masks` to be 0, 1, or `n_bands`, rejects insufficient mask requests for blobs with masks, and returns `WrongParam` for shape/type mismatches.
 - `lerc_decodeToDouble` decodes through the native typed path first, then converts the decoded scalar values to `f64`, matching the C++ API's output type while keeping the Rust decode core typed.
 - `get_lerc2_blob_info_arrays` mirrors the truncation-tolerant output-array behavior of `lerc_getBlobInfo`, including zero-filling caller arrays and reporting `-1` quick ranges for multi-depth no-data blobs.
-- The Rust `lerc_getBlobInfo` C ABI currently supports Lerc2 metadata only. It validates null pointers and sizes like the C++ API, maps Rust errors to C status codes, and catches panics before returning `ErrCode::Failed`.
+- The Rust `lerc_getBlobInfo` C ABI currently supports Lerc2 metadata and the checked-in Lerc1 fixture path. It validates null pointers and sizes like the C++ API, maps Rust errors to C status codes, and catches panics before returning `ErrCode::Failed`.
 - The Rust `lerc_getDataRanges` C ABI currently supports Lerc2 metadata and the checked-in Lerc1 fixture path. It validates null pointers and caller capacity like the C++ API, maps Rust errors to C status codes, and catches panics before returning `ErrCode::Failed`.
 - The Rust `lerc_decode` C ABI currently supports the same non-Huffman Lerc2 subset as `decode_lerc2_supported_into`. It validates shape, data type, mask count, and raw output pointers like the C++ API, and returns `HasNoData` for regular non-4D decode when multi-depth no-data metadata is present.
 - The Rust `lerc_decodeToDouble` C ABI currently supports the same non-Huffman Lerc2 subset as `lerc_decode`, including the same regular non-4D `HasNoData` behavior.
@@ -75,12 +75,12 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
    - Assert Rust bit-packed bytes match C++ conversion from byte masks.
    - Assert Rust byte-mask output matches C++ `Lerc::Convert(const BitMask&, Byte*)`.
 3. Add C++ parity tests for `lerc_getBlobInfo`.
-   - Rust safe and C ABI blob-info array paths are now cross-checked across the checked-in Lerc2 fixtures.
+   - Rust safe and C ABI blob-info array paths are now cross-checked across the checked-in Lerc2 fixtures and `world.lerc1`.
    - Compare Rust `get_lerc_info` with C API output for all `testData/*.lerc2` fixtures.
    - Compare Rust `get_lerc2_blob_info_arrays` with C API `lerc_getBlobInfo` output arrays.
-   - Rust safe and C ABI data-range paths are now cross-checked across the checked-in no-data-free Lerc2 fixtures.
+   - Rust safe and C ABI data-range paths are now cross-checked across the checked-in no-data-free Lerc2 fixtures and `world.lerc1`.
    - Compare Rust `get_lerc2_data_ranges` and Rust `lerc_getDataRanges` with the C++ C API for no-data-free fixtures.
-   - Add direct C ABI tests for `lerc_getBlobInfo` and `lerc_getDataRanges` on `world.lerc1` once generated C++ fixture expectations are available.
+   - Broaden legacy coverage with generated C++ expectations for more Lerc1 tile and mask variants.
 4. Port decode-only Lerc2 block paths.
    - Add C++ parity tests for `decode_lerc2_supported` on synthetic and fixture blobs that avoid Huffman.
    - Add C++ parity tests for `decode_lerc2_bands_supported` on concatenated non-Huffman fixtures.
@@ -108,7 +108,7 @@ cargo bench --bench rle_bit_stuffer
 Last run in this branch:
 
 - `cargo check`: passed with `#![deny(missing_docs)]` enabled.
-- `cargo test`: passed, 93 unit tests.
+- `cargo test`: passed, 95 unit tests.
 - `cargo doc --no-deps`: passed and generated crate documentation.
 - `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, pre-v2.3 BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, decoded `f64` conversion through C ABI, Lerc1 header parsing, Lerc1 count-mask reading, Lerc1 z-stat reading, Lerc1 info aggregation, Lerc1 data-range aggregation, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 integer and floating-point diff tiled simple/LUT decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, real float fixture decode, v6 supported-subset no-data decode, C API-style supported decode-into-buffer validation, C ABI decode, C ABI decode-to-double, C ABI real float fixture decode, and C ABI 4D no-data decode variants.
 
