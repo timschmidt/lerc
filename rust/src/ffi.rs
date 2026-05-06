@@ -12,7 +12,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 use crate::{
     decode_lerc_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, DataType, DecodeIntoSpec,
+    get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec,
     DecodedData, ErrCode, LercError,
 };
 use core::ffi::c_void;
@@ -1088,17 +1088,9 @@ fn write_no_data_info(
     uses_no_data[..n_bands].fill(0);
     no_data_values[..n_bands].fill(0.0);
 
-    let mut offset = 0usize;
-    for i_band in 0..n_bands {
-        let header = get_lerc2_header_info(&blob[offset..])?.header;
-        uses_no_data[i_band] = u8::from(header.has_no_data_values());
-        no_data_values[i_band] = header.no_data_val_orig;
-        let blob_size = header.blob_size as usize;
-        if blob_size == 0 || blob_size > blob.len().saturating_sub(offset) {
-            return Err(LercError::BufferTooSmall);
-        }
-        offset += blob_size;
-    }
+    let info = get_lerc2_no_data_info(blob, n_bands)?;
+    uses_no_data[..n_bands].copy_from_slice(&info.uses_no_data);
+    no_data_values[..n_bands].copy_from_slice(&info.no_data_values);
 
     Ok(())
 }

@@ -280,6 +280,17 @@ pub struct DataRanges {
     pub bytes_consumed: usize,
 }
 
+/// Per-band Lerc2 no-data metadata for 4D decode wrappers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoDataInfo {
+    /// Per-band flags: `1` when the band carries no-data metadata, otherwise `0`.
+    pub uses_no_data: Vec<u8>,
+    /// Per-band original no-data sentinel values.
+    pub no_data_values: Vec<f64>,
+    /// Total number of bytes consumed while reading band headers.
+    pub bytes_consumed: usize,
+}
+
 /// Caller-provided output shape for supported decode-into operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeIntoSpec {
@@ -498,6 +509,36 @@ fn get_lerc1_data_ranges(blob: &[u8]) -> Result<DataRanges> {
         n_bands: 1,
         n_depth: 1,
         bytes_consumed: stats.bytes_consumed,
+    })
+}
+
+/// Reads per-band Lerc2 no-data metadata without decoding pixel values.
+///
+/// The returned arrays match the public 4D C API output shape: one flag and
+/// one original no-data sentinel per requested band.
+pub fn get_lerc2_no_data_info(blob: &[u8], n_bands: usize) -> Result<NoDataInfo> {
+    if n_bands == 0 {
+        return Err(LercError::WrongParam("band count must be positive"));
+    }
+
+    let mut uses_no_data = vec![0u8; n_bands];
+    let mut no_data_values = vec![0.0f64; n_bands];
+    let mut offset = 0usize;
+    for i_band in 0..n_bands {
+        let header = get_lerc2_header_info(&blob[offset..])?.header;
+        uses_no_data[i_band] = u8::from(header.has_no_data_values());
+        no_data_values[i_band] = header.no_data_val_orig;
+        let blob_size = header.blob_size as usize;
+        if blob_size == 0 || blob_size > blob.len().saturating_sub(offset) {
+            return Err(LercError::BufferTooSmall);
+        }
+        offset += blob_size;
+    }
+
+    Ok(NoDataInfo {
+        uses_no_data,
+        no_data_values,
+        bytes_consumed: offset,
     })
 }
 
@@ -2025,10 +2066,11 @@ mod tests {
     use super::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
         decode_lerc2_supported_into, decode_lerc_supported_into, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
-        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, DecodeIntoSpec,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        validate_lerc2_checksum, DecodeIntoSpec, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -3266,6 +3308,39 @@ mod tests {
         let err = get_lerc2_data_ranges(&blob).unwrap_err();
         assert_eq!(err, LercError::HasNoData);
         assert_eq!(err.err_code(), crate::ErrCode::HasNoData);
+    }
+
+    #[test]
+    fn reads_v6_no_data_info_for_single_and_concatenated_bands() {
+        let no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let plain_blob = synthetic_v4_one_sweep_blob(
+            DataType::UChar,
+            1,
+            &[1, 1, 1, 1, 1, 1],
+            &[1, 9],
+            &[1, 2, 3, 4, 5, 6],
+        );
+
+        let single = get_lerc2_no_data_info(&no_data_blob, 1).unwrap();
+        assert_eq!(single.uses_no_data, [1]);
+        assert_eq!(single.no_data_values, [255.0]);
+        assert_eq!(single.bytes_consumed, no_data_blob.len());
+
+        let mut concatenated = no_data_blob.clone();
+        concatenated.extend_from_slice(&plain_blob);
+        let multi = get_lerc2_no_data_info(&concatenated, 2).unwrap();
+        assert_eq!(multi.uses_no_data, [1, 0]);
+        assert_eq!(multi.no_data_values, [255.0, 0.0]);
+        assert_eq!(multi.bytes_consumed, concatenated.len());
+
+        assert_eq!(
+            get_lerc2_no_data_info(&concatenated, 0).unwrap_err(),
+            LercError::WrongParam("band count must be positive")
+        );
+        assert_eq!(
+            get_lerc2_no_data_info(&no_data_blob, 2).unwrap_err(),
+            LercError::BufferTooSmall
+        );
     }
 
     #[test]
