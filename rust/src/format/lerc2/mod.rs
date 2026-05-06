@@ -28,6 +28,14 @@ pub const BLOB_DATA_RANGE_ARRAY_LEN: usize = 3;
 const CHECKSUM_START_OFFSET: usize = FILE_KEY.len() + 4 + 4;
 #[allow(dead_code)]
 const FP_MAX_DELTA: u8 = 5;
+#[allow(dead_code)]
+const FPL_HUFFMAN_NORMAL: u8 = 0;
+#[allow(dead_code)]
+const FPL_HUFFMAN_RLE: u8 = 1;
+#[allow(dead_code)]
+const FPL_HUFFMAN_NO_ENCODING: u8 = 2;
+#[allow(dead_code)]
+const FPL_HUFFMAN_PACKBITS: u8 = 3;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2729,6 +2737,8 @@ pub fn decode_lerc2_supported_with_previous(
             if image_mode != 0 {
                 if try_huffman_int(&header) {
                     read_huffman_int_payload(&mut reader, &header, &mask_info.mask, image_mode)?
+                } else if try_huffman_float(&header) && image_mode == 3 {
+                    read_huffman_float_payload(&mut reader, &header)?
                 } else {
                     return Err(LercError::Unsupported(
                         "Lerc2 floating-point Huffman image modes are not ported yet",
@@ -4442,6 +4452,135 @@ fn write_huffman_symbol(
 }
 
 #[allow(dead_code)]
+fn extract_fpl_compressed_buffer(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    let (&mode, payload) = encoded.split_first().ok_or(LercError::BufferTooSmall)?;
+    match mode {
+        FPL_HUFFMAN_RLE => {
+            if payload.len() != 5 {
+                return Err(LercError::CorruptInput(
+                    "floating-point Huffman RLE payload has invalid length",
+                ));
+            }
+            let count = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+            if count != expected_len {
+                return Err(LercError::CorruptInput(
+                    "floating-point Huffman RLE count mismatch",
+                ));
+            }
+            Ok(vec![payload[0]; expected_len])
+        }
+        FPL_HUFFMAN_NO_ENCODING => {
+            if payload.len() != expected_len {
+                return Err(LercError::CorruptInput(
+                    "floating-point Huffman raw payload length mismatch",
+                ));
+            }
+            Ok(payload.to_vec())
+        }
+        FPL_HUFFMAN_PACKBITS => extract_fpl_packbits(payload, expected_len),
+        FPL_HUFFMAN_NORMAL => extract_fpl_normal_huffman(payload, expected_len),
+        _ => Err(LercError::CorruptInput(
+            "floating-point Huffman payload mode is invalid",
+        )),
+    }
+}
+
+#[allow(dead_code)]
+fn extract_fpl_packbits(payload: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(expected_len);
+    let mut reader = Reader::new(payload);
+    while reader.pos < payload.len() {
+        let control = reader.read_bytes(1)?[0];
+        if control <= 127 {
+            let count = control as usize + 1;
+            let literal = reader.read_bytes(count)?;
+            if out.len().saturating_add(count) > expected_len {
+                return Err(LercError::CorruptInput(
+                    "floating-point Huffman PackBits output is too long",
+                ));
+            }
+            out.extend_from_slice(literal);
+        } else {
+            let count = control as usize - 127;
+            let value = reader.read_bytes(1)?[0];
+            if out.len().saturating_add(count) > expected_len {
+                return Err(LercError::CorruptInput(
+                    "floating-point Huffman PackBits output is too long",
+                ));
+            }
+            out.resize(out.len() + count, value);
+        }
+    }
+    if out.len() != expected_len {
+        return Err(LercError::CorruptInput(
+            "floating-point Huffman PackBits output length mismatch",
+        ));
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn extract_fpl_normal_huffman(payload: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    let mut reader = Reader::new(payload);
+    let table = read_huffman_code_table(&mut reader, 5)?;
+    let mut bits = HuffmanBitReader::new(&reader.bytes[reader.pos..]);
+    let mut out = Vec::with_capacity(expected_len);
+    for _ in 0..expected_len {
+        let value = table.decode_symbol(&mut bits)?;
+        if !(0..=255).contains(&value) {
+            return Err(LercError::CorruptInput(
+                "floating-point Huffman symbol is outside byte range",
+            ));
+        }
+        out.push(value as u8);
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn read_fp_huffman_slice(
+    reader: &mut Reader<'_>,
+    data_type: DataType,
+    cols: usize,
+    rows: usize,
+) -> Result<Vec<u8>> {
+    let predictor_code = reader.read_bytes(1)?[0];
+    let predictor = FpPredictor::from_code(predictor_code).ok_or(LercError::CorruptInput(
+        "floating-point Huffman predictor code is invalid",
+    ))?;
+    let value_size = match data_type {
+        DataType::Float => 4,
+        DataType::Double => 8,
+        _ => {
+            return Err(LercError::Unsupported(
+                "floating-point Huffman slice requires float or double data",
+            ))
+        }
+    };
+    let expected_len = cols.checked_mul(rows).ok_or(LercError::CorruptInput(
+        "floating-point sample count overflow",
+    ))?;
+
+    let mut planes = Vec::with_capacity(value_size);
+    for _ in 0..value_size {
+        let byte_index = reader.read_bytes(1)?[0] as usize;
+        let byte_delta = reader.read_bytes(1)?[0];
+        if byte_delta > FP_MAX_DELTA {
+            return Err(LercError::CorruptInput(
+                "floating-point Huffman byte delta level is invalid",
+            ));
+        }
+        let compressed_size = reader.read_u32_le()? as usize;
+        let compressed = reader.read_bytes(compressed_size)?;
+        let extracted = extract_fpl_compressed_buffer(compressed, expected_len)?;
+        let restored = restore_fp_byte_delta_sequence(&extracted, byte_delta)?;
+        planes.push((byte_index, restored));
+    }
+
+    restore_fp_bytes_from_planes(&planes, data_type, cols, rows, predictor)
+}
+
+#[allow(dead_code)]
 fn restore_fp_byte_delta_sequence(data: &[u8], level: u8) -> Result<Vec<u8>> {
     if level > FP_MAX_DELTA {
         return Err(LercError::CorruptInput(
@@ -4762,6 +4901,17 @@ fn read_huffman_int_payload(
     }
     reader.pos = payload_start + bytes_consumed;
     Ok(out)
+}
+
+fn read_huffman_float_payload(reader: &mut Reader<'_>, header: &HeaderInfo) -> Result<Vec<u8>> {
+    let n_cols = header.n_cols as usize;
+    let n_rows = header.n_rows as usize;
+    let n_depth = header.n_depth as usize;
+    if n_depth == 1 {
+        read_fp_huffman_slice(reader, header.data_type, n_cols, n_rows)
+    } else {
+        read_fp_huffman_slice(reader, header.data_type, n_depth, n_cols * n_rows)
+    }
 }
 
 fn read_huffman_code_table(
@@ -5360,26 +5510,29 @@ impl<'a> Writer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, compute_lerc2_data_ranges_for_encode,
-        compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
-        compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-        compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
-        decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
-        encode_lerc2_byte_huffman_bands, encode_lerc2_byte_huffman_bands_with_no_data,
-        encode_lerc2_byte_huffman_with_no_data, encode_lerc2_constant, encode_lerc2_one_sweep,
-        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
-        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+        compute_checksum_fletcher32, compute_huffman_encode_table,
+        compute_lerc2_data_ranges_for_encode, compute_lerc2_header_byte_len,
+        compute_lerc2_mask_byte_len, compute_lerc2_min_max_ranges_byte_len,
+        compute_lerc2_one_sweep_byte_len, compute_lerc2_tiled_raw_byte_len,
+        decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+        decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
+        encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
+        encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
+        encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
+        encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-        encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
-        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data,
+        extract_fpl_compressed_buffer, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_fp_huffman_slice, read_lerc2_data_one_sweep, read_lerc2_mask,
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes, validate_lerc2_checksum,
-        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
-        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, MinMaxRanges,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        write_huffman_code_table, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
+        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo,
+        HuffmanBitWriter, MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -6394,6 +6547,193 @@ mod tests {
         assert_eq!(
             restore_fp_byte_delta_sequence(&[1, 2, 3], 6).unwrap_err(),
             LercError::CorruptInput("floating-point Huffman byte delta level is invalid")
+        );
+    }
+
+    fn encode_fpl_normal_huffman_payload(data: &[u8]) -> Vec<u8> {
+        let mut histo = [0usize; 256];
+        for &value in data {
+            histo[value as usize] += 1;
+        }
+        let table = compute_huffman_encode_table(&histo).unwrap().unwrap();
+        let mut out = vec![0];
+        write_huffman_code_table(&table, 5, &mut out).unwrap();
+        let mut bits = HuffmanBitWriter::new();
+        for &value in data {
+            let (len, code) = table.codes[value as usize];
+            bits.push_bits(code, len).unwrap();
+        }
+        out.extend_from_slice(&bits.finish(true));
+        out
+    }
+
+    #[test]
+    fn extracts_floating_point_huffman_wrapped_rle_raw_and_packbits_payloads() {
+        let mut rle = vec![1, 0xab];
+        rle.extend_from_slice(&5u32.to_le_bytes());
+        assert_eq!(extract_fpl_compressed_buffer(&rle, 5).unwrap(), [0xab; 5]);
+
+        let raw = [2, 9, 8, 7, 6];
+        assert_eq!(
+            extract_fpl_compressed_buffer(&raw, 4).unwrap(),
+            [9, 8, 7, 6]
+        );
+
+        let packbits = [3, 2, 1, 2, 3, 130, 4, 0, 5];
+        assert_eq!(
+            extract_fpl_compressed_buffer(&packbits, 7).unwrap(),
+            [1, 2, 3, 4, 4, 4, 5]
+        );
+    }
+
+    #[test]
+    fn extracts_floating_point_huffman_wrapped_normal_payload() {
+        let values = [4, 7, 4, 9, 9, 9, 7, 4, 12, 12, 9];
+        let encoded = encode_fpl_normal_huffman_payload(&values);
+
+        assert_eq!(
+            extract_fpl_compressed_buffer(&encoded, values.len()).unwrap(),
+            values
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_floating_point_huffman_wrapped_payloads() {
+        assert_eq!(
+            extract_fpl_compressed_buffer(&[4], 0).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman payload mode is invalid")
+        );
+        assert_eq!(
+            extract_fpl_compressed_buffer(&[1, 7, 2, 0, 0, 0], 3).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman RLE count mismatch")
+        );
+        assert_eq!(
+            extract_fpl_compressed_buffer(&[2, 1, 2], 3).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman raw payload length mismatch")
+        );
+        assert_eq!(
+            extract_fpl_compressed_buffer(&[3, 4, 1, 2], 5).unwrap_err(),
+            LercError::BufferTooSmall
+        );
+        assert_eq!(
+            extract_fpl_compressed_buffer(&[3, 130, 1], 2).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman PackBits output is too long")
+        );
+    }
+
+    fn append_fpl_raw_plane(slice: &mut Vec<u8>, byte_index: u8, byte_delta: u8, bytes: &[u8]) {
+        slice.push(byte_index);
+        slice.push(byte_delta);
+        slice.extend_from_slice(&((bytes.len() + 1) as u32).to_le_bytes());
+        slice.push(2);
+        slice.extend_from_slice(bytes);
+    }
+
+    #[test]
+    fn reads_floating_point_huffman_slice_from_wrapped_byte_planes() {
+        let transformed = [0x7f00_0000u32, 0x8020_0000];
+        let mut slice = vec![FpPredictor::None.code()];
+        for byte_index in [2u8, 0, 3, 1] {
+            let plane = transformed
+                .iter()
+                .map(|value| value.to_le_bytes()[byte_index as usize])
+                .collect::<Vec<_>>();
+            append_fpl_raw_plane(&mut slice, byte_index, 0, &plane);
+        }
+
+        let mut reader = Reader::new(&slice);
+        let restored = read_fp_huffman_slice(&mut reader, DataType::Float, 2, 1).unwrap();
+        let values: Vec<f32> = restored
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        assert_eq!(values, [1.0, 2.5]);
+        assert_eq!(reader.pos, slice.len());
+    }
+
+    #[test]
+    fn decodes_supported_lerc2_floating_point_huffman_blob() {
+        let transformed = [0x7f00_0000u32, 0x8020_0000];
+        let mut slice = vec![FpPredictor::None.code()];
+        for byte_index in 0..4u8 {
+            let plane = transformed
+                .iter()
+                .map(|value| value.to_le_bytes()[byte_index as usize])
+                .collect::<Vec<_>>();
+            append_fpl_raw_plane(&mut slice, byte_index, 0, &plane);
+        }
+        let mut payload = vec![0, 3];
+        payload.extend_from_slice(&slice);
+
+        let header_size = compute_lerc2_header_byte_len(6).unwrap();
+        let mut header = HeaderInfo {
+            version: 6,
+            checksum: 0,
+            n_rows: 1,
+            n_cols: 2,
+            n_depth: 1,
+            num_valid_pixel: 2,
+            micro_block_size: 8,
+            blob_size: 0,
+            n_blobs_more: 0,
+            b_pass_no_data_values: 0,
+            b_is_int: 0,
+            b_reserved_3: 0,
+            b_reserved_4: 0,
+            data_type: DataType::Float,
+            max_z_error: 0.0,
+            z_min: 1.0,
+            z_max: 2.5,
+            no_data_val: 0.0,
+            no_data_val_orig: 0.0,
+            header_size,
+        };
+        let mask_len = compute_lerc2_mask_byte_len(&header, None, true).unwrap();
+        let ranges = MinMaxRanges {
+            mins: vec![1.0],
+            maxs: vec![2.5],
+            bytes_consumed: 8,
+            min_max_equal: false,
+        };
+        let ranges_len = compute_lerc2_min_max_ranges_byte_len(&header).unwrap();
+        header.blob_size = (header_size + mask_len + ranges_len + payload.len()) as i32;
+        let mut blob = blob_with_written_header_mask_and_ranges(&header, None, true, &ranges);
+        blob.extend_from_slice(&payload);
+        finalize_lerc2_checksum(&mut blob).unwrap();
+
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.data, DecodedData::Float(vec![1.0, 2.5]));
+    }
+
+    #[test]
+    fn rejects_malformed_floating_point_huffman_slice_headers() {
+        let mut invalid_predictor = vec![3];
+        for byte_index in 0..4 {
+            append_fpl_raw_plane(&mut invalid_predictor, byte_index, 0, &[0]);
+        }
+        let mut reader = Reader::new(&invalid_predictor);
+        assert_eq!(
+            read_fp_huffman_slice(&mut reader, DataType::Float, 1, 1).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman predictor code is invalid")
+        );
+
+        let mut invalid_delta = vec![FpPredictor::None.code()];
+        append_fpl_raw_plane(&mut invalid_delta, 0, 6, &[0]);
+        let mut reader = Reader::new(&invalid_delta);
+        assert_eq!(
+            read_fp_huffman_slice(&mut reader, DataType::Float, 1, 1).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman byte delta level is invalid")
+        );
+
+        let mut short_payload = vec![FpPredictor::None.code(), 0, 0];
+        short_payload.extend_from_slice(&3u32.to_le_bytes());
+        short_payload.extend_from_slice(&[2, 1]);
+        let mut reader = Reader::new(&short_payload);
+        assert_eq!(
+            read_fp_huffman_slice(&mut reader, DataType::Float, 1, 1).unwrap_err(),
+            LercError::BufferTooSmall
         );
     }
 
