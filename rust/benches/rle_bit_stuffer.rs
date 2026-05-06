@@ -5,9 +5,9 @@ use lerc::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
     decode_lerc2_supported_into, decode_typed_values, get_lerc1_header_info,
     get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info,
-    read_lerc1_count_mask, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
-    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
-    DataType, DecodeIntoSpec, Rle,
+    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
+    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    validate_lerc2_checksum, BitMask, BitStuffer2, DataType, DecodeIntoSpec, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -142,6 +142,9 @@ fn main() {
     });
     bench("lerc1-count-mask-read", 10_000, || {
         black_box(read_lerc1_count_mask(black_box(&lerc1_blob)).unwrap());
+    });
+    bench("lerc1-z-stats-read", 1_000, || {
+        black_box(read_lerc1_z_stats(black_box(&lerc1_blob)).unwrap());
     });
     bench("lerc2-header-parse", 100_000, || {
         black_box(get_lerc2_header_info(black_box(&lerc2_blob)).unwrap());

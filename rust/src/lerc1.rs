@@ -11,7 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! Legacy Lerc1 metadata readers.
 
 use crate::types::{DataType, LercError, Result};
-use crate::{BitMask, Rle};
+use crate::{BitMask, BitStuffer2, Rle};
 
 /// ASCII type string that starts legacy Lerc1 `CntZImage` blobs.
 pub const CNT_Z_IMAGE_KEY: &[u8; 10] = b"CntZImage ";
@@ -64,6 +64,19 @@ pub struct Lerc1MaskInfo {
     pub bytes_consumed: usize,
     /// True when every represented pixel is valid.
     pub all_valid: bool,
+}
+
+/// Decoded legacy Lerc1 z-value statistics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lerc1ZStats {
+    /// Minimum z value over valid pixels.
+    pub z_min: f32,
+    /// Maximum z value over valid pixels.
+    pub z_max: f32,
+    /// Number of valid z values included in the range.
+    pub num_valid_pixels: usize,
+    /// Number of bytes consumed through the z-value payload.
+    pub bytes_consumed: usize,
 }
 
 /// Reads and validates the legacy Lerc1 `CntZImage` header and part headers.
@@ -146,6 +159,50 @@ pub fn read_lerc1_count_mask(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskI
     ))
 }
 
+/// Reads legacy Lerc1 z tiles and returns min/max statistics for valid pixels.
+///
+/// This is a stats-only decoder for the Lerc1 z part; it does not expose the
+/// full pixel array. Count/mask decoding is performed first so invalid pixels
+/// can be skipped the same way as the C++ `CntZImage` reader.
+pub fn read_lerc1_z_stats(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskInfo, Lerc1ZStats)> {
+    let (info, mask_info) = read_lerc1_count_mask(blob)?;
+    if info.z_part.num_tiles_vert <= 0 || info.z_part.num_tiles_hori <= 0 {
+        return Err(LercError::Unsupported("non-tiled Lerc1 z parts"));
+    }
+
+    let payload_start = info.z_part.payload_offset;
+    let payload_end = payload_start
+        .checked_add(info.z_part.num_bytes as usize)
+        .ok_or(LercError::CorruptInput("Lerc1 z payload overflow"))?;
+    let payload = blob
+        .get(payload_start..payload_end)
+        .ok_or(LercError::BufferTooSmall)?;
+    let mut reader = Reader::new(payload);
+    let mut stats = ZStatsBuilder::default();
+
+    for (i0, i1) in tile_ranges(info.n_rows as usize, info.z_part.num_tiles_vert as usize)? {
+        for (j0, j1) in tile_ranges(info.n_cols as usize, info.z_part.num_tiles_hori as usize)? {
+            read_z_tile(
+                &mut reader,
+                &info,
+                &mask_info.mask,
+                i0,
+                i1,
+                j0,
+                j1,
+                &mut stats,
+            )?;
+        }
+    }
+
+    if reader.pos != payload.len() {
+        return Err(LercError::CorruptInput("unused Lerc1 z payload bytes"));
+    }
+
+    let stats = stats.finish(payload_start + reader.pos)?;
+    Ok((info, mask_info, stats))
+}
+
 fn read_part_info(reader: &mut Reader<'_>) -> Result<Lerc1PartInfo> {
     let num_tiles_vert = reader.read_i32_le()?;
     let num_tiles_hori = reader.read_i32_le()?;
@@ -162,6 +219,140 @@ fn read_part_info(reader: &mut Reader<'_>) -> Result<Lerc1PartInfo> {
         max_value,
         payload_offset: reader.pos,
     })
+}
+
+fn tile_ranges(size: usize, num_tiles: usize) -> Result<Vec<(usize, usize)>> {
+    if size == 0 || num_tiles == 0 || num_tiles > size {
+        return Err(LercError::CorruptInput("invalid Lerc1 tile grid"));
+    }
+
+    let base = size / num_tiles;
+    let remainder = size % num_tiles;
+    let mut ranges = Vec::with_capacity(num_tiles + usize::from(remainder > 0));
+    for tile in 0..=num_tiles {
+        let start = tile * base;
+        let len = if tile == num_tiles { remainder } else { base };
+        if len > 0 {
+            ranges.push((start, start + len));
+        }
+    }
+    Ok(ranges)
+}
+
+fn read_z_tile(
+    reader: &mut Reader<'_>,
+    info: &Lerc1HeaderInfo,
+    mask: &BitMask,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    stats: &mut ZStatsBuilder,
+) -> Result<()> {
+    let raw_flag = reader.read_u8()?;
+    let bits67 = raw_flag >> 6;
+    let flag = raw_flag & 63;
+
+    if flag == 2 {
+        for idx in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)? {
+            let _ = idx;
+            stats.add(0.0);
+        }
+        return Ok(());
+    }
+
+    if flag > 3 {
+        return Err(LercError::CorruptInput("invalid Lerc1 z tile flag"));
+    }
+
+    if flag == 0 {
+        for idx in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)? {
+            let _ = idx;
+            stats.add(reader.read_f32_le()?);
+        }
+        return Ok(());
+    }
+
+    let num_bytes = if bits67 == 0 { 4 } else { 3 - bits67 as usize };
+    let offset = reader.read_lerc1_float(num_bytes)?;
+    if flag == 3 {
+        for idx in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)? {
+            let _ = idx;
+            stats.add(offset);
+        }
+        return Ok(());
+    }
+
+    let valid_count = valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)?.len();
+    let (values, consumed) = BitStuffer2::decode(
+        &reader.bytes[reader.pos..],
+        ((i1 - i0) * (j1 - j0)).max(valid_count),
+        2,
+    )?;
+    if values.len() < valid_count {
+        return Err(LercError::CorruptInput("Lerc1 z tile value underrun"));
+    }
+    reader.pos += consumed;
+
+    let inv_scale = (2.0 * info.max_z_error) as f32;
+    for value in values.iter().take(valid_count) {
+        stats.add((offset + *value as f32 * inv_scale).min(info.z_part.max_value));
+    }
+    Ok(())
+}
+
+fn valid_indexes(
+    mask: &BitMask,
+    width: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) -> Result<Vec<usize>> {
+    let mut indexes = Vec::new();
+    for row in i0..i1 {
+        for col in j0..j1 {
+            let idx = row * width + col;
+            if mask.is_valid(idx)? {
+                indexes.push(idx);
+            }
+        }
+    }
+    Ok(indexes)
+}
+
+#[derive(Default)]
+struct ZStatsBuilder {
+    z_min: f32,
+    z_max: f32,
+    count: usize,
+}
+
+impl ZStatsBuilder {
+    fn add(&mut self, value: f32) {
+        if self.count == 0 {
+            self.z_min = value;
+            self.z_max = value;
+        } else {
+            self.z_min = self.z_min.min(value);
+            self.z_max = self.z_max.max(value);
+        }
+        self.count += 1;
+    }
+
+    fn finish(self, bytes_consumed: usize) -> Result<Lerc1ZStats> {
+        if self.count == 0 {
+            return Err(LercError::CorruptInput(
+                "Lerc1 z stats contain no valid pixels",
+            ));
+        }
+        Ok(Lerc1ZStats {
+            z_min: self.z_min,
+            z_max: self.z_max,
+            num_valid_pixels: self.count,
+            bytes_consumed,
+        })
+    }
 }
 
 struct Reader<'a> {
@@ -183,6 +374,10 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
     fn read_i32_le(&mut self) -> Result<i32> {
         let bytes = self.read_bytes(4)?;
         Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
@@ -198,6 +393,18 @@ impl<'a> Reader<'a> {
         Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
+    fn read_lerc1_float(&mut self, len: usize) -> Result<f32> {
+        match len {
+            1 => Ok(i8::from_le_bytes([self.read_u8()?]) as f32),
+            2 => {
+                let bytes = self.read_bytes(2)?;
+                Ok(i16::from_le_bytes(bytes.try_into().unwrap()) as f32)
+            }
+            4 => self.read_f32_le(),
+            _ => Err(LercError::CorruptInput("invalid Lerc1 float byte width")),
+        }
+    }
+
     fn skip_payload(&mut self, len: usize) -> Result<()> {
         self.read_bytes(len)?;
         Ok(())
@@ -206,7 +413,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_lerc1_header_info, read_lerc1_count_mask};
+    use super::{get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats};
     use crate::DataType;
     use std::fs;
     use std::path::PathBuf;
@@ -253,6 +460,17 @@ mod tests {
         assert_eq!(mask_info.mask.byte_len(), 8257);
         assert_eq!(mask_info.mask.count_valid_bits(), 65_025);
         assert!(!mask_info.all_valid);
+    }
+
+    #[test]
+    fn reads_world_lerc1_z_stats() {
+        let blob = fixture("world.lerc1");
+        let (_, mask_info, stats) = read_lerc1_z_stats(&blob).unwrap();
+
+        assert_eq!(stats.num_valid_pixels, mask_info.mask.count_valid_bits());
+        assert_eq!(stats.bytes_consumed, blob.len());
+        assert_eq!(stats.z_min, -27.458_635);
+        assert_eq!(stats.z_max, 5474.173);
     }
 
     #[test]
