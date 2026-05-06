@@ -115,6 +115,8 @@ pub enum LercError {
     WrongParam(&'static str),
     /// A provided input or output buffer is too small.
     BufferTooSmall,
+    /// Input data contains NaN values in a shape that cannot be encoded.
+    NaN,
     /// No-data values are present and cannot be represented by the requested API.
     HasNoData,
     /// Encoded input is malformed or internally inconsistent.
@@ -129,6 +131,7 @@ impl LercError {
         match self {
             Self::WrongParam(_) => ErrCode::WrongParam,
             Self::BufferTooSmall => ErrCode::BufferTooSmall,
+            Self::NaN => ErrCode::NaN,
             Self::HasNoData => ErrCode::HasNoData,
             Self::CorruptInput(_) | Self::Unsupported(_) => ErrCode::Failed,
         }
@@ -140,6 +143,7 @@ impl fmt::Display for LercError {
         match self {
             Self::WrongParam(msg) => write!(f, "wrong parameter: {msg}"),
             Self::BufferTooSmall => f.write_str("buffer too small"),
+            Self::NaN => f.write_str("input contains unsupported NaN values"),
             Self::HasNoData => f.write_str("has no-data values"),
             Self::CorruptInput(msg) => write!(f, "corrupt input: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),

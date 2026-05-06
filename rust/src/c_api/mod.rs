@@ -745,6 +745,17 @@ unsafe fn try_encode_supported_blob(
         }
     }
 
+    let prepared_nan = prepare_nan_encode_inputs(spec, data, mask_bytes)?;
+    let (spec, data, mask_bytes) = if let Some(prepared) = prepared_nan.as_ref() {
+        (
+            prepared.spec,
+            prepared.data.as_slice(),
+            Some(prepared.masks.as_slice()),
+        )
+    } else {
+        (spec, data, mask_bytes)
+    };
+
     if version < 4 && spec.n_bands != 1 {
         return Ok(None);
     }
@@ -754,6 +765,108 @@ unsafe fn try_encode_supported_blob(
             Ok(None)
         }
         Err(err) => Err(err),
+    }
+}
+
+struct PreparedNanEncode {
+    spec: EncodeSpec,
+    data: Vec<u8>,
+    masks: Vec<u8>,
+}
+
+fn prepare_nan_encode_inputs(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask_bytes: Option<&[u8]>,
+) -> crate::Result<Option<PreparedNanEncode>> {
+    if spec.data_type != DataType::Float && spec.data_type != DataType::Double {
+        return Ok(None);
+    }
+
+    let n_pixels = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam("encode pixel count overflow"))?;
+    let value_size = spec.data_type.size_in_bytes();
+    let band_value_bytes = n_pixels
+        .checked_mul(spec.n_depth)
+        .and_then(|count| count.checked_mul(value_size))
+        .ok_or(LercError::WrongParam("encode band byte count overflow"))?;
+
+    let mut prepared_data = data.to_vec();
+    let mut prepared_masks = vec![1u8; n_pixels * spec.n_bands];
+    let mut found_nan = false;
+
+    for i_band in 0..spec.n_bands {
+        let data_band_offset = i_band * band_value_bytes;
+        let mask_band_offset = i_band * n_pixels;
+        let input_mask = match (spec.n_masks, mask_bytes) {
+            (0, _) => None,
+            (1, Some(masks)) => Some(&masks[..n_pixels]),
+            (_, Some(masks)) => {
+                let offset = i_band * n_pixels;
+                Some(&masks[offset..offset + n_pixels])
+            }
+            (_, None) => None,
+        };
+
+        for i_pixel in 0..n_pixels {
+            let input_valid = input_mask.is_none_or(|mask| mask[i_pixel] != 0);
+            if !input_valid {
+                prepared_masks[mask_band_offset + i_pixel] = 0;
+                continue;
+            }
+
+            let pixel_offset = data_band_offset + i_pixel * spec.n_depth * value_size;
+            let mut nan_count = 0usize;
+            for i_depth in 0..spec.n_depth {
+                let value_offset = pixel_offset + i_depth * value_size;
+                let value = read_float_value_for_nan(spec.data_type, &data[value_offset..]);
+                if value.is_nan() {
+                    nan_count += 1;
+                    write_zero_float_value(spec.data_type, &mut prepared_data[value_offset..]);
+                }
+            }
+
+            if nan_count == 0 {
+                continue;
+            }
+            found_nan = true;
+            if nan_count == spec.n_depth {
+                prepared_masks[mask_band_offset + i_pixel] = 0;
+            } else if spec.n_depth > 1 {
+                return Err(LercError::NaN);
+            }
+        }
+    }
+
+    if !found_nan {
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedNanEncode {
+        spec: EncodeSpec {
+            n_masks: if spec.n_bands == 1 { 1 } else { spec.n_bands },
+            ..spec
+        },
+        data: prepared_data,
+        masks: prepared_masks,
+    }))
+}
+
+fn read_float_value_for_nan(data_type: DataType, bytes: &[u8]) -> f64 {
+    match data_type {
+        DataType::Float => f32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::Double => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        _ => unreachable!("NaN filtering only handles float and double"),
+    }
+}
+
+fn write_zero_float_value(data_type: DataType, bytes: &mut [u8]) {
+    match data_type {
+        DataType::Float => bytes[..4].copy_from_slice(&0.0f32.to_le_bytes()),
+        DataType::Double => bytes[..8].copy_from_slice(&0.0f64.to_le_bytes()),
+        _ => unreachable!("NaN filtering only handles float and double"),
     }
 }
 
@@ -2498,6 +2611,508 @@ mod tests {
         };
 
         assert_eq!(status, ErrCode::HasNoData as u32);
+    }
+
+    #[test]
+    fn c_abi_round_trips_cpp_sample_style_float_image_with_mask() {
+        let n_cols = 17usize;
+        let n_rows = 13usize;
+        let mut data = Vec::with_capacity(n_cols * n_rows);
+        let mut valid = Vec::with_capacity(n_cols * n_rows);
+        for i in 0..n_rows {
+            for j in 0..n_cols {
+                let value = ((i * i + j * j) as f32).sqrt() + ((i * 7 + j * 11) % 20) as f32;
+                data.push(value);
+                valid.push(u8::from(j % 5 != 0 && i % 4 != 0));
+            }
+        }
+
+        let mut num_bytes = 0u32;
+        let status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                n_cols as i32,
+                n_rows as i32,
+                1,
+                1,
+                valid.as_ptr(),
+                0.1,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+
+        let mut blob = vec![0u8; num_bytes as usize];
+        let mut written = 0u32;
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                n_cols as i32,
+                n_rows as i32,
+                1,
+                1,
+                valid.as_ptr(),
+                0.1,
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(written, num_bytes);
+        blob.truncate(written as usize);
+
+        let mut info = [0u32; BLOB_INFO_ARRAY_LEN];
+        let mut ranges = [0.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+        let status = unsafe {
+            lerc_getBlobInfo(
+                blob.as_ptr(),
+                blob.len() as u32,
+                info.as_mut_ptr(),
+                ranges.as_mut_ptr(),
+                info.len() as i32,
+                ranges.len() as i32,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(info[1], DataType::Float as u32);
+        assert_eq!(info[2], 1);
+        assert_eq!(info[3], n_cols as u32);
+        assert_eq!(info[4], n_rows as u32);
+        assert_eq!(info[5], 1);
+        assert_eq!(info[8], 1);
+        assert_eq!(ranges[2], 0.1);
+
+        let mut decoded = vec![0.0f32; data.len()];
+        let mut decoded_mask = vec![0u8; valid.len()];
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                decoded_mask.as_mut_ptr(),
+                1,
+                n_cols as i32,
+                n_rows as i32,
+                1,
+                DataType::Float as u32,
+                decoded.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(decoded_mask, valid);
+        for ((&actual, &expected), &is_valid) in decoded.iter().zip(data.iter()).zip(valid.iter()) {
+            if is_valid != 0 {
+                assert!((actual - expected).abs() <= 0.1);
+            } else {
+                assert_eq!(actual, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn c_abi_round_trips_cpp_sample_style_uchar_depth_triplets() {
+        let n_cols = 11usize;
+        let n_rows = 7usize;
+        let n_depth = 3usize;
+        let mut data = Vec::with_capacity(n_cols * n_rows * n_depth);
+        for i in 0..n_rows {
+            for j in 0..n_cols {
+                for m in 0..n_depth {
+                    data.push(((i * 13 + j * 17 + m * 19) % 30) as u8);
+                }
+            }
+        }
+
+        let mut blob = vec![0u8; data.len() * 2];
+        let mut written = 0u32;
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                n_depth as i32,
+                n_cols as i32,
+                n_rows as i32,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        blob.truncate(written as usize);
+
+        let mut mins = [0.0f64; 3];
+        let mut maxs = [0.0f64; 3];
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                n_depth as i32,
+                1,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        let mut expected_mins = [u8::MAX; 3];
+        let mut expected_maxs = [u8::MIN; 3];
+        for pixel in data.chunks_exact(n_depth) {
+            for (i_depth, &value) in pixel.iter().enumerate() {
+                expected_mins[i_depth] = expected_mins[i_depth].min(value);
+                expected_maxs[i_depth] = expected_maxs[i_depth].max(value);
+            }
+        }
+        assert_eq!(mins, expected_mins.map(f64::from),);
+        assert_eq!(maxs, expected_maxs.map(f64::from),);
+
+        let mut decoded = vec![0u8; data.len()];
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                0,
+                ptr::null_mut(),
+                n_depth as i32,
+                n_cols as i32,
+                n_rows as i32,
+                1,
+                DataType::UChar as u32,
+                decoded.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn c_abi_round_trips_cpp_sample_style_4d_no_data() {
+        let n_cols = 5usize;
+        let n_rows = 4usize;
+        let n_depth = 2usize;
+        let n_bands = 2usize;
+        let no_data = f32::MAX;
+        let mut data = vec![0.0f32; n_bands * n_rows * n_cols * n_depth];
+        for band in 0..n_bands {
+            let band_offset = band * n_rows * n_cols * n_depth;
+            for i in 0..n_rows {
+                for j in 0..n_cols {
+                    let pixel = i * n_cols + j;
+                    let value = ((i * i + j * j) as f32).sqrt() + (band * 10) as f32;
+                    data[band_offset + pixel * n_depth] = value;
+                    data[band_offset + pixel * n_depth + 1] = value + 0.25;
+                    if band == 0 && (i + j) % 3 == 0 {
+                        data[band_offset + pixel * n_depth] = no_data;
+                    }
+                }
+            }
+        }
+        let uses_no_data = [1u8, 0];
+        let no_data_values = [no_data as f64, 0.0];
+
+        let mut num_bytes = 0u32;
+        let status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                n_depth as i32,
+                n_cols as i32,
+                n_rows as i32,
+                n_bands as i32,
+                0,
+                ptr::null(),
+                0.001,
+                &mut num_bytes,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+
+        let mut blob = vec![0u8; num_bytes as usize];
+        let mut written = 0u32;
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                n_depth as i32,
+                n_cols as i32,
+                n_rows as i32,
+                n_bands as i32,
+                0,
+                ptr::null(),
+                0.001,
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        blob.truncate(written as usize);
+
+        let info = get_lerc_info(&blob).unwrap();
+        assert_eq!(info.n_depth, n_depth as i32);
+        assert_eq!(info.n_bands, n_bands as i32);
+        assert_eq!(info.n_uses_no_data_value, n_bands as i32);
+
+        let mut decoded = vec![0.0f32; data.len()];
+        let mut decoded_mask = vec![0u8; n_cols * n_rows];
+        let mut decoded_uses_no_data = [0u8; 2];
+        let mut decoded_no_data = [0.0f64; 2];
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                decoded_mask.as_mut_ptr(),
+                n_depth as i32,
+                n_cols as i32,
+                n_rows as i32,
+                n_bands as i32,
+                DataType::Float as u32,
+                decoded.as_mut_ptr().cast(),
+                decoded_uses_no_data.as_mut_ptr(),
+                decoded_no_data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(decoded_mask, vec![1u8; n_cols * n_rows]);
+        assert_eq!(decoded_uses_no_data, uses_no_data);
+        assert_eq!(decoded_no_data, no_data_values);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn c_abi_encode_filters_cpp_sample_style_float_nan_pixels() {
+        let n_cols = 9usize;
+        let n_rows = 5usize;
+        let n_bands = 4usize;
+        let mut data = vec![0.0f32; n_cols * n_rows * n_bands];
+        let mut expected_masks = vec![1u8; n_cols * n_rows * n_bands];
+
+        for band in 0..n_bands {
+            let offset = band * n_cols * n_rows;
+            for i in 0..n_rows {
+                for j in 0..n_cols {
+                    let pixel = i * n_cols + j;
+                    data[offset + pixel] =
+                        ((i * i + j * j) as f32).sqrt() + ((band * 13 + i + j) % 20) as f32;
+                    if band != 2 && (i * 3 + j + band) % 4 == 0 {
+                        data[offset + pixel] = f32::NAN;
+                        expected_masks[offset + pixel] = 0;
+                    }
+                }
+            }
+        }
+
+        let mut num_bytes = 0u32;
+        let status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                n_cols as i32,
+                n_rows as i32,
+                n_bands as i32,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+
+        let mut blob = vec![0u8; num_bytes as usize];
+        let mut written = 0u32;
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                n_cols as i32,
+                n_rows as i32,
+                n_bands as i32,
+                0,
+                ptr::null(),
+                0.0,
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        blob.truncate(written as usize);
+
+        let mut info = [0u32; BLOB_INFO_ARRAY_LEN];
+        let mut ranges = [0.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+        let status = unsafe {
+            lerc_getBlobInfo(
+                blob.as_ptr(),
+                blob.len() as u32,
+                info.as_mut_ptr(),
+                ranges.as_mut_ptr(),
+                info.len() as i32,
+                ranges.len() as i32,
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(info[8], n_bands as u32);
+
+        let mut decoded = vec![123.0f32; data.len()];
+        let mut decoded_masks = vec![123u8; expected_masks.len()];
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                n_bands as i32,
+                decoded_masks.as_mut_ptr(),
+                1,
+                n_cols as i32,
+                n_rows as i32,
+                n_bands as i32,
+                DataType::Float as u32,
+                decoded.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(decoded_masks, expected_masks);
+        for ((&actual, &expected), &valid) in
+            decoded.iter().zip(data.iter()).zip(expected_masks.iter())
+        {
+            if valid != 0 {
+                assert_eq!(actual, expected);
+            } else {
+                assert_eq!(actual, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn c_abi_encode_rejects_mixed_depth_nan_without_no_data() {
+        let data = [1.0f32, f32::NAN, 2.0, 3.0, 4.0, 5.0];
+        let mut num_bytes = 123u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                2,
+                3,
+                1,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+
+        assert_eq!(status, ErrCode::NaN as u32);
+        assert_eq!(num_bytes, 0);
+    }
+
+    #[test]
+    fn c_abi_decode_and_info_wrappers_reject_adversarial_blobs_without_writes() {
+        let mut malformed_blobs = vec![
+            Vec::new(),
+            b"Lerc2 ".to_vec(),
+            synthetic_v4_const_blob()[..20].to_vec(),
+            synthetic_v4_const_blob(),
+        ];
+        malformed_blobs[3][0] = b'X';
+        let mut checksum_mismatch = fixture("california_400_400_1_float.lerc2");
+        let last = checksum_mismatch.len() - 1;
+        checksum_mismatch[last] ^= 0x01;
+
+        for blob in &malformed_blobs {
+            let ptr = if blob.is_empty() {
+                ptr::null()
+            } else {
+                blob.as_ptr()
+            };
+            let len = blob.len() as u32;
+            let mut info = [77u32; BLOB_INFO_ARRAY_LEN];
+            let mut ranges = [77.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+            let status = unsafe {
+                lerc_getBlobInfo(
+                    ptr,
+                    len,
+                    info.as_mut_ptr(),
+                    ranges.as_mut_ptr(),
+                    info.len() as i32,
+                    ranges.len() as i32,
+                )
+            };
+            assert_ne!(status, ErrCode::Ok as u32);
+
+            let mut mins = [77.0f64; 1];
+            let mut maxs = [77.0f64; 1];
+            let status =
+                unsafe { lerc_getDataRanges(ptr, len, 1, 1, mins.as_mut_ptr(), maxs.as_mut_ptr()) };
+            assert_ne!(status, ErrCode::Ok as u32);
+        }
+
+        malformed_blobs.push(checksum_mismatch);
+
+        for blob in malformed_blobs {
+            let ptr = if blob.is_empty() {
+                ptr::null()
+            } else {
+                blob.as_ptr()
+            };
+            let len = blob.len() as u32;
+            let mut decoded = [77u8; 4];
+            let mut mask = [77u8; 4];
+            let status = unsafe {
+                lerc_decode(
+                    ptr,
+                    len,
+                    1,
+                    mask.as_mut_ptr(),
+                    1,
+                    2,
+                    2,
+                    1,
+                    DataType::UChar as u32,
+                    decoded.as_mut_ptr().cast(),
+                )
+            };
+            assert_ne!(status, ErrCode::Ok as u32);
+            assert_eq!(decoded, [77u8; 4]);
+            assert_eq!(mask, [77u8; 4]);
+
+            let mut decoded_f64 = [77.0f64; 4];
+            let status = unsafe {
+                lerc_decodeToDouble(
+                    ptr,
+                    len,
+                    1,
+                    mask.as_mut_ptr(),
+                    1,
+                    2,
+                    2,
+                    1,
+                    decoded_f64.as_mut_ptr(),
+                )
+            };
+            assert_ne!(status, ErrCode::Ok as u32);
+            assert_eq!(decoded_f64, [77.0f64; 4]);
+        }
     }
 
     fn synthetic_v4_const_blob() -> Vec<u8> {

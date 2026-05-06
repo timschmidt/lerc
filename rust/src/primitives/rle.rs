@@ -322,4 +322,30 @@ mod tests {
         let compressed = Rle::compress(&[3, 3, 3, 3, 3, 4]).unwrap();
         assert!(Rle::decompress(&compressed[..compressed.len() - 1]).is_err());
     }
+
+    #[test]
+    fn rejects_adversarial_count_streams() {
+        let missing_eof = [
+            2, 0, // literal count
+            1, 2, // literal bytes, but no EOF marker
+        ];
+        assert!(Rle::decompressed_len(&missing_eof).is_err());
+        assert!(Rle::decompress(&missing_eof).is_err());
+
+        let count_exceeds_input = [
+            5, 0, // claims five literal bytes
+            1, 2, // only two literal bytes before EOF-shaped bytes
+            0, 128,
+        ];
+        assert!(Rle::decompressed_len(&count_exceeds_input).is_err());
+        assert!(Rle::decompress(&count_exceeds_input).is_err());
+
+        let zero_length_stream = [0, 128];
+        assert!(Rle::decompressed_len(&zero_length_stream).is_err());
+        assert!(Rle::decompress(&zero_length_stream).is_err());
+
+        let encoded = Rle::compress(&[1, 2, 3, 4]).unwrap();
+        let mut too_short = [0u8; 3];
+        assert!(Rle::decompress_into(&encoded, &mut too_short).is_err());
+    }
 }

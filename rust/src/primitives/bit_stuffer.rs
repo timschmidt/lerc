@@ -575,4 +575,26 @@ mod tests {
         let encoded = BitStuffer2::encode_simple(&data, 3).unwrap();
         assert!(BitStuffer2::decode(&encoded, 3, 3).is_err());
     }
+
+    #[test]
+    fn rejects_adversarial_headers_and_payloads() {
+        assert!(BitStuffer2::decode(&[], 1, 3).is_err());
+
+        let mut simple = BitStuffer2::encode_simple(&[1, 2, 3, 4], 3).unwrap();
+        simple.truncate(simple.len() - 1);
+        assert!(BitStuffer2::decode(&simple, 4, 3).is_err());
+
+        let header_claims_four_count_bytes = [0u8];
+        assert!(BitStuffer2::decode(&header_claims_four_count_bytes, 1, 3).is_err());
+
+        let lut_missing_len = [
+            0b0010_0001, // LUT flag with one value bit and one count byte
+            1,           // element count
+        ];
+        assert!(BitStuffer2::decode(&lut_missing_len, 1, 3).is_err());
+
+        let mut lut = BitStuffer2::encode_lut(&[(0, 0), (7, 1), (9, 2)], 3).unwrap();
+        *lut.last_mut().unwrap() = 0xff;
+        assert!(BitStuffer2::decode(&lut, 3, 3).is_err());
+    }
 }
