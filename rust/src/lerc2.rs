@@ -2310,6 +2310,20 @@ mod tests {
         block
     }
 
+    fn diff_lut_tile_block(offset: i16, quantized: &[u32]) -> Vec<u8> {
+        let mut sorted: Vec<(u32, u32)> = quantized
+            .iter()
+            .enumerate()
+            .map(|(idx, &value)| (value, idx as u32))
+            .collect();
+        sorted.sort_unstable();
+
+        let mut block = vec![(2 << 6) | 4 | 1];
+        block.extend_from_slice(&offset.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 5).unwrap());
+        block
+    }
+
     fn diff_constant_tile_block(offset: i16) -> Vec<u8> {
         let mut block = vec![(2 << 6) | 4 | 3];
         block.extend_from_slice(&offset.to_le_bytes());
@@ -2326,6 +2340,20 @@ mod tests {
         let mut block = vec![4 | 1];
         block.extend_from_slice(&offset.to_le_bytes());
         block.extend_from_slice(&BitStuffer2::encode_simple(quantized, 5).unwrap());
+        block
+    }
+
+    fn diff_float_lut_tile_block(offset: f32, quantized: &[u32]) -> Vec<u8> {
+        let mut sorted: Vec<(u32, u32)> = quantized
+            .iter()
+            .enumerate()
+            .map(|(idx, &value)| (value, idx as u32))
+            .collect();
+        sorted.sort_unstable();
+
+        let mut block = vec![4 | 1];
+        block.extend_from_slice(&offset.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 5).unwrap());
         block
     }
 
@@ -3003,6 +3031,15 @@ mod tests {
     }
 
     #[test]
+    fn reads_v5_diff_lut_tiled_payload() {
+        let blob = synthetic_v5_diff_tiled_blob(diff_lut_tile_block(5, &[0, 1, 2, 3]));
+        let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
+
+        assert_eq!(tiled.data, [10, 15, 20, 26, 30, 37, 40, 48]);
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
     fn reads_v5_diff_constant_tiled_payload() {
         let blob = synthetic_v5_diff_tiled_blob(diff_constant_tile_block(5));
         let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
@@ -3017,6 +3054,20 @@ mod tests {
             1.5,
             &[0, 1, 2, 3],
         ));
+        let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
+        let decoded = tiled.decode_typed(DataType::Float).unwrap();
+
+        assert_eq!(
+            decoded,
+            DecodedData::Float(vec![10.0, 11.5, 20.0, 22.0, 30.0, 32.5, 40.0, 42.0])
+        );
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn reads_v5_float_diff_lut_tiled_payload() {
+        let blob =
+            synthetic_v5_float_diff_tiled_blob(diff_float_lut_tile_block(1.5, &[0, 1, 2, 3]));
         let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
         let decoded = tiled.decode_typed(DataType::Float).unwrap();
 

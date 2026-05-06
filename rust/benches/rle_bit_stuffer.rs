@@ -88,7 +88,9 @@ fn main() {
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
     let tiled_diff_blob = synthetic_v5_tiled_diff_blob();
+    let tiled_diff_lut_blob = synthetic_v5_tiled_diff_lut_blob();
     let tiled_float_diff_blob = synthetic_v5_tiled_float_diff_blob();
+    let tiled_float_diff_lut_blob = synthetic_v5_tiled_float_diff_lut_blob();
     let encoded_rle = Rle::compress(&byte_data).unwrap();
     let encoded_bits = BitStuffer2::encode_simple(&uint_data, 3).unwrap();
     let encoded_bits_pre_v3 = BitStuffer2::encode_simple(&uint_data, 2).unwrap();
@@ -184,8 +186,14 @@ fn main() {
     bench("lerc2-tiled-diff-v5-synthetic", 100_000, || {
         black_box(read_lerc2_tiled_payload(black_box(&tiled_diff_blob)).unwrap());
     });
+    bench("lerc2-tiled-diff-lut-v5-synthetic", 100_000, || {
+        black_box(read_lerc2_tiled_payload(black_box(&tiled_diff_lut_blob)).unwrap());
+    });
     bench("lerc2-tiled-float-diff-v5-synthetic", 100_000, || {
         black_box(read_lerc2_tiled_payload(black_box(&tiled_float_diff_blob)).unwrap());
+    });
+    bench("lerc2-tiled-float-diff-lut-v5-synthetic", 100_000, || {
+        black_box(read_lerc2_tiled_payload(black_box(&tiled_float_diff_lut_blob)).unwrap());
     });
     bench("lerc2-supported-decode-v4-synthetic", 100_000, || {
         black_box(decode_lerc2_supported(black_box(&one_sweep_blob)).unwrap());
@@ -402,16 +410,34 @@ fn synthetic_v4_tiled_lut_blob() -> Vec<u8> {
 }
 
 fn synthetic_v5_tiled_diff_blob() -> Vec<u8> {
+    synthetic_v5_tiled_diff_blob_with_block({
+        let mut block = vec![(2 << 6) | 4 | 1];
+        block.extend_from_slice(&5i16.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_simple(&[0, 1, 2, 3], 5).unwrap());
+        block
+    })
+}
+
+fn synthetic_v5_tiled_diff_lut_blob() -> Vec<u8> {
+    let mut sorted: Vec<(u32, u32)> = [0, 1, 2, 3]
+        .iter()
+        .enumerate()
+        .map(|(idx, &value)| (value, idx as u32))
+        .collect();
+    sorted.sort_unstable();
+    synthetic_v5_tiled_diff_blob_with_block({
+        let mut block = vec![(2 << 6) | 4 | 1];
+        block.extend_from_slice(&5i16.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 5).unwrap());
+        block
+    })
+}
+
+fn synthetic_v5_tiled_diff_blob_with_block(depth1_block: Vec<u8>) -> Vec<u8> {
     let range_bytes = [10u8, 15, 40, 48];
     let depth0_block = {
         let mut block = vec![0];
         block.extend_from_slice(&[10, 20, 30, 40]);
-        block
-    };
-    let depth1_block = {
-        let mut block = vec![(2 << 6) | 4 | 1];
-        block.extend_from_slice(&5i16.to_le_bytes());
-        block.extend_from_slice(&BitStuffer2::encode_simple(&[0, 1, 2, 3], 5).unwrap());
         block
     };
     let blocks = [depth0_block, depth1_block];
@@ -439,6 +465,30 @@ fn synthetic_v5_tiled_diff_blob() -> Vec<u8> {
 }
 
 fn synthetic_v5_tiled_float_diff_blob() -> Vec<u8> {
+    synthetic_v5_tiled_float_diff_blob_with_block({
+        let mut block = vec![4 | 1];
+        block.extend_from_slice(&1.5f32.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_simple(&[0, 1, 2, 3], 5).unwrap());
+        block
+    })
+}
+
+fn synthetic_v5_tiled_float_diff_lut_blob() -> Vec<u8> {
+    let mut sorted: Vec<(u32, u32)> = [0, 1, 2, 3]
+        .iter()
+        .enumerate()
+        .map(|(idx, &value)| (value, idx as u32))
+        .collect();
+    sorted.sort_unstable();
+    synthetic_v5_tiled_float_diff_blob_with_block({
+        let mut block = vec![4 | 1];
+        block.extend_from_slice(&1.5f32.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 5).unwrap());
+        block
+    })
+}
+
+fn synthetic_v5_tiled_float_diff_blob_with_block(depth1_block: Vec<u8>) -> Vec<u8> {
     let mut range_bytes = Vec::new();
     for value in [10.0f32, 11.5, 40.0, 42.0] {
         range_bytes.extend_from_slice(&value.to_le_bytes());
@@ -448,12 +498,6 @@ fn synthetic_v5_tiled_float_diff_blob() -> Vec<u8> {
         for value in [10.0f32, 20.0, 30.0, 40.0] {
             block.extend_from_slice(&value.to_le_bytes());
         }
-        block
-    };
-    let depth1_block = {
-        let mut block = vec![4 | 1];
-        block.extend_from_slice(&1.5f32.to_le_bytes());
-        block.extend_from_slice(&BitStuffer2::encode_simple(&[0, 1, 2, 3], 5).unwrap());
         block
     };
     let blocks = [depth0_block, depth1_block];
