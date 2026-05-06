@@ -569,6 +569,30 @@ pub fn validate_lerc2_checksum(blob: &[u8]) -> Result<HeaderInfo> {
     Ok(header)
 }
 
+/// Computes and writes the Lerc2 checksum into a complete blob in place.
+///
+/// Version 0 through 2 blobs do not carry a checksum and are left unchanged.
+/// For version 3 and newer blobs, the Fletcher32 checksum is computed over the
+/// byte range after the checksum field through `header.blob_size`, matching the
+/// C++ encoder finalization step.
+pub fn finalize_lerc2_checksum(blob: &mut [u8]) -> Result<u32> {
+    let header = get_lerc2_header_info(blob)?.header;
+    let blob_size = header.blob_size as usize;
+    if blob_size > blob.len() {
+        return Err(LercError::BufferTooSmall);
+    }
+    if header.version < 3 {
+        return Ok(0);
+    }
+    if blob_size <= CHECKSUM_START_OFFSET {
+        return Err(LercError::CorruptInput("Lerc2 blob too small for checksum"));
+    }
+
+    let checksum = compute_checksum_fletcher32(&blob[CHECKSUM_START_OFFSET..blob_size]);
+    blob[FILE_KEY.len() + 4..CHECKSUM_START_OFFSET].copy_from_slice(&checksum.to_le_bytes());
+    Ok(checksum)
+}
+
 /// Reads the version 4+ min/max range section.
 pub fn read_lerc2_min_max_ranges(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, MinMaxRanges)> {
     read_lerc2_min_max_ranges_with_previous(blob, None)
@@ -2320,12 +2344,12 @@ mod tests {
     use super::{
         compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
         decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-        decode_lerc_supported_into, decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, DecodeIntoSpec, HeaderInfo,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        decode_lerc_supported_into, decode_lerc_supported_to_f64, finalize_lerc2_checksum,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
+        read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask,
+        DecodeIntoSpec, HeaderInfo, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -3164,6 +3188,33 @@ mod tests {
         assert_eq!(offset, bluemarble.len());
         assert_eq!(checksums.len(), 3);
         assert_eq!(checksums, [0x86ce_e665, 0x2419_e3dc, 0x5e2d_64e2]);
+    }
+
+    #[test]
+    fn finalizes_lerc2_checksum_for_written_blob() {
+        let mut header = header_for_write(4);
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap();
+        let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), true).unwrap();
+        header.blob_size = (header.header_size + mask_len) as i32;
+        header.checksum = 0;
+        let mut blob = blob_with_written_header_and_mask(&header, Some(&mask), true);
+
+        assert!(validate_lerc2_checksum(&blob).is_err());
+        let checksum = finalize_lerc2_checksum(&mut blob).unwrap();
+        assert_eq!(checksum, compute_checksum_fletcher32(&blob[14..]));
+        assert_eq!(validate_lerc2_checksum(&blob).unwrap().checksum, checksum);
+    }
+
+    #[test]
+    fn finalizing_pre_v3_lerc2_blob_leaves_checksum_absent() {
+        let mut header = header_for_write(2);
+        header.num_valid_pixel = header.n_cols * header.n_rows;
+        let mut blob = blob_with_written_header_and_mask(&header, None, true);
+        let before = blob.clone();
+
+        assert_eq!(finalize_lerc2_checksum(&mut blob).unwrap(), 0);
+        assert_eq!(blob, before);
+        assert_eq!(validate_lerc2_checksum(&blob).unwrap().version, 2);
     }
 
     #[test]
