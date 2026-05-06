@@ -12,9 +12,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 use crate::{
     decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
-    encode_lerc2_one_sweep, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_no_data_info, get_lerc_info, BitMask, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
-    LercError,
+    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info, BitMask, DataType,
+    DecodeIntoSpec, EncodeSpec, ErrCode, LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -22,8 +22,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// C ABI equivalent of `lerc_computeCompressedSize`.
 ///
-/// Single-band inputs are encoded by the Rust constant or one-sweep Lerc2
-/// paths. Other valid inputs currently zero `num_bytes` and return
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
+/// no-data inputs currently zero `num_bytes` and return
 /// [`ErrCode::Failed`].
 ///
 /// # Safety
@@ -66,8 +66,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
 
 /// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
 ///
-/// Single-band inputs are encoded by the Rust constant or one-sweep Lerc2
-/// paths. Other valid inputs currently zero `num_bytes` and return
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
+/// no-data inputs currently zero `num_bytes` and return
 /// [`ErrCode::Failed`].
 ///
 /// # Safety
@@ -109,8 +109,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
 
 /// C ABI equivalent of `lerc_encode`.
 ///
-/// Single-band inputs are encoded by the Rust constant or one-sweep Lerc2
-/// paths. Other valid inputs currently zero `n_bytes_written` and return
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
+/// no-data inputs currently zero `n_bytes_written` and return
 /// [`ErrCode::Failed`].
 ///
 /// # Safety
@@ -157,8 +157,8 @@ pub unsafe extern "C" fn lerc_encode(
 
 /// C ABI equivalent of `lerc_encodeForVersion`.
 ///
-/// Single-band inputs are encoded by the Rust constant or one-sweep Lerc2
-/// paths. Other valid inputs currently zero `n_bytes_written` and return
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
+/// no-data inputs currently zero `n_bytes_written` and return
 /// [`ErrCode::Failed`].
 ///
 /// # Safety
@@ -717,13 +717,21 @@ unsafe fn try_encode_supported_blob(
     max_z_err: f64,
     version: i32,
 ) -> crate::Result<Option<Vec<u8>>> {
+    let data = unsafe { slice::from_raw_parts(p_data.cast::<u8>(), spec.data_byte_len()?) };
+    let mask_bytes = if spec.n_masks > 0 {
+        Some(unsafe { slice::from_raw_parts(p_valid_bytes, spec.mask_byte_len()?) })
+    } else {
+        None
+    };
+
     if spec.n_bands != 1 {
-        return Ok(None);
+        if version < 4 {
+            return Ok(None);
+        }
+        return encode_lerc2_one_sweep_bands(spec, data, max_z_err, mask_bytes, version).map(Some);
     }
 
-    let data = unsafe { slice::from_raw_parts(p_data.cast::<u8>(), spec.data_byte_len()?) };
-    let mask = if spec.n_masks > 0 {
-        let mask_bytes = unsafe { slice::from_raw_parts(p_valid_bytes, spec.mask_byte_len()?) };
+    let mask = if let Some(mask_bytes) = mask_bytes {
         Some(BitMask::from_byte_mask(
             mask_bytes,
             spec.n_cols,
@@ -736,7 +744,10 @@ unsafe fn try_encode_supported_blob(
     let value = match constant_value_as_f64(spec.data_type, data)? {
         Some(value) => value,
         None => {
-            return encode_lerc2_one_sweep(spec, data, max_z_err, mask.as_ref(), version).map(Some)
+            if version < 4 {
+                return Ok(None);
+            }
+            return encode_lerc2_one_sweep(spec, data, max_z_err, mask.as_ref(), version).map(Some);
         }
     };
 
@@ -1488,39 +1499,21 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_encode_unsupported_multi_band_zeroes_output_counters_and_fails() {
-        let data = [1u8; 12];
+    fn c_abi_encode_unsupported_old_version_zeroes_output_counters_and_fails() {
+        let data = [1u8, 2, 3, 4, 5, 6];
         let mut num_bytes = 123u32;
         let mut out = [0u8; 64];
         let mut written = 123u32;
 
         let status = unsafe {
-            lerc_computeCompressedSize(
-                data.as_ptr().cast(),
-                DataType::UChar as u32,
-                1,
-                3,
-                2,
-                2,
-                0,
-                ptr::null(),
-                0.0,
-                &mut num_bytes,
-            )
-        };
-        assert_eq!(status, ErrCode::Failed as u32);
-        assert_eq!(num_bytes, 0);
-
-        num_bytes = 123;
-        let status = unsafe {
             lerc_computeCompressedSizeForVersion(
                 data.as_ptr().cast(),
-                6,
+                3,
                 DataType::UChar as u32,
                 1,
                 3,
                 2,
-                2,
+                1,
                 0,
                 ptr::null(),
                 0.0,
@@ -1530,35 +1523,15 @@ mod tests {
         assert_eq!(status, ErrCode::Failed as u32);
         assert_eq!(num_bytes, 0);
 
-        let status = unsafe {
-            lerc_encode(
-                data.as_ptr().cast(),
-                DataType::UChar as u32,
-                1,
-                3,
-                2,
-                2,
-                0,
-                ptr::null(),
-                0.0,
-                out.as_mut_ptr(),
-                out.len() as u32,
-                &mut written,
-            )
-        };
-        assert_eq!(status, ErrCode::Failed as u32);
-        assert_eq!(written, 0);
-
-        written = 123;
         let status = unsafe {
             lerc_encodeForVersion(
                 data.as_ptr().cast(),
-                6,
+                3,
                 DataType::UChar as u32,
                 1,
                 3,
                 2,
-                2,
+                1,
                 0,
                 ptr::null(),
                 0.0,
@@ -1692,6 +1665,46 @@ mod tests {
         assert_eq!(
             decoded.data,
             DecodedData::UChar(vec![1, 2, 0, 0, 3, 9, 5, 6, 7, 8, 0, 0])
+        );
+    }
+
+    #[test]
+    fn c_abi_encode_supports_one_sweep_multi_band_input() {
+        let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let valid = [1u8, 0, 1, 1, 1, 0];
+        let mut out = [0u8; 256];
+        let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                2,
+                1,
+                valid.as_ptr(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.header.n_blobs_more, 1);
+        let decoded_bands = crate::decode_lerc2_bands_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded_bands.bands.len(), 2);
+        assert_eq!(
+            decoded_bands.bands[0].data,
+            DecodedData::UChar(vec![1, 0, 3, 5, 7, 0])
+        );
+        assert_eq!(
+            decoded_bands.bands[1].data,
+            DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
         );
     }
 
