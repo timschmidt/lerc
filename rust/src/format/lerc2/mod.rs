@@ -4459,6 +4459,197 @@ fn restore_fp_byte_delta_sequence(data: &[u8], level: u8) -> Result<Vec<u8>> {
     Ok(restored)
 }
 
+#[allow(dead_code)]
+fn restore_fp_bytes_from_planes(
+    byte_planes: &[(usize, Vec<u8>)],
+    data_type: DataType,
+    cols: usize,
+    rows: usize,
+    predictor: FpPredictor,
+) -> Result<Vec<u8>> {
+    let value_size = match data_type {
+        DataType::Float => 4,
+        DataType::Double => 8,
+        _ => {
+            return Err(LercError::Unsupported(
+                "floating-point Huffman restore requires float or double data",
+            ))
+        }
+    };
+    let sample_count = cols.checked_mul(rows).ok_or(LercError::CorruptInput(
+        "floating-point sample count overflow",
+    ))?;
+    if byte_planes.len() != value_size {
+        return Err(LercError::CorruptInput(
+            "floating-point Huffman byte-plane count mismatch",
+        ));
+    }
+
+    let mut bytes = vec![0u8; sample_count * value_size];
+    let mut seen = vec![false; value_size];
+    for (byte_index, plane) in byte_planes {
+        if *byte_index >= value_size || seen[*byte_index] {
+            return Err(LercError::CorruptInput(
+                "floating-point Huffman byte-plane index is invalid",
+            ));
+        }
+        if plane.len() != sample_count {
+            return Err(LercError::CorruptInput(
+                "floating-point Huffman byte-plane length mismatch",
+            ));
+        }
+        seen[*byte_index] = true;
+        for (sample_idx, byte) in plane.iter().copied().enumerate() {
+            bytes[sample_idx * value_size + *byte_index] = byte;
+        }
+    }
+
+    match data_type {
+        DataType::Float => {
+            let mut values: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            match predictor {
+                FpPredictor::RowsCols => {
+                    restore_fp_cross_sequence_u32(&mut values, cols, rows, predictor.int_delta())
+                }
+                _ => restore_fp_block_sequence_u32(&mut values, cols, rows, predictor.int_delta()),
+            }
+            for value in &mut values {
+                *value = undo_float_transform_bits(*value);
+            }
+            bytes.clear();
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        DataType::Double => {
+            let mut values: Vec<u64> = bytes
+                .chunks_exact(8)
+                .map(|chunk| {
+                    u64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ])
+                })
+                .collect();
+            match predictor {
+                FpPredictor::RowsCols => {
+                    restore_fp_cross_sequence_u64(&mut values, cols, rows, predictor.int_delta())
+                }
+                _ => restore_fp_block_sequence_u64(&mut values, cols, rows, predictor.int_delta()),
+            }
+            bytes.clear();
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        _ => unreachable!("data type checked above"),
+    }
+    Ok(bytes)
+}
+
+#[allow(dead_code)]
+fn undo_float_transform_bits(value: u32) -> u32 {
+    let mantissa = value & 0x007f_ffff;
+    let exponent = ((value & 0xff80_0000) >> 24) & 0xff;
+    let sign = (value >> 23) & 0x01;
+    mantissa | (exponent << 23) | (sign << 31)
+}
+
+fn add_fp32_bits(lhs: u32, rhs: u32) -> u32 {
+    let mantissa = lhs.wrapping_add(rhs) & 0x007f_ffff;
+    let lhs_exp = ((lhs & 0xff80_0000) >> 23) & 0x1ff;
+    let rhs_exp = ((rhs & 0xff80_0000) >> 23) & 0x1ff;
+    mantissa | (((lhs_exp + rhs_exp) & 0x1ff) << 23)
+}
+
+fn add_fp64_bits(lhs: u64, rhs: u64) -> u64 {
+    let mantissa = lhs.wrapping_add(rhs) & 0x000f_ffff_ffff_ffff;
+    let lhs_exp = ((lhs & 0xfff0_0000_0000_0000) >> 52) & 0xfff;
+    let rhs_exp = ((rhs & 0xfff0_0000_0000_0000) >> 52) & 0xfff;
+    mantissa | (((lhs_exp + rhs_exp) & 0xfff) << 52)
+}
+
+fn restore_fp_block_sequence_u32(values: &mut [u32], cols: usize, rows: usize, delta: u8) {
+    if delta == 2 {
+        for row in 0..rows {
+            let row_start = row * cols;
+            for col in 2..cols {
+                let idx = row_start + col;
+                values[idx] = add_fp32_bits(values[idx], values[idx - 1]);
+            }
+        }
+    }
+    if delta > 0 {
+        for row in 0..rows {
+            let row_start = row * cols;
+            for col in 1..cols {
+                let idx = row_start + col;
+                values[idx] = add_fp32_bits(values[idx], values[idx - 1]);
+            }
+        }
+    }
+}
+
+fn restore_fp_block_sequence_u64(values: &mut [u64], cols: usize, rows: usize, delta: u8) {
+    if delta == 2 {
+        for row in 0..rows {
+            let row_start = row * cols;
+            for col in 2..cols {
+                let idx = row_start + col;
+                values[idx] = add_fp64_bits(values[idx], values[idx - 1]);
+            }
+        }
+    }
+    if delta > 0 {
+        for row in 0..rows {
+            let row_start = row * cols;
+            for col in 1..cols {
+                let idx = row_start + col;
+                values[idx] = add_fp64_bits(values[idx], values[idx - 1]);
+            }
+        }
+    }
+}
+
+fn restore_fp_cross_sequence_u32(values: &mut [u32], cols: usize, rows: usize, delta: u8) {
+    if delta == 2 {
+        for col in 0..cols {
+            for row in 1..rows {
+                let idx = row * cols + col;
+                values[idx] = add_fp32_bits(values[idx], values[idx - cols]);
+            }
+        }
+    }
+    for row in 0..rows {
+        let row_start = row * cols;
+        for col in 1..cols {
+            let idx = row_start + col;
+            values[idx] = add_fp32_bits(values[idx], values[idx - 1]);
+        }
+    }
+}
+
+fn restore_fp_cross_sequence_u64(values: &mut [u64], cols: usize, rows: usize, delta: u8) {
+    if delta == 2 {
+        for col in 0..cols {
+            for row in 1..rows {
+                let idx = row * cols + col;
+                values[idx] = add_fp64_bits(values[idx], values[idx - cols]);
+            }
+        }
+    }
+    for row in 0..rows {
+        let row_start = row * cols;
+        for col in 1..cols {
+            let idx = row_start + col;
+            values[idx] = add_fp64_bits(values[idx], values[idx - 1]);
+        }
+    }
+}
+
 fn read_huffman_int_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
@@ -5185,10 +5376,10 @@ mod tests {
         get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        restore_fp_byte_delta_sequence, validate_lerc2_checksum, write_lerc2_header,
-        write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
-        DecodeIntoSpec, FpPredictor, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes, validate_lerc2_checksum,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
+        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, MinMaxRanges,
+        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -6203,6 +6394,135 @@ mod tests {
         assert_eq!(
             restore_fp_byte_delta_sequence(&[1, 2, 3], 6).unwrap_err(),
             LercError::CorruptInput("floating-point Huffman byte delta level is invalid")
+        );
+    }
+
+    #[test]
+    fn restores_floating_point_huffman_byte_order_without_prediction() {
+        let transformed = [0x7f00_0000u32, 0x8020_0000];
+        let planes = vec![
+            (
+                2,
+                transformed
+                    .iter()
+                    .map(|value| value.to_le_bytes()[2])
+                    .collect(),
+            ),
+            (
+                0,
+                transformed
+                    .iter()
+                    .map(|value| value.to_le_bytes()[0])
+                    .collect(),
+            ),
+            (
+                3,
+                transformed
+                    .iter()
+                    .map(|value| value.to_le_bytes()[3])
+                    .collect(),
+            ),
+            (
+                1,
+                transformed
+                    .iter()
+                    .map(|value| value.to_le_bytes()[1])
+                    .collect(),
+            ),
+        ];
+        let restored =
+            restore_fp_bytes_from_planes(&planes, DataType::Float, 2, 1, FpPredictor::None)
+                .unwrap();
+        let values: Vec<f32> = restored
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        assert_eq!(values, [1.0, 2.5]);
+    }
+
+    #[test]
+    fn restores_floating_point_huffman_byte_order_with_row_delta() {
+        let values = vec![
+            0x3ff0_0000_0000_0000u64,
+            0x0010_0000_0000_0001,
+            0x0000_0000_0000_0002,
+        ];
+        let mut planes = Vec::new();
+        for byte_index in 0..8 {
+            planes.push((
+                byte_index,
+                values
+                    .iter()
+                    .map(|value| value.to_le_bytes()[byte_index])
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let restored =
+            restore_fp_bytes_from_planes(&planes, DataType::Double, 3, 1, FpPredictor::Delta1)
+                .unwrap();
+        let restored_values: Vec<u64> = restored
+            .chunks_exact(8)
+            .map(|chunk| {
+                u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect();
+
+        assert_eq!(
+            restored_values,
+            [
+                0x3ff0_0000_0000_0000,
+                0x4000_0000_0000_0001,
+                0x4000_0000_0000_0003,
+            ]
+        );
+    }
+
+    #[test]
+    fn restores_floating_point_huffman_byte_order_with_cross_delta() {
+        let values = vec![
+            0x3ff0_0000_0000_0000u64,
+            0x0010_0000_0000_0001,
+            0x0010_0000_0000_0002,
+            0x0000_0000_0000_0003,
+        ];
+        let mut planes = Vec::new();
+        for byte_index in 0..8 {
+            planes.push((
+                byte_index,
+                values
+                    .iter()
+                    .map(|value| value.to_le_bytes()[byte_index])
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let restored =
+            restore_fp_bytes_from_planes(&planes, DataType::Double, 2, 2, FpPredictor::RowsCols)
+                .unwrap();
+        let restored_values: Vec<u64> = restored
+            .chunks_exact(8)
+            .map(|chunk| {
+                u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect();
+
+        assert_eq!(
+            restored_values,
+            [
+                0x3ff0_0000_0000_0000,
+                0x4000_0000_0000_0001,
+                0x4000_0000_0000_0002,
+                0x4010_0000_0000_0006,
+            ]
+        );
+        assert_eq!(
+            restore_fp_bytes_from_planes(&planes[..3], DataType::Double, 2, 2, FpPredictor::None)
+                .unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman byte-plane count mismatch")
         );
     }
 
