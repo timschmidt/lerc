@@ -2,14 +2,14 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    compute_checksum_fletcher32, decode_lerc1, decode_lerc2_bands_supported,
-    decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_typed_values, get_lerc1_header_info,
-    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-    get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
-    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
-    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
-    DataType, DecodeIntoSpec, EncodeSpec, Rle,
+    compute_checksum_fletcher32, compute_lerc2_header_byte_len, decode_lerc1,
+    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_typed_values,
+    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
+    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
+    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -81,6 +81,29 @@ fn main() {
         n_bands: 2,
         n_masks: 1,
     };
+    let encode_header = HeaderInfo {
+        version: 6,
+        checksum: 0,
+        n_rows: 2,
+        n_cols: 3,
+        n_depth: 2,
+        num_valid_pixel: 6,
+        micro_block_size: 8,
+        blob_size: (compute_lerc2_header_byte_len(6).unwrap() + 4) as i32,
+        n_blobs_more: 0,
+        b_pass_no_data_values: 0,
+        b_is_int: 1,
+        b_reserved_3: 0,
+        b_reserved_4: 0,
+        data_type: DataType::UChar,
+        max_z_error: 0.5,
+        z_min: 1.0,
+        z_max: 12.0,
+        no_data_val: 0.0,
+        no_data_val_orig: 0.0,
+        header_size: compute_lerc2_header_byte_len(6).unwrap(),
+    };
+    let mut encode_header_bytes = vec![0; encode_header.header_size];
     let mut decode_into_data = vec![0; one_sweep_bands_decoded.data_byte_len()];
     let mut decode_into_mask = vec![0; 6];
     let mut decode_to_f64_data = vec![0.0f64; decode_into_spec.value_count().unwrap()];
@@ -343,6 +366,16 @@ fn main() {
         black_box(encode_spec.data_byte_len().unwrap());
         black_box(encode_spec.value_count().unwrap());
         black_box(encode_spec.mask_byte_len().unwrap());
+    });
+    bench("lerc2-header-write-v6", 100_000, || {
+        black_box(compute_lerc2_header_byte_len(6).unwrap());
+        black_box(
+            write_lerc2_header(
+                black_box(&encode_header),
+                black_box(&mut encode_header_bytes),
+            )
+            .unwrap(),
+        );
     });
     bench("lerc2-supported-decode-into-v4-synthetic", 100_000, || {
         black_box(

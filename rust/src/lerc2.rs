@@ -370,6 +370,81 @@ pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     })
 }
 
+/// Computes the serialized byte count for a Lerc2 header version.
+pub fn compute_lerc2_header_byte_len(version: i32) -> Result<usize> {
+    if !(0..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam("unsupported Lerc2 header version"));
+    }
+
+    Ok(FILE_KEY.len()
+        + 4
+        + if version >= 3 { 4 } else { 0 }
+        + if version >= 4 { 7 * 4 } else { 6 * 4 }
+        + if version >= 6 { 4 + 4 } else { 0 }
+        + if version >= 6 { 5 * 8 } else { 3 * 8 })
+}
+
+/// Writes a Lerc2 header in little-endian byte order.
+///
+/// The checksum field is written from `header.checksum`. Encoders that need a
+/// zero placeholder should set that field to zero before calling this helper.
+pub fn write_lerc2_header(header: &HeaderInfo, output: &mut [u8]) -> Result<usize> {
+    if header.version < 4 && header.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 headers can only store depth 1",
+        ));
+    }
+
+    validate_header_dims(
+        header.n_rows,
+        header.n_cols,
+        header.n_depth,
+        header.num_valid_pixel,
+        header.micro_block_size,
+        header.blob_size,
+    )
+    .map_err(|_| LercError::WrongParam("invalid Lerc2 header dimensions"))?;
+
+    let header_len = compute_lerc2_header_byte_len(header.version)?;
+    if output.len() < header_len {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut writer = Writer::new(output);
+    writer.write_bytes(FILE_KEY)?;
+    writer.write_i32_le(header.version)?;
+    if header.version >= 3 {
+        writer.write_u32_le(header.checksum)?;
+    }
+    writer.write_i32_le(header.n_rows)?;
+    writer.write_i32_le(header.n_cols)?;
+    if header.version >= 4 {
+        writer.write_i32_le(header.n_depth)?;
+    }
+    writer.write_i32_le(header.num_valid_pixel)?;
+    writer.write_i32_le(header.micro_block_size)?;
+    writer.write_i32_le(header.blob_size)?;
+    writer.write_i32_le(header.data_type as i32)?;
+    if header.version >= 6 {
+        writer.write_i32_le(header.n_blobs_more)?;
+        writer.write_bytes(&[
+            header.b_pass_no_data_values,
+            header.b_is_int,
+            header.b_reserved_3,
+            header.b_reserved_4,
+        ])?;
+    }
+    writer.write_f64_le(header.max_z_error)?;
+    writer.write_f64_le(header.z_min)?;
+    writer.write_f64_le(header.z_max)?;
+    if header.version >= 6 {
+        writer.write_f64_le(header.no_data_val)?;
+        writer.write_f64_le(header.no_data_val_orig)?;
+    }
+
+    Ok(writer.pos)
+}
+
 /// Reads and decodes the Lerc2 mask section.
 pub fn read_lerc2_mask(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo)> {
     read_lerc2_mask_with_previous(blob, None)
@@ -2118,15 +2193,48 @@ impl<'a> Reader<'a> {
     }
 }
 
+struct Writer<'a> {
+    bytes: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> Writer<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn write_bytes(&mut self, src: &[u8]) -> Result<()> {
+        if self.bytes.len().saturating_sub(self.pos) < src.len() {
+            return Err(LercError::BufferTooSmall);
+        }
+        self.bytes[self.pos..self.pos + src.len()].copy_from_slice(src);
+        self.pos += src.len();
+        Ok(())
+    }
+
+    fn write_i32_le(&mut self, value: i32) -> Result<()> {
+        self.write_bytes(&value.to_le_bytes())
+    }
+
+    fn write_u32_le(&mut self, value: u32) -> Result<()> {
+        self.write_bytes(&value.to_le_bytes())
+    }
+
+    fn write_f64_le(&mut self, value: f64) -> Result<()> {
+        self.write_bytes(&value.to_le_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
-        read_lerc2_tiled_raw, validate_lerc2_checksum, DecodeIntoSpec, BLOB_DATA_RANGE_ARRAY_LEN,
+        compute_checksum_fletcher32, compute_lerc2_header_byte_len, decode_lerc2_bands_supported,
+        decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
+        decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+        get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep,
+        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
+        write_lerc2_header, DecodeIntoSpec, HeaderInfo, BLOB_DATA_RANGE_ARRAY_LEN,
         BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
@@ -2139,6 +2247,32 @@ mod tests {
         path.push("testData");
         path.push(name);
         fs::read(path).unwrap()
+    }
+
+    fn header_for_write(version: i32) -> HeaderInfo {
+        let header_size = compute_lerc2_header_byte_len(version).unwrap();
+        HeaderInfo {
+            version,
+            checksum: 0x1234_5678,
+            n_rows: 2,
+            n_cols: 3,
+            n_depth: if version >= 4 { 2 } else { 1 },
+            num_valid_pixel: 5,
+            micro_block_size: 8,
+            blob_size: (header_size + 4) as i32,
+            n_blobs_more: if version >= 6 { 1 } else { 0 },
+            b_pass_no_data_values: if version >= 6 { 1 } else { 0 },
+            b_is_int: if version >= 6 { 1 } else { 0 },
+            b_reserved_3: if version >= 6 { 2 } else { 0 },
+            b_reserved_4: if version >= 6 { 3 } else { 0 },
+            data_type: DataType::Float,
+            max_z_error: 0.125,
+            z_min: -3.5,
+            z_max: 10.25,
+            no_data_val: if version >= 6 { -9999.0 } else { 0.0 },
+            no_data_val_orig: if version >= 6 { -32768.0 } else { 0.0 },
+            header_size,
+        }
     }
 
     fn synthetic_v4_blob(data_type: DataType, n_depth: i32, range_bytes: &[u8]) -> Vec<u8> {
@@ -2577,6 +2711,73 @@ mod tests {
         assert_eq!(header.max_z_error, 0.000_075);
         assert_eq!(header.z_min, -82.972_091_674_804_69);
         assert_eq!(header.z_max, 4080.613_769_531_25);
+    }
+
+    #[test]
+    fn computes_lerc2_header_byte_lengths() {
+        assert_eq!(compute_lerc2_header_byte_len(2).unwrap(), 58);
+        assert_eq!(compute_lerc2_header_byte_len(3).unwrap(), 62);
+        assert_eq!(compute_lerc2_header_byte_len(4).unwrap(), 66);
+        assert_eq!(compute_lerc2_header_byte_len(6).unwrap(), 90);
+        assert_eq!(
+            compute_lerc2_header_byte_len(7).unwrap_err(),
+            LercError::WrongParam("unsupported Lerc2 header version")
+        );
+    }
+
+    #[test]
+    fn writes_lerc2_v3_header_for_parser_round_trip() {
+        let header = header_for_write(3);
+        let mut blob = vec![0; header.header_size + 4];
+        let written = write_lerc2_header(&header, &mut blob).unwrap();
+        blob[written..written + 4].copy_from_slice(&0i32.to_le_bytes());
+
+        assert_eq!(written, header.header_size);
+        let probe = get_lerc2_header_info(&blob).unwrap();
+        assert!(!probe.has_mask);
+        assert_eq!(probe.header, header);
+    }
+
+    #[test]
+    fn writes_lerc2_v6_header_for_parser_round_trip() {
+        let header = header_for_write(6);
+        let mut blob = vec![0; header.header_size + 4];
+        let written = write_lerc2_header(&header, &mut blob).unwrap();
+        blob[written..written + 4].copy_from_slice(&0i32.to_le_bytes());
+
+        assert_eq!(written, header.header_size);
+        let probe = get_lerc2_header_info(&blob).unwrap();
+        assert!(!probe.has_mask);
+        assert_eq!(probe.header, header);
+    }
+
+    #[test]
+    fn rejects_invalid_lerc2_header_write_inputs() {
+        let header = header_for_write(4);
+        assert_eq!(
+            write_lerc2_header(&header, &mut [0; 8]).unwrap_err(),
+            LercError::BufferTooSmall
+        );
+
+        let bad_depth = HeaderInfo {
+            version: 3,
+            n_depth: 2,
+            ..header_for_write(3)
+        };
+        let mut output = [0; 86];
+        assert_eq!(
+            write_lerc2_header(&bad_depth, &mut output).unwrap_err(),
+            LercError::WrongParam("pre-v4 Lerc2 headers can only store depth 1")
+        );
+
+        let bad_dims = HeaderInfo {
+            n_rows: 0,
+            ..header
+        };
+        assert_eq!(
+            write_lerc2_header(&bad_dims, &mut output).unwrap_err(),
+            LercError::WrongParam("invalid Lerc2 header dimensions")
+        );
     }
 
     #[test]
