@@ -1248,6 +1248,7 @@ mod tests {
         for (fixture_name, n_depth, n_bands) in [
             ("bluemarble_256_256_3_byte.lerc2", 1, 3),
             ("california_400_400_1_float.lerc2", 1, 1),
+            ("world.lerc1", 1, 1),
         ] {
             let blob = fixture(fixture_name);
             let expected = get_lerc2_data_ranges(&blob).unwrap();

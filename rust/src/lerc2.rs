@@ -434,7 +434,14 @@ pub fn read_lerc2_min_max_ranges_with_previous(
 }
 
 /// Aggregates data ranges across one or more concatenated Lerc2 bands.
+///
+/// Legacy Lerc1 blobs fall back to the Lerc1 z-stat reader and report a
+/// single-band, single-depth range.
 pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
+    if get_lerc2_header_info(blob).is_err() {
+        return get_lerc1_data_ranges(blob);
+    }
+
     let mut offset = 0usize;
     let mut previous_mask: Option<BitMask> = None;
     let mut first_header: Option<HeaderInfo> = None;
@@ -480,6 +487,17 @@ pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
         n_bands,
         n_depth,
         bytes_consumed: offset,
+    })
+}
+
+fn get_lerc1_data_ranges(blob: &[u8]) -> Result<DataRanges> {
+    let (_, _, stats) = read_lerc1_z_stats(blob)?;
+    Ok(DataRanges {
+        mins: vec![stats.z_min as f64],
+        maxs: vec![stats.z_max as f64],
+        n_bands: 1,
+        n_depth: 1,
+        bytes_consumed: stats.bytes_consumed,
     })
 }
 
@@ -2679,6 +2697,18 @@ mod tests {
         assert_eq!(ranges.bytes_consumed, blob.len());
         assert_eq!(ranges.mins, [-82.972_091_674_804_69]);
         assert_eq!(ranges.maxs, [4080.613_769_531_25]);
+    }
+
+    #[test]
+    fn reports_data_ranges_for_legacy_lerc1_fixture() {
+        let blob = fixture("world.lerc1");
+        let ranges = get_lerc2_data_ranges(&blob).unwrap();
+
+        assert_eq!(ranges.n_bands, 1);
+        assert_eq!(ranges.n_depth, 1);
+        assert_eq!(ranges.bytes_consumed, blob.len());
+        assert_eq!(ranges.mins, [-27.458_635_330_200_195]);
+        assert_eq!(ranges.maxs, [5474.172_851_562_5]);
     }
 
     #[test]
