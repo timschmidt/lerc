@@ -8,8 +8,8 @@ description = "Rust port of core LERC primitives"
 [lib]
 name = "lerc"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bench]]
 name = "rle_bit_stuffer"
 harness = false
-

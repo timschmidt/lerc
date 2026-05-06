@@ -28,6 +28,8 @@ pub mod bit_mask;
 pub mod bit_stuffer;
 /// Typed decoded data containers and conversion helpers.
 pub mod decoded;
+/// C ABI entry points.
+pub mod ffi;
 /// Lerc2 metadata and supported-subset decode helpers.
 pub mod lerc2;
 /// LERC run-length encoding helpers.
