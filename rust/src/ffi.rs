@@ -23,9 +23,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// C ABI equivalent of `lerc_computeCompressedSize`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
-/// no-data inputs currently zero `num_bytes` and return
-/// [`ErrCode::Failed`].
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
+/// metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -67,9 +66,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
 
 /// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
-/// no-data inputs currently zero `num_bytes` and return
-/// [`ErrCode::Failed`].
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
+/// metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -110,9 +108,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
 
 /// C ABI equivalent of `lerc_encode`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
-/// no-data inputs currently zero `n_bytes_written` and return
-/// [`ErrCode::Failed`].
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
+/// metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -158,9 +155,8 @@ pub unsafe extern "C" fn lerc_encode(
 
 /// C ABI equivalent of `lerc_encodeForVersion`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. 4D
-/// no-data inputs currently zero `n_bytes_written` and return
-/// [`ErrCode::Failed`].
+/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
+/// metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -205,9 +201,8 @@ pub unsafe extern "C" fn lerc_encodeForVersion(
 
 /// C ABI equivalent of `lerc_computeCompressedSize_4D`.
 ///
-/// Calls without active no-data bands are encoded by the Rust constant or
-/// one-sweep Lerc2 paths. Active no-data encode is not ported yet and returns
-/// [`ErrCode::Failed`].
+/// Calls with or without active no-data bands are encoded by the Rust
+/// one-sweep Lerc2 paths.
 ///
 /// # Safety
 ///
@@ -251,9 +246,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSize_4D(
 
 /// C ABI equivalent of `lerc_encode_4D`.
 ///
-/// Calls without active no-data bands are encoded by the Rust constant or
-/// one-sweep Lerc2 paths. Active no-data encode is not ported yet and returns
-/// [`ErrCode::Failed`].
+/// Calls with or without active no-data bands are encoded by the Rust
+/// one-sweep Lerc2 paths.
 ///
 /// # Safety
 ///
