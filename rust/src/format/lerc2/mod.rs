@@ -864,12 +864,28 @@ pub fn encode_lerc2_auto(
     version: i32,
 ) -> Result<Vec<u8>> {
     let baseline = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
-    if spec.n_bands != 1
-        || !matches!(spec.data_type, DataType::UChar | DataType::Char)
+    if !matches!(spec.data_type, DataType::UChar | DataType::Char)
         || max_z_error != 0.5
         || version < 4
     {
         return Ok(baseline);
+    }
+
+    if spec.n_bands != 1 {
+        return match encode_lerc2_byte_huffman_bands(spec, data, masks, version) {
+            Ok(huffman) if huffman.len() < baseline.len() => Ok(huffman),
+            Ok(_) => Ok(baseline),
+            Err(LercError::WrongParam("constant byte input should use Lerc2 constant encode")) => {
+                Ok(baseline)
+            }
+            Err(LercError::WrongParam("constant byte ranges should use Lerc2 constant encode")) => {
+                Ok(baseline)
+            }
+            Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => {
+                Ok(baseline)
+            }
+            Err(err) => Err(err),
+        };
     }
 
     let mask = match masks {
@@ -894,6 +910,103 @@ pub fn encode_lerc2_auto(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Encodes band-major byte data as concatenated byte-Huffman Lerc2 blobs.
+///
+/// This helper mirrors the existing band-major encode layout: no masks means
+/// all pixels are valid, one mask is shared by all bands and may be omitted
+/// after the first band, and `n_bands` masks provide per-band masks. Version 6
+/// blobs carry `nBlobsMore`; version 4 and 5 concatenation relies on the next
+/// blob header.
+pub fn encode_lerc2_byte_huffman_bands(
+    spec: EncodeSpec,
+    data: &[u8],
+    masks: Option<&[u8]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    validate_encode_bands_inputs(spec, data, masks, "byte Huffman Lerc2 band encode")?;
+    if !(4..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam(
+            "byte Huffman Lerc2 encode requires version 4 or newer",
+        ));
+    }
+    if !matches!(spec.data_type, DataType::UChar | DataType::Char) {
+        return Err(LercError::WrongParam(
+            "byte Huffman Lerc2 encode requires Char or UChar data",
+        ));
+    }
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    let mask_len = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam(
+            "Lerc2 encode mask byte count overflow",
+        ))?;
+    let mut blob = Vec::new();
+    let mut previous_mask: Option<BitMask> = None;
+
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let mask = match masks {
+            Some(mask_bytes) if spec.n_masks == 1 => Some(BitMask::from_byte_mask(
+                &mask_bytes[..mask_len],
+                spec.n_cols,
+                spec.n_rows,
+            )?),
+            Some(mask_bytes) => {
+                let mask_start = band
+                    .checked_mul(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 encode mask offset overflow"))?;
+                Some(BitMask::from_byte_mask(
+                    &mask_bytes[mask_start..mask_start + mask_len],
+                    spec.n_cols,
+                    spec.n_rows,
+                )?)
+            }
+            None => None,
+        };
+        let n_blobs_more = if version >= 6 {
+            i32::try_from(spec.n_bands - 1 - band)
+                .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
+        } else {
+            0
+        };
+        let encode_mask = if band == 0 {
+            true
+        } else if spec.n_masks == 1 {
+            false
+        } else {
+            match (mask.as_ref(), &previous_mask) {
+                (Some(mask), Some(previous)) => mask != previous,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        };
+        let band_blob = encode_lerc2_byte_huffman_band(
+            EncodeSpec {
+                n_masks: usize::from(mask.is_some()),
+                ..band_spec
+            },
+            &data[data_start..data_start + band_data_len],
+            mask.as_ref(),
+            version,
+            n_blobs_more,
+            encode_mask,
+        )?;
+        blob.extend_from_slice(&band_blob);
+        previous_mask = mask;
+    }
+
+    Ok(blob)
 }
 
 /// Encodes a single-band Lerc2 blob using one-sweep payloads with no-data metadata.
@@ -4793,8 +4906,8 @@ mod tests {
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
         compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
         decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        encode_lerc2_auto, encode_lerc2_byte_huffman, encode_lerc2_constant,
-        encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        encode_lerc2_auto, encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
+        encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
         encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
@@ -5990,6 +6103,75 @@ mod tests {
 
         assert!(auto.len() < uncompressed.len());
         assert_eq!(decoded.data, DecodedData::UChar(data));
+        assert_eq!(decoded.bytes_consumed, auto.len());
+    }
+
+    #[test]
+    fn encodes_byte_huffman_lerc2_bands_with_shared_mask() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 64,
+            n_rows: 16,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let band_len = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(band_len * 2);
+        data.extend((0..band_len).map(|idx| (idx % 64) as u8));
+        data.extend((0..band_len).map(|idx| (255 - (idx % 64)) as u8));
+        let mask: Vec<u8> = (0..band_len)
+            .map(|idx| u8::from(idx % 13 != 0 && idx % 17 != 0))
+            .collect();
+
+        let blob = encode_lerc2_byte_huffman_bands(spec, &data, Some(&mask), 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 1);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+        for band in 0..2 {
+            let mut expected = data[band * band_len..(band + 1) * band_len].to_vec();
+            for (idx, valid) in mask.iter().enumerate() {
+                if *valid == 0 {
+                    expected[idx] = 0;
+                }
+            }
+            assert_eq!(decoded.bands[band].data, DecodedData::UChar(expected));
+        }
+        assert_eq!(decoded.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn auto_encode_selects_byte_huffman_bands_when_smaller() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 64,
+            n_rows: 64,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let band_len = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(band_len * 2);
+        data.extend((0..band_len).map(|idx| (idx % 64) as u8));
+        data.extend((0..band_len).map(|idx| (128 + idx % 64) as u8));
+
+        let auto = encode_lerc2_auto(spec, &data, 0.5, None, 6).unwrap();
+        let uncompressed = encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&auto).unwrap();
+
+        assert!(auto.len() < uncompressed.len());
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(data[..band_len].to_vec())
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(data[band_len..].to_vec())
+        );
         assert_eq!(decoded.bytes_consumed, auto.len());
     }
 

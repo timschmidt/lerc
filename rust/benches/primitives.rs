@@ -199,6 +199,18 @@ fn main() {
     )
     .unwrap();
     let huffman_encode_mask_bytes = huffman_encode_mask.to_byte_mask();
+    let huffman_bands_encode_spec = EncodeSpec {
+        n_depth: 1,
+        n_cols: 64,
+        n_rows: 64,
+        n_bands: 2,
+        n_masks: 0,
+        ..huffman_encode_spec
+    };
+    let huffman_bands_len = huffman_bands_encode_spec.n_cols * huffman_bands_encode_spec.n_rows;
+    let mut huffman_bands_encode_data = Vec::with_capacity(huffman_bands_len * 2);
+    huffman_bands_encode_data.extend((0..huffman_bands_len).map(|idx| (idx % 64) as u8));
+    huffman_bands_encode_data.extend((0..huffman_bands_len).map(|idx| (128 + idx % 64) as u8));
     let ffi_constant_encode_mask = [1u8, 0, 1, 1, 1, 1];
     let mut ffi_constant_encode_size = 0u32;
     let mut ffi_constant_encode_out = [0u8; 128];
@@ -673,6 +685,18 @@ fn main() {
                 black_box(&huffman_encode_data),
                 0.5,
                 Some(black_box(&huffman_encode_mask_bytes)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-auto-byte-huffman-bands-encode-v6", 10_000, || {
+        black_box(
+            encode_lerc2_auto(
+                huffman_bands_encode_spec,
+                black_box(&huffman_bands_encode_data),
+                0.5,
+                None,
                 6,
             )
             .unwrap(),

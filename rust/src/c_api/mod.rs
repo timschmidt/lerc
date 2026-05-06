@@ -1873,6 +1873,73 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_encode_selects_byte_huffman_bands_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 64,
+            n_rows: 64,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let band_len = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(band_len * 2);
+        data.extend((0..band_len).map(|idx| (idx % 64) as u8));
+        data.extend((0..band_len).map(|idx| (128 + idx % 64) as u8));
+        let uncompressed = crate::encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                64,
+                64,
+                2,
+                0,
+                ptr::null(),
+                0.5,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                64,
+                64,
+                2,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        assert!((written as usize) < uncompressed.len());
+        let decoded = decode_lerc2_bands_supported(&out[..written as usize]).unwrap();
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(data[..band_len].to_vec())
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(data[band_len..].to_vec())
+        );
+    }
+
+    #[test]
     fn c_abi_encode_supports_one_sweep_multi_band_input() {
         let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
         let valid = [1u8, 0, 1, 1, 1, 0];
