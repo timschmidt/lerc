@@ -1477,7 +1477,7 @@ fn encode_lerc2_byte_huffman_band(
 fn encode_lerc2_tiled_raw_band(
     spec: EncodeSpec,
     data: &[u8],
-    max_z_error: f64,
+    mut max_z_error: f64,
     mask: Option<&BitMask>,
     version: i32,
     micro_block_size: i32,
@@ -1486,9 +1486,6 @@ fn encode_lerc2_tiled_raw_band(
     no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "raw tiled Lerc2 encode")?;
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
     if !(4..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
             "raw tiled Lerc2 encode requires version 4 or newer",
@@ -1512,6 +1509,7 @@ fn encode_lerc2_tiled_raw_band(
 
     let mask = effective_encode_mask(spec, mask)?;
     let num_valid_pixel = mask.count_valid_bits();
+    max_z_error = normalize_lerc2_max_z_error_for_encode(spec, data, &mask, max_z_error)?;
     let ranges = compute_lerc2_data_ranges_for_encode_with_mask(spec, data, &mask)?;
     let z_min = ranges.mins.iter().copied().fold(f64::INFINITY, f64::min);
     let z_max = ranges
@@ -1631,9 +1629,7 @@ pub fn encode_lerc2_tiled_raw_bands_with_no_data(
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "raw tiled Lerc2 band encode")?;
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if !(4..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
             "raw tiled Lerc2 encode requires version 4 or newer",
@@ -1753,7 +1749,7 @@ pub fn encode_lerc2_tiled_raw_bands_with_no_data(
 fn encode_lerc2_one_sweep_band(
     spec: EncodeSpec,
     data: &[u8],
-    max_z_error: f64,
+    mut max_z_error: f64,
     mask: Option<&BitMask>,
     version: i32,
     n_blobs_more: i32,
@@ -1761,9 +1757,6 @@ fn encode_lerc2_one_sweep_band(
     no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "one-sweep Lerc2 encode")?;
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
     if !(4..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
             "one-sweep Lerc2 encode requires version 4 or newer",
@@ -1782,6 +1775,7 @@ fn encode_lerc2_one_sweep_band(
 
     let mask = effective_encode_mask(spec, mask)?;
     let num_valid_pixel = mask.count_valid_bits();
+    max_z_error = normalize_lerc2_max_z_error_for_encode(spec, data, &mask, max_z_error)?;
     let ranges = compute_lerc2_data_ranges_for_encode_with_mask(spec, data, &mask)?;
     let z_min = ranges.mins.iter().copied().fold(f64::INFINITY, f64::min);
     let z_max = ranges
@@ -1883,9 +1877,7 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
     version: i32,
 ) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "one-sweep Lerc2 band encode")?;
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if !(4..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
             "one-sweep Lerc2 encode requires version 4 or newer",
@@ -3251,8 +3243,225 @@ fn effective_encode_mask(spec: EncodeSpec, mask: Option<&BitMask>) -> Result<Bit
     Ok(mask)
 }
 
+fn validate_negative_max_z_error_for_encode(data_type: DataType, max_z_error: f64) -> Result<()> {
+    if max_z_error < 0.0 && !is_integer_data_type(data_type) {
+        return Err(LercError::WrongParam(
+            "negative max_z_error bit-plane encode requires integer data",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_lerc2_max_z_error_for_encode(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: &BitMask,
+    max_z_error: f64,
+) -> Result<f64> {
+    if max_z_error >= 0.0 {
+        return Ok(max_z_error);
+    }
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
+    let inferred = try_lerc2_bit_plane_max_z_error(spec, data, mask, -max_z_error)?.unwrap_or(0.0);
+    Ok(inferred.floor().max(0.5))
+}
+
+fn is_integer_data_type(data_type: DataType) -> bool {
+    (data_type as i32) < (DataType::Float as i32)
+}
+
+#[allow(dead_code)]
+fn try_lerc2_bit_plane_max_z_error(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: &BitMask,
+    eps: f64,
+) -> Result<Option<f64>> {
+    if !is_integer_data_type(spec.data_type) || eps <= 0.0 {
+        return Ok(None);
+    }
+    let num_valid_pixel = mask.count_valid_bits();
+    const MIN_COUNT: usize = 5000;
+    if num_valid_pixel < MIN_COUNT {
+        return Ok(None);
+    }
+
+    let max_shift = spec.data_type.size_in_bytes() * 8;
+    let mut counts = vec![0usize; spec.n_depth * max_shift];
+    let mut pair_count = 0usize;
+
+    if spec.n_depth == 1 && num_valid_pixel == spec.n_cols * spec.n_rows {
+        for row in 0..spec.n_rows.saturating_sub(1) {
+            for col in 0..spec.n_cols.saturating_sub(1) {
+                let idx = row * spec.n_cols + col;
+                add_lerc2_bit_plane_diff_counts(
+                    spec.data_type,
+                    max_shift,
+                    data,
+                    idx,
+                    idx + 1,
+                    0,
+                    spec.n_depth,
+                    &mut counts,
+                );
+                pair_count += 1;
+                add_lerc2_bit_plane_diff_counts(
+                    spec.data_type,
+                    max_shift,
+                    data,
+                    idx,
+                    idx + spec.n_cols,
+                    0,
+                    spec.n_depth,
+                    &mut counts,
+                );
+                pair_count += 1;
+            }
+        }
+    } else {
+        for row in 0..spec.n_rows {
+            for col in 0..spec.n_cols {
+                let pixel_idx = row * spec.n_cols + col;
+                if !mask.is_valid(pixel_idx)? {
+                    continue;
+                }
+                if col + 1 < spec.n_cols && mask.is_valid(pixel_idx + 1)? {
+                    for depth in 0..spec.n_depth {
+                        add_lerc2_bit_plane_diff_counts(
+                            spec.data_type,
+                            max_shift,
+                            data,
+                            pixel_idx,
+                            pixel_idx + 1,
+                            depth,
+                            spec.n_depth,
+                            &mut counts,
+                        );
+                    }
+                    pair_count += 1;
+                }
+                if row + 1 < spec.n_rows && mask.is_valid(pixel_idx + spec.n_cols)? {
+                    for depth in 0..spec.n_depth {
+                        add_lerc2_bit_plane_diff_counts(
+                            spec.data_type,
+                            max_shift,
+                            data,
+                            pixel_idx,
+                            pixel_idx + spec.n_cols,
+                            depth,
+                            spec.n_depth,
+                            &mut counts,
+                        );
+                    }
+                    pair_count += 1;
+                }
+            }
+        }
+    }
+
+    if pair_count < MIN_COUNT {
+        return Ok(None);
+    }
+
+    let mut cuts_found = 0usize;
+    let mut last_plane_kept = 0usize;
+    for bit in (0..max_shift).rev() {
+        let critical = (0..spec.n_depth).all(|depth| {
+            let ones = counts[depth * max_shift + bit] as f64;
+            let m = ones / pair_count as f64;
+            (1.0 - 2.0 * m).abs() < eps
+        });
+        if critical && cuts_found < 2 {
+            if cuts_found == 0 {
+                last_plane_kept = bit;
+            }
+            if cuts_found == 1 && bit < last_plane_kept.saturating_sub(1) {
+                last_plane_kept = bit;
+                cuts_found = 0;
+            }
+            cuts_found += 1;
+        }
+    }
+
+    let max_z_error = if last_plane_kept == 0 {
+        0.0
+    } else {
+        ((1u64 << last_plane_kept) >> 1) as f64
+    };
+    Ok(Some(max_z_error))
+}
+
+fn add_lerc2_bit_plane_diff_counts(
+    data_type: DataType,
+    max_shift: usize,
+    data: &[u8],
+    pixel_idx: usize,
+    other_pixel_idx: usize,
+    depth: usize,
+    n_depth: usize,
+    counts: &mut [usize],
+) {
+    let diff = match data_type {
+        DataType::Char | DataType::Short | DataType::Int => {
+            let lhs =
+                read_integer_value_from_bytes(data_type, data, pixel_idx, depth, n_depth) as i32;
+            let rhs =
+                read_integer_value_from_bytes(data_type, data, other_pixel_idx, depth, n_depth)
+                    as i32;
+            (lhs ^ rhs) as u32
+        }
+        DataType::UChar | DataType::UShort | DataType::UInt => {
+            let lhs =
+                read_unsigned_value_from_bytes(data_type, data, pixel_idx, depth, n_depth) as u32;
+            let rhs =
+                read_unsigned_value_from_bytes(data_type, data, other_pixel_idx, depth, n_depth)
+                    as u32;
+            lhs ^ rhs
+        }
+        _ => unreachable!("bit-plane heuristic is only called for integer data"),
+    };
+    let start = depth * max_shift;
+    for bit in 0..max_shift {
+        counts[start + bit] += ((diff >> bit) & 1) as usize;
+    }
+}
+
+fn read_integer_value_from_bytes(
+    data_type: DataType,
+    data: &[u8],
+    pixel_idx: usize,
+    depth: usize,
+    n_depth: usize,
+) -> i64 {
+    let value_size = data_type.size_in_bytes();
+    let offset = (pixel_idx * n_depth + depth) * value_size;
+    match data_type {
+        DataType::Char => i8::from_le_bytes(data[offset..offset + 1].try_into().unwrap()) as i64,
+        DataType::Short => i16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as i64,
+        DataType::Int => i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as i64,
+        _ => unreachable!("signed integer reader called for non-signed type"),
+    }
+}
+
+fn read_unsigned_value_from_bytes(
+    data_type: DataType,
+    data: &[u8],
+    pixel_idx: usize,
+    depth: usize,
+    n_depth: usize,
+) -> u64 {
+    let value_size = data_type.size_in_bytes();
+    let offset = (pixel_idx * n_depth + depth) * value_size;
+    match data_type {
+        DataType::UChar => data[offset] as u64,
+        DataType::UShort => u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as u64,
+        DataType::UInt => u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as u64,
+        _ => unreachable!("unsigned integer reader called for non-unsigned type"),
+    }
+}
+
 fn data_values_are_integer(data_type: DataType, data: &[u8]) -> Result<bool> {
-    if (data_type as i32) < (DataType::Float as i32) {
+    if is_integer_data_type(data_type) {
         return Ok(true);
     }
 
@@ -5528,11 +5737,11 @@ mod tests {
         read_fp_huffman_slice, read_lerc2_data_one_sweep, read_lerc2_mask,
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes, validate_lerc2_checksum,
-        write_huffman_code_table, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo,
-        HuffmanBitWriter, MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
-        FILE_KEY,
+        restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes,
+        try_lerc2_bit_plane_max_z_error, validate_lerc2_checksum, write_huffman_code_table,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
+        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter,
+        MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -7873,6 +8082,10 @@ mod tests {
             encode_lerc2_one_sweep(spec, &data, 0.0, None, 3).unwrap_err(),
             LercError::WrongParam("one-sweep Lerc2 encode requires version 4 or newer")
         );
+        assert_eq!(
+            encode_lerc2_one_sweep(spec, &data, -0.01, None, 6).unwrap_err(),
+            LercError::WrongParam("negative max_z_error bit-plane encode requires integer data")
+        );
     }
 
     #[test]
@@ -7889,10 +8102,6 @@ mod tests {
         assert_eq!(
             encode_lerc2_tiled_raw(spec, &data, 0.0, None, 3, 2).unwrap_err(),
             LercError::WrongParam("raw tiled Lerc2 encode requires version 4 or newer")
-        );
-        assert_eq!(
-            encode_lerc2_tiled_raw(spec, &data, -1.0, None, 6, 2).unwrap_err(),
-            LercError::WrongParam("max_z_error must be nonnegative")
         );
         assert_eq!(
             encode_lerc2_tiled_raw(spec, &data, 0.0, None, 6, 0).unwrap_err(),
@@ -7916,6 +8125,45 @@ mod tests {
             encode_lerc2_tiled_raw_bands(band_spec, &band_data, 0.0, None, 6, 0).unwrap_err(),
             LercError::WrongParam("Lerc2 raw tiled micro block size must be 1 through 32")
         );
+    }
+
+    #[test]
+    fn integer_negative_max_z_error_uses_bit_plane_heuristic() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 80,
+            n_rows: 80,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let mut state = 0x1234_5678u32;
+        let data = (0..spec.n_cols * spec.n_rows)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state & 3) as u8
+            })
+            .collect::<Vec<_>>();
+        let mut mask = BitMask::new(spec.n_cols, spec.n_rows).unwrap();
+        mask.set_all_valid();
+        let inferred = try_lerc2_bit_plane_max_z_error(spec, &data, &mask, 0.2).unwrap();
+        assert_eq!(inferred, Some(1.0));
+
+        let blob = encode_lerc2_one_sweep(spec, &data, -0.2, None, 6).unwrap();
+        let header = get_lerc2_header_info(&blob).unwrap().header;
+        assert_eq!(header.max_z_error, 1.0);
+
+        let small_spec = EncodeSpec {
+            n_cols: 2,
+            n_rows: 2,
+            ..spec
+        };
+        let small_blob =
+            encode_lerc2_tiled_raw(small_spec, &[1, 2, 3, 4], -0.2, None, 6, 2).unwrap();
+        let small_header = get_lerc2_header_info(&small_blob).unwrap().header;
+        assert_eq!(small_header.max_z_error, 0.5);
     }
 
     #[test]
