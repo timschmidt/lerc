@@ -16,7 +16,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added Lerc2 tiled raw-binary payload decoding for non-diff raw and constant-zero tile blocks.
 - Added Lerc2 tiled simple bit-stuffed payload decoding and constant-zMin tile handling.
 - Added Lerc2 tiled LUT payload decoding via the shared `BitStuffer2` stream decoder.
-- Added Lerc2 v5 diff-encoded tiled payload decoding for integer lossless simple/constant tile modes.
+- Added Lerc2 v5 diff-encoded tiled payload decoding for integer and floating-point simple/constant tile modes.
 - Added typed decoded-data conversion helpers for all Lerc native data types, plus typed accessors for one-sweep and tiled decode outputs.
 - Added a high-level supported-subset Lerc2 decode dispatcher that validates checksums, reads headers/masks/min-max ranges, dispatches const/one-sweep/tiled payloads, and returns typed decoded data.
 - Added a high-level supported-subset multi-band Lerc2 decode dispatcher for concatenated blobs, including previous-mask reuse between bands.
@@ -35,7 +35,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added encode-side C ABI placeholders for `lerc_computeCompressedSize`, `lerc_computeCompressedSizeForVersion`, `lerc_computeCompressedSize_4D`, `lerc_encode`, `lerc_encodeForVersion`, and `lerc_encode_4D`; these validate arguments, zero output counters, and return `Failed` until the Rust encoder is ported.
 - Promoted the real `california_400_400_1_float.lerc2` fixture into supported-subset decode coverage, including safe Rust decode plus `lerc_decode` and `lerc_decodeToDouble` FFI output checks.
 - Configured the Rust crate to build `rlib`, `cdylib`, and `staticlib` outputs.
-- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, checked decoded output copying, decoded `f64` conversion, C API-style decode-into validation, C API-style blob info arrays, encode-side C ABI placeholder validation, the `lerc_getBlobInfo`, `lerc_getDataRanges`, `lerc_decode`, `lerc_decodeToDouble`, `lerc_decode_4D`, and `lerc_decodeToDouble_4D` C ABI wrappers, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, high-level supported decode dispatch, real fixture supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
+- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, checked decoded output copying, decoded `f64` conversion, C API-style decode-into validation, C API-style blob info arrays, encode-side C ABI placeholder validation, the `lerc_getBlobInfo`, `lerc_getDataRanges`, `lerc_decode`, `lerc_decodeToDouble`, `lerc_decode_4D`, and `lerc_decodeToDouble_4D` C ABI wrappers, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, integer and floating-point diff tiled expansion, high-level supported decode dispatch, real fixture supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -79,7 +79,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
    - Add C++ parity tests for `decode_lerc2_supported` on synthetic and fixture blobs that avoid Huffman.
    - Add C++ parity tests for `decode_lerc2_bands_supported` on concatenated non-Huffman fixtures.
    - Add C++ parity coverage for v6 no-data remapping across all supported native data types.
-   - Extend diff-encoded coverage to LUT and floating-point cases where C++ supports them.
+   - Extend diff-encoded coverage to LUT cases where C++ supports them.
    - Decode Huffman-backed blocks separately.
    - Keep each block codec independently fuzzable and benchmarkable.
 5. Add encode paths after decode parity is established.
@@ -102,9 +102,9 @@ cargo bench --bench rle_bit_stuffer
 Last run in this branch:
 
 - `cargo check`: passed with `#![deny(missing_docs)]` enabled.
-- `cargo test`: passed, 74 unit tests.
+- `cargo test`: passed, 76 unit tests.
 - `cargo doc --no-deps`: passed and generated crate documentation.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, pre-v2.3 BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, decoded `f64` conversion through C ABI, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, real float fixture decode, v6 supported-subset no-data decode, C API-style supported decode-into-buffer validation, C ABI decode, C ABI decode-to-double, C ABI real float fixture decode, and C ABI 4D no-data decode variants.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, pre-v2.3 BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, decoded `f64` conversion through C ABI, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 integer and floating-point diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, real float fixture decode, v6 supported-subset no-data decode, C API-style supported decode-into-buffer validation, C ABI decode, C ABI decode-to-double, C ABI real float fixture decode, and C ABI 4D no-data decode variants.
 
 ## Open Risks
 
