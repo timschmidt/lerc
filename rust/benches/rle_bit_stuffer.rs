@@ -45,6 +45,9 @@ fn main() {
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let mut one_sweep_bands_blob = one_sweep_blob.clone();
     one_sweep_bands_blob.extend_from_slice(&one_sweep_blob);
+    let one_sweep_bands_decoded = decode_lerc2_bands_supported(&one_sweep_bands_blob).unwrap();
+    let mut decoded_data_bytes = vec![0; one_sweep_bands_decoded.data_byte_len()];
+    let mut decoded_mask_bytes = vec![0; one_sweep_bands_decoded.mask_byte_len()];
     let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
@@ -127,6 +130,20 @@ fn main() {
             black_box(decode_lerc2_supported(black_box(&one_sweep_no_data_blob)).unwrap());
         },
     );
+    bench("lerc2-supported-write-data-bytes", 100_000, || {
+        black_box(
+            one_sweep_bands_decoded
+                .write_data_le_bytes(black_box(&mut decoded_data_bytes))
+                .unwrap(),
+        );
+    });
+    bench("lerc2-supported-write-mask-bytes", 100_000, || {
+        black_box(
+            one_sweep_bands_decoded
+                .write_mask_bytes(black_box(&mut decoded_mask_bytes))
+                .unwrap(),
+        );
+    });
 
     std::thread::sleep(Duration::from_millis(1));
 }

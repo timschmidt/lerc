@@ -117,10 +117,69 @@ pub struct DecodedLerc2 {
     pub bytes_consumed: usize,
 }
 
+impl DecodedLerc2 {
+    pub fn data_byte_len(&self) -> usize {
+        self.data.byte_len()
+    }
+
+    pub fn write_data_le_bytes(&self, output: &mut [u8]) -> Result<usize> {
+        self.data.write_le_bytes(output)
+    }
+
+    pub fn mask_byte_len(&self) -> usize {
+        (self.header.n_cols as usize) * (self.header.n_rows as usize)
+    }
+
+    pub fn write_mask_bytes(&self, output: &mut [u8]) -> Result<usize> {
+        let byte_len = self.mask_byte_len();
+        if output.len() < byte_len {
+            return Err(LercError::BufferTooSmall);
+        }
+        output[..byte_len].copy_from_slice(&self.mask.to_byte_mask());
+        Ok(byte_len)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedLerc2Bands {
     pub bands: Vec<DecodedLerc2>,
     pub bytes_consumed: usize,
+}
+
+impl DecodedLerc2Bands {
+    pub fn data_byte_len(&self) -> usize {
+        self.bands.iter().map(DecodedLerc2::data_byte_len).sum()
+    }
+
+    pub fn write_data_le_bytes(&self, output: &mut [u8]) -> Result<usize> {
+        let byte_len = self.data_byte_len();
+        if output.len() < byte_len {
+            return Err(LercError::BufferTooSmall);
+        }
+
+        let mut offset = 0usize;
+        for band in &self.bands {
+            offset += band.write_data_le_bytes(&mut output[offset..])?;
+        }
+        Ok(offset)
+    }
+
+    pub fn mask_byte_len(&self) -> usize {
+        self.bands.iter().map(DecodedLerc2::mask_byte_len).sum()
+    }
+
+    pub fn write_mask_bytes(&self, output: &mut [u8]) -> Result<usize> {
+        let byte_len = self.mask_byte_len();
+        if output.len() < byte_len {
+            return Err(LercError::BufferTooSmall);
+        }
+
+        let mut offset = 0usize;
+        for band in &self.bands {
+            offset += band.write_mask_bytes(&mut output[offset..])?;
+        }
+        Ok(offset)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2292,6 +2351,29 @@ mod tests {
     }
 
     #[test]
+    fn writes_supported_decode_data_and_mask_to_c_api_style_buffers() {
+        let blob = synthetic_v4_ushort_tiled_raw_blob();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        let mut data = vec![0; decoded.data_byte_len()];
+        assert_eq!(decoded.write_data_le_bytes(&mut data).unwrap(), data.len());
+        assert_eq!(
+            data,
+            [100u16, 200, 300, 400]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let mut mask = vec![0; decoded.mask_byte_len()];
+        assert_eq!(decoded.write_mask_bytes(&mut mask).unwrap(), mask.len());
+        assert_eq!(mask, [1, 1, 1, 1]);
+
+        assert!(decoded.write_data_le_bytes(&mut [0; 7]).is_err());
+        assert!(decoded.write_mask_bytes(&mut [0; 3]).is_err());
+    }
+
+    #[test]
     fn decodes_supported_one_sweep_and_const_payloads() {
         let valid = [1, 1, 1, 1, 1, 1];
         let mut ranges = Vec::new();
@@ -2348,6 +2430,36 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 20, 30, 0, 40])
         );
+    }
+
+    #[test]
+    fn writes_supported_band_decode_data_and_masks_in_band_order() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 20];
+        let first_payload = [1u8, 2, 3, 4];
+        let second_payload = [10u8, 20, 30, 40];
+        let first =
+            synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &first_payload);
+        let second = synthetic_v4_one_sweep_blob_reusing_previous_mask(
+            DataType::UChar,
+            1,
+            4,
+            &ranges,
+            &second_payload,
+        );
+        let mut concatenated = first;
+        concatenated.extend_from_slice(&second);
+        let decoded = decode_lerc2_bands_supported(&concatenated).unwrap();
+
+        let mut data = vec![0; decoded.data_byte_len()];
+        assert_eq!(decoded.write_data_le_bytes(&mut data).unwrap(), data.len());
+        assert_eq!(data, [1, 0, 2, 3, 0, 4, 10, 0, 20, 30, 0, 40]);
+
+        let mut masks = vec![0; decoded.mask_byte_len()];
+        assert_eq!(decoded.write_mask_bytes(&mut masks).unwrap(), masks.len());
+        assert_eq!(masks, [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1]);
+        assert!(decoded.write_data_le_bytes(&mut [0; 11]).is_err());
+        assert!(decoded.write_mask_bytes(&mut [0; 11]).is_err());
     }
 
     #[test]

@@ -23,6 +23,19 @@ pub enum DecodedData {
 }
 
 impl DecodedData {
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Self::Char(_) => DataType::Char,
+            Self::UChar(_) => DataType::UChar,
+            Self::Short(_) => DataType::Short,
+            Self::UShort(_) => DataType::UShort,
+            Self::Int(_) => DataType::Int,
+            Self::UInt(_) => DataType::UInt,
+            Self::Float(_) => DataType::Float,
+            Self::Double(_) => DataType::Double,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Char(values) => values.len(),
@@ -38,6 +51,46 @@ impl DecodedData {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len() * self.data_type().size_in_bytes()
+    }
+
+    pub fn write_le_bytes(&self, output: &mut [u8]) -> Result<usize> {
+        let byte_len = self.byte_len();
+        if output.len() < byte_len {
+            return Err(LercError::BufferTooSmall);
+        }
+
+        match self {
+            Self::Char(values) => {
+                for (dst, &value) in output.iter_mut().zip(values.iter()) {
+                    *dst = value as u8;
+                }
+            }
+            Self::UChar(values) => output[..byte_len].copy_from_slice(values),
+            Self::Short(values) => write_native_values(output, values, i16::to_le_bytes),
+            Self::UShort(values) => write_native_values(output, values, u16::to_le_bytes),
+            Self::Int(values) => write_native_values(output, values, i32::to_le_bytes),
+            Self::UInt(values) => write_native_values(output, values, u32::to_le_bytes),
+            Self::Float(values) => write_native_values(output, values, f32::to_le_bytes),
+            Self::Double(values) => write_native_values(output, values, f64::to_le_bytes),
+        }
+
+        Ok(byte_len)
+    }
+}
+
+fn write_native_values<T, const N: usize>(
+    output: &mut [u8],
+    values: &[T],
+    to_le_bytes: fn(T) -> [u8; N],
+) where
+    T: Copy,
+{
+    for (chunk, &value) in output.chunks_exact_mut(N).zip(values.iter()) {
+        chunk.copy_from_slice(&to_le_bytes(value));
     }
 }
 
@@ -166,5 +219,28 @@ mod tests {
     fn rejects_misaligned_input() {
         assert!(decode_typed_values(DataType::Short, &[1]).is_err());
         assert!(decode_typed_values(DataType::Double, &[0; 7]).is_err());
+    }
+
+    #[test]
+    fn writes_decoded_values_as_little_endian_bytes() {
+        let data = DecodedData::Int(vec![-1, 2_000]);
+        let mut output = [0u8; 8];
+        assert_eq!(data.data_type(), DataType::Int);
+        assert_eq!(data.byte_len(), 8);
+        assert_eq!(data.write_le_bytes(&mut output).unwrap(), 8);
+        assert_eq!(output, [0xff, 0xff, 0xff, 0xff, 0xd0, 0x07, 0x00, 0x00,]);
+
+        let data = DecodedData::Float(vec![-1.25, 2.5]);
+        let mut output = [0u8; 8];
+        assert_eq!(data.write_le_bytes(&mut output).unwrap(), 8);
+        assert_eq!(&output[..4], &(-1.25f32).to_le_bytes());
+        assert_eq!(&output[4..], &2.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_too_small_decoded_output_buffer() {
+        let data = DecodedData::UShort(vec![1, 2]);
+        let mut output = [0u8; 3];
+        assert!(data.write_le_bytes(&mut output).is_err());
     }
 }
