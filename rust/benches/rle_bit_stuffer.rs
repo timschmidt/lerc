@@ -43,6 +43,7 @@ fn main() {
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
+    let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
     let encoded_rle = Rle::compress(&byte_data).unwrap();
     let encoded_bits = BitStuffer2::encode_simple(&uint_data, 3).unwrap();
     let bit_mask = BitMask::from_byte_mask(&mask_data, 1000, 1000).unwrap();
@@ -91,6 +92,9 @@ fn main() {
     });
     bench("lerc2-tiled-bitstuff-v4-synthetic", 100_000, || {
         black_box(read_lerc2_tiled_payload(black_box(&tiled_bitstuff_blob)).unwrap());
+    });
+    bench("lerc2-tiled-lut-v4-synthetic", 100_000, || {
+        black_box(read_lerc2_tiled_payload(black_box(&tiled_lut_blob)).unwrap());
     });
 
     std::thread::sleep(Duration::from_millis(1));
@@ -149,9 +153,36 @@ fn synthetic_v4_tiled_bitstuff_blob() -> Vec<u8> {
     synthetic_v4_tiled_blocks(DataType::UChar, 1, &valid, &range_bytes, &blocks)
 }
 
+fn synthetic_v4_tiled_lut_blob() -> Vec<u8> {
+    let valid = [1; 15];
+    let range_bytes = [10u8, 24];
+    let blocks = vec![
+        lut_tile_block(10, &[0, 1, 5, 6]),
+        lut_tile_block(12, &[0, 1, 5, 6]),
+        lut_tile_block(14, &[0, 5]),
+        lut_tile_block(20, &[0, 1]),
+        lut_tile_block(22, &[0, 1]),
+        vec![3, 24],
+    ];
+    synthetic_v4_tiled_blocks(DataType::UChar, 1, &valid, &range_bytes, &blocks)
+}
+
 fn bit_stuffed_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
     let mut block = vec![1, offset];
     block.extend_from_slice(&BitStuffer2::encode_simple(quantized, 4).unwrap());
+    block
+}
+
+fn lut_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
+    let mut sorted: Vec<(u32, u32)> = quantized
+        .iter()
+        .enumerate()
+        .map(|(idx, &value)| (value, idx as u32))
+        .collect();
+    sorted.sort_unstable();
+
+    let mut block = vec![1, offset];
+    block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 4).unwrap());
     block
 }
 

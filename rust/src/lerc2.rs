@@ -1124,6 +1124,19 @@ mod tests {
         block
     }
 
+    fn lut_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
+        let mut sorted: Vec<(u32, u32)> = quantized
+            .iter()
+            .enumerate()
+            .map(|(idx, &value)| (value, idx as u32))
+            .collect();
+        sorted.sort_unstable();
+
+        let mut block = vec![1, offset];
+        block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 4).unwrap());
+        block
+    }
+
     #[test]
     fn parses_single_band_float_fixture_header() {
         let blob = fixture("california_400_400_1_float.lerc2");
@@ -1390,6 +1403,43 @@ mod tests {
             bit_stuffed_tile_block(10, &[4, 9]),
             bit_stuffed_tile_block(10, &[10, 11]),
             bit_stuffed_tile_block(10, &[12, 13]),
+            vec![3, 24],
+        ];
+        let mut blob = synthetic_v4_tiled_block_blob(DataType::UChar, 1, &valid, &ranges, &blocks);
+        blob.pop();
+
+        assert!(read_lerc2_tiled_payload(&blob).is_err());
+    }
+
+    #[test]
+    fn reads_v4_lut_tiled_payload() {
+        let valid = [1; 15];
+        let ranges = [10u8, 24];
+        let blocks = vec![
+            lut_tile_block(10, &[0, 1, 5, 6]),
+            lut_tile_block(12, &[0, 1, 5, 6]),
+            lut_tile_block(14, &[0, 5]),
+            lut_tile_block(20, &[0, 1]),
+            lut_tile_block(22, &[0, 1]),
+            vec![3, 24],
+        ];
+        let blob = synthetic_v4_tiled_block_blob(DataType::UChar, 1, &valid, &ranges, &blocks);
+        let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
+
+        assert_eq!(tiled.data, (10u8..=24).collect::<Vec<_>>());
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn rejects_truncated_lut_tiled_payload() {
+        let valid = [1; 15];
+        let ranges = [10u8, 24];
+        let blocks = vec![
+            lut_tile_block(10, &[0, 1, 5, 6]),
+            lut_tile_block(12, &[0, 1, 5, 6]),
+            lut_tile_block(14, &[0, 5]),
+            lut_tile_block(20, &[0, 1]),
+            lut_tile_block(22, &[0, 1]),
             vec![3, 24],
         ];
         let mut blob = synthetic_v4_tiled_block_blob(DataType::UChar, 1, &valid, &ranges, &blocks);
