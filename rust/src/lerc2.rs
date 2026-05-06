@@ -770,6 +770,28 @@ pub fn encode_lerc2_tiled_raw(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    encode_lerc2_tiled_raw_band(
+        spec,
+        data,
+        max_z_error,
+        mask,
+        version,
+        micro_block_size,
+        0,
+        true,
+    )
+}
+
+fn encode_lerc2_tiled_raw_band(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    mask: Option<&BitMask>,
+    version: i32,
+    micro_block_size: i32,
+    n_blobs_more: i32,
+    encode_partial_mask: bool,
+) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "raw tiled Lerc2 encode")?;
     if max_z_error < 0.0 {
         return Err(LercError::WrongParam("max_z_error must be nonnegative"));
@@ -805,7 +827,7 @@ pub fn encode_lerc2_tiled_raw(
         num_valid_pixel: num_valid_pixel as i32,
         micro_block_size,
         blob_size: 1,
-        n_blobs_more: 0,
+        n_blobs_more,
         b_pass_no_data_values: 0,
         b_is_int: u8::from(data_values_are_integer(spec.data_type, data)?),
         b_reserved_3: 0,
@@ -824,7 +846,7 @@ pub fn encode_lerc2_tiled_raw(
         ));
     }
 
-    let encode_mask = mask.count_valid_bits() < spec.n_cols * spec.n_rows;
+    let encode_mask = encode_partial_mask && mask.count_valid_bits() < spec.n_cols * spec.n_rows;
     let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
     let ranges_len = if has_valid && header.z_min != header.z_max {
         compute_lerc2_min_max_ranges_byte_len(&header)?
@@ -855,6 +877,107 @@ pub fn encode_lerc2_tiled_raw(
     }
     debug_assert_eq!(offset, blob.len());
     finalize_lerc2_checksum(&mut blob)?;
+    Ok(blob)
+}
+
+/// Encodes band-major data as concatenated single-band raw tiled Lerc2 blobs.
+///
+/// `data` must contain `n_bands` complete bands in band-major order. Masks
+/// follow the public C API convention: no masks means all pixels are valid, one
+/// mask is shared by all bands, and `n_bands` masks provide one mask per band.
+/// Version 6 blobs carry `nBlobsMore`; version 4 and 5 concatenation relies on
+/// the following blob header.
+pub fn encode_lerc2_tiled_raw_bands(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    version: i32,
+    micro_block_size: i32,
+) -> Result<Vec<u8>> {
+    validate_encode_bands_inputs(spec, data, masks, "raw tiled Lerc2 band encode")?;
+    if max_z_error < 0.0 {
+        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
+    }
+    if !(4..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam(
+            "raw tiled Lerc2 encode requires version 4 or newer",
+        ));
+    }
+    if !(1..=32).contains(&micro_block_size) {
+        return Err(LercError::WrongParam(
+            "Lerc2 raw tiled micro block size must be 1 through 32",
+        ));
+    }
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    let mask_len = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam(
+            "Lerc2 encode mask byte count overflow",
+        ))?;
+    let mut blob = Vec::new();
+    let mut previous_mask: Option<BitMask> = None;
+
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let mask = match masks {
+            Some(mask_bytes) if spec.n_masks == 1 => Some(BitMask::from_byte_mask(
+                &mask_bytes[..mask_len],
+                spec.n_cols,
+                spec.n_rows,
+            )?),
+            Some(mask_bytes) => {
+                let mask_start = band
+                    .checked_mul(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 encode mask offset overflow"))?;
+                Some(BitMask::from_byte_mask(
+                    &mask_bytes[mask_start..mask_start + mask_len],
+                    spec.n_cols,
+                    spec.n_rows,
+                )?)
+            }
+            None => None,
+        };
+        let encode_mask = if band == 0 {
+            true
+        } else if spec.n_masks == 1 {
+            false
+        } else {
+            match (mask.as_ref(), &previous_mask) {
+                (Some(mask), Some(previous)) => mask != previous,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        };
+        let n_blobs_more = if version >= 6 {
+            i32::try_from(spec.n_bands - 1 - band)
+                .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
+        } else {
+            0
+        };
+        let band_blob = encode_lerc2_tiled_raw_band(
+            band_spec,
+            &data[data_start..data_start + band_data_len],
+            max_z_error,
+            mask.as_ref(),
+            version,
+            micro_block_size,
+            n_blobs_more,
+            encode_mask,
+        )?;
+        blob.extend_from_slice(&band_blob);
+        previous_mask = mask;
+    }
+
     Ok(blob)
 }
 
@@ -3482,14 +3605,15 @@ mod tests {
         compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
         decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
         encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_tiled_raw, finalize_lerc2_checksum,
-        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-        read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_tiled_raw,
+        encode_lerc2_tiled_raw_bands, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
+        write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -4662,6 +4786,63 @@ mod tests {
     }
 
     #[test]
+    fn encodes_raw_tiled_lerc2_bands_with_shared_mask() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let mask = [1u8, 0, 1, 1, 1, 0];
+        let blob = encode_lerc2_tiled_raw_bands(spec, &data, 0.0, Some(&mask), 6, 2).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 1);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert_eq!(decoded.bands[0].header.micro_block_size, 2);
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![1, 0, 3, 5, 7, 0])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
+        );
+    }
+
+    #[test]
+    fn encodes_raw_tiled_lerc2_bands_with_per_band_masks() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 2,
+        };
+        let data = [1u8, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60];
+        let masks = [1u8, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1];
+        let blob = encode_lerc2_tiled_raw_bands(spec, &data, 0.0, Some(&masks), 6, 2).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bands.len(), 2);
+        assert_ne!(decoded.bands[0].mask, decoded.bands[1].mask);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![1, 0, 3, 4, 5, 0])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(vec![10, 20, 0, 0, 50, 60])
+        );
+    }
+
+    #[test]
     fn encodes_one_sweep_lerc2_bands_with_shared_mask() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -4850,6 +5031,21 @@ mod tests {
             LercError::Unsupported(
                 "raw tiled Lerc2 encode does not emit Huffman-probe image mode prefixes yet"
             )
+        );
+
+        let band_spec = EncodeSpec {
+            n_bands: 2,
+            n_masks: 0,
+            ..spec
+        };
+        let band_data = [1u8, 2, 3, 4, 10, 20, 30, 40];
+        assert_eq!(
+            encode_lerc2_tiled_raw_bands(band_spec, &band_data, 0.0, None, 3, 2).unwrap_err(),
+            LercError::WrongParam("raw tiled Lerc2 encode requires version 4 or newer")
+        );
+        assert_eq!(
+            encode_lerc2_tiled_raw_bands(band_spec, &band_data, 0.0, None, 6, 0).unwrap_err(),
+            LercError::WrongParam("Lerc2 raw tiled micro block size must be 1 through 32")
         );
     }
 
