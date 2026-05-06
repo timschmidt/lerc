@@ -52,6 +52,62 @@ pub enum DataType {
     Double = 7,
 }
 
+/// Caller-provided shape for encode and compute-size operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeSpec {
+    /// Scalar data type of the source values.
+    pub data_type: DataType,
+    /// Number of values per pixel.
+    pub n_depth: usize,
+    /// Number of columns.
+    pub n_cols: usize,
+    /// Number of rows.
+    pub n_rows: usize,
+    /// Number of bands.
+    pub n_bands: usize,
+    /// Number of byte masks supplied: 0, 1, or `n_bands`.
+    pub n_masks: usize,
+}
+
+impl EncodeSpec {
+    /// Validates dimensions and mask count for encode-style operations.
+    pub fn validate(self) -> Result<()> {
+        if self.n_depth == 0 || self.n_cols == 0 || self.n_rows == 0 || self.n_bands == 0 {
+            return Err(LercError::WrongParam("encode dimensions must be positive"));
+        }
+        if !(self.n_masks == 0 || self.n_masks == 1 || self.n_masks == self.n_bands) {
+            return Err(LercError::WrongParam(
+                "encode mask count must be 0, 1, or n_bands",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the number of source scalar values described by this shape.
+    pub fn value_count(self) -> Result<usize> {
+        self.n_bands
+            .checked_mul(self.n_rows)
+            .and_then(|count| count.checked_mul(self.n_cols))
+            .and_then(|count| count.checked_mul(self.n_depth))
+            .ok_or(LercError::WrongParam("encode value count overflow"))
+    }
+
+    /// Returns the byte count needed for source scalar values.
+    pub fn data_byte_len(self) -> Result<usize> {
+        self.value_count()?
+            .checked_mul(self.data_type.size_in_bytes())
+            .ok_or(LercError::WrongParam("encode data byte count overflow"))
+    }
+
+    /// Returns the byte count needed for source byte masks.
+    pub fn mask_byte_len(self) -> Result<usize> {
+        self.n_masks
+            .checked_mul(self.n_rows)
+            .and_then(|count| count.checked_mul(self.n_cols))
+            .ok_or(LercError::WrongParam("encode mask byte count overflow"))
+    }
+}
+
 /// Error type returned by safe Rust LERC APIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LercError {
@@ -123,5 +179,65 @@ impl DataType {
             Self::Int | Self::UInt | Self::Float => 4,
             Self::Double => 8,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DataType, EncodeSpec, LercError};
+
+    #[test]
+    fn encode_spec_validates_shape_and_reports_lengths() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 5,
+            n_bands: 7,
+            n_masks: 1,
+        };
+
+        spec.validate().unwrap();
+        assert_eq!(spec.value_count().unwrap(), 210);
+        assert_eq!(spec.data_byte_len().unwrap(), 840);
+        assert_eq!(spec.mask_byte_len().unwrap(), 15);
+
+        let bad_masks = EncodeSpec { n_masks: 2, ..spec };
+        assert_eq!(
+            bad_masks.validate().unwrap_err(),
+            LercError::WrongParam("encode mask count must be 0, 1, or n_bands")
+        );
+
+        let zero_dim = EncodeSpec { n_cols: 0, ..spec };
+        assert_eq!(
+            zero_dim.validate().unwrap_err(),
+            LercError::WrongParam("encode dimensions must be positive")
+        );
+
+        let overflow = EncodeSpec {
+            data_type: DataType::Double,
+            n_depth: usize::MAX,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        assert_eq!(
+            overflow.value_count().unwrap_err(),
+            LercError::WrongParam("encode value count overflow")
+        );
+        assert_eq!(
+            overflow.data_byte_len().unwrap_err(),
+            LercError::WrongParam("encode value count overflow")
+        );
+
+        let mask_overflow = EncodeSpec {
+            n_masks: usize::MAX,
+            ..spec
+        };
+        assert_eq!(
+            mask_overflow.mask_byte_len().unwrap_err(),
+            LercError::WrongParam("encode mask byte count overflow")
+        );
     }
 }

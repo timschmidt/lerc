@@ -60,4 +60,4 @@ pub use lerc2::{
     BLOB_INFO_ARRAY_LEN,
 };
 pub use rle::Rle;
-pub use types::{DataType, ErrCode, LercError, Result};
+pub use types::{DataType, EncodeSpec, ErrCode, LercError, Result};

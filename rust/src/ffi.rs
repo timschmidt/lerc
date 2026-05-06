@@ -13,7 +13,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 use crate::{
     decode_lerc_supported_into, decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays,
     get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec,
-    ErrCode, LercError,
+    EncodeSpec, ErrCode, LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -621,20 +621,36 @@ fn validate_encode_shape(
     max_z_err: f64,
 ) -> core::result::Result<(), ErrCode> {
     if p_data.is_null()
-        || DataType::try_from(data_type as i32)
-            .map(|parsed| parsed as u32 != data_type)
-            .unwrap_or(true)
         || n_depth <= 0
         || n_cols <= 0
         || n_rows <= 0
         || n_bands <= 0
         || max_z_err < 0.0
-        || !(n_masks == 0 || n_masks == 1 || n_masks == n_bands)
         || (n_masks > 0 && p_valid_bytes.is_null())
     {
         return Err(ErrCode::WrongParam);
     }
 
+    let parsed_type = DataType::try_from(data_type as i32)
+        .map_err(|_| ErrCode::WrongParam)
+        .and_then(|parsed| {
+            if parsed as u32 == data_type {
+                Ok(parsed)
+            } else {
+                Err(ErrCode::WrongParam)
+            }
+        })?;
+    let spec = EncodeSpec {
+        data_type: parsed_type,
+        n_depth: n_depth as usize,
+        n_cols: n_cols as usize,
+        n_rows: n_rows as usize,
+        n_bands: n_bands as usize,
+        n_masks: n_masks as usize,
+    };
+    spec.validate().map_err(|err| err.err_code())?;
+    spec.data_byte_len().map_err(|err| err.err_code())?;
+    spec.mask_byte_len().map_err(|err| err.err_code())?;
     Ok(())
 }
 

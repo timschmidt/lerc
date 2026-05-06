@@ -9,7 +9,7 @@ use lerc::{
     get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
     read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
-    DataType, DecodeIntoSpec, Rle,
+    DataType, DecodeIntoSpec, EncodeSpec, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -66,6 +66,14 @@ fn main() {
     let mut decoded_data_bytes = vec![0; one_sweep_bands_decoded.data_byte_len()];
     let mut decoded_mask_bytes = vec![0; one_sweep_bands_decoded.mask_byte_len()];
     let decode_into_spec = DecodeIntoSpec {
+        data_type: DataType::UChar,
+        n_depth: 2,
+        n_cols: 3,
+        n_rows: 2,
+        n_bands: 2,
+        n_masks: 1,
+    };
+    let encode_spec = EncodeSpec {
         data_type: DataType::UChar,
         n_depth: 2,
         n_cols: 3,
@@ -329,6 +337,12 @@ fn main() {
         black_box(decode_into_spec.data_byte_len().unwrap());
         black_box(decode_into_spec.value_count().unwrap());
         black_box(decode_into_spec.mask_byte_len().unwrap());
+    });
+    bench("encode-spec-validate-and-byte-counts", 100_000, || {
+        black_box(encode_spec.validate().unwrap());
+        black_box(encode_spec.data_byte_len().unwrap());
+        black_box(encode_spec.value_count().unwrap());
+        black_box(encode_spec.mask_byte_len().unwrap());
     });
     bench("lerc2-supported-decode-into-v4-synthetic", 100_000, || {
         black_box(
