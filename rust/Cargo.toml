@@ -11,5 +11,5 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bench]]
-name = "rle_bit_stuffer"
+name = "primitives"
 harness = false

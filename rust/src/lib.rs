@@ -22,26 +22,24 @@ limitations under the License.
 //! The full LERC image encoder/decoder will be layered on these modules as the
 //! port progresses.
 
-/// Packed valid-pixel mask helpers.
-pub mod bit_mask;
-/// Lerc2 bit-stuffing helpers.
-pub mod bit_stuffer;
-/// Typed decoded data containers and conversion helpers.
-pub mod decoded;
+/// Safe Rust API facade modules.
+pub mod api;
 /// C ABI entry points.
-pub mod ffi;
-/// Legacy Lerc1 metadata helpers.
-pub mod lerc1;
-/// Lerc2 metadata and supported-subset decode helpers.
-pub mod lerc2;
-/// LERC run-length encoding helpers.
-pub mod rle;
-/// Shared data types and errors.
-pub mod types;
+pub mod c_api;
+/// Shared data model, error, and decoded-value types.
+pub mod data;
+/// Format-specific LERC implementations.
+pub mod format;
+/// Reusable codec primitives.
+pub mod primitives;
+mod support;
 
-pub use bit_mask::BitMask;
-pub use bit_stuffer::BitStuffer2;
-pub use decoded::{decode_typed_values, DecodedData};
+pub use c_api as ffi;
+pub use data::decoded;
+pub use data::decoded::{decode_typed_values, DecodedData};
+pub use data::types;
+pub use format::lerc1;
+pub use format::lerc2;
 pub use lerc1::{
     decode_lerc1, get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats, DecodedLerc1,
     Lerc1HeaderInfo, Lerc1MaskInfo, Lerc1PartInfo, Lerc1ZStats, CNT_Z_IMAGE_KEY,
@@ -68,5 +66,10 @@ pub use lerc2::{
     DecodedLerc2Bands, HeaderInfo, LercInfo, MaskInfo, MinMaxRanges, NoDataInfo, TiledData,
     BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
 };
-pub use rle::Rle;
+pub use primitives::bit_mask;
+pub use primitives::bit_mask::BitMask;
+pub use primitives::bit_stuffer;
+pub use primitives::bit_stuffer::BitStuffer2;
+pub use primitives::rle;
+pub use primitives::rle::Rle;
 pub use types::{DataType, EncodeSpec, ErrCode, LercError, Result};
