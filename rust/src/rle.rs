@@ -283,6 +283,34 @@ mod tests {
     }
 
     #[test]
+    fn matches_known_literal_run_stream() {
+        let input = [1, 2, 3, 4];
+        let encoded = [
+            4, 0, // literal count
+            1, 2, 3, 4, // literal bytes
+            0, 128, // EOF count
+        ];
+
+        assert_eq!(Rle::compute_num_bytes(&input), encoded.len());
+        assert_eq!(Rle::compress(&input).unwrap(), encoded);
+        assert_eq!(Rle::decompress(&encoded).unwrap(), input);
+    }
+
+    #[test]
+    fn matches_known_repeated_run_stream() {
+        let input = [9, 9, 9, 9, 9, 9];
+        let encoded = [
+            250, 255, // repeated count: -6i16
+            9,   // repeated byte
+            0, 128, // EOF count
+        ];
+
+        assert_eq!(Rle::compute_num_bytes(&input), encoded.len());
+        assert_eq!(Rle::compress(&input).unwrap(), encoded);
+        assert_eq!(Rle::decompress(&encoded).unwrap(), input);
+    }
+
+    #[test]
     fn round_trips_counter_boundaries() {
         let mut input = vec![42; 32770];
         input.extend((0..512).map(|i| (i & 0xff) as u8));
