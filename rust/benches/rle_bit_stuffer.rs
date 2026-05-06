@@ -172,6 +172,11 @@ fn main() {
     let mut ffi_one_sweep_bands_encode_size = 0u32;
     let mut ffi_one_sweep_bands_encode_out = [0u8; 320];
     let mut ffi_one_sweep_bands_encode_written = 0u32;
+    let ffi_encode_4d_uses_no_data = [0u8; 2];
+    let ffi_encode_4d_no_data_values = [0.0f64; 2];
+    let mut ffi_encode_4d_size = 0u32;
+    let mut ffi_encode_4d_out = [0u8; 320];
+    let mut ffi_encode_4d_written = 0u32;
     let mut ffi_float_fixture_data = vec![0.0f32; 160_000];
     let mut ffi_float_fixture_mask = vec![0; 160_000];
     let mut ffi_float_fixture_double_data = vec![0.0f64; 160_000];
@@ -620,6 +625,52 @@ fn main() {
             )
         });
     });
+    bench(
+        "ffi-compute-size-one-sweep-encode-4d-no-active-no-data-v6",
+        100_000,
+        || {
+            black_box(unsafe {
+                lerc::ffi::lerc_computeCompressedSize_4D(
+                    black_box(encode_one_sweep_bands_data.as_ptr().cast()),
+                    DataType::UChar as u32,
+                    2,
+                    3,
+                    2,
+                    2,
+                    1,
+                    black_box(ffi_constant_encode_mask.as_ptr()),
+                    0.5,
+                    black_box(&mut ffi_encode_4d_size),
+                    black_box(ffi_encode_4d_uses_no_data.as_ptr()),
+                    black_box(ffi_encode_4d_no_data_values.as_ptr()),
+                )
+            });
+        },
+    );
+    bench(
+        "ffi-one-sweep-encode-4d-no-active-no-data-v6",
+        100_000,
+        || {
+            black_box(unsafe {
+                lerc::ffi::lerc_encode_4D(
+                    black_box(encode_one_sweep_bands_data.as_ptr().cast()),
+                    DataType::UChar as u32,
+                    2,
+                    3,
+                    2,
+                    2,
+                    1,
+                    black_box(ffi_constant_encode_mask.as_ptr()),
+                    0.5,
+                    black_box(ffi_encode_4d_out.as_mut_ptr()),
+                    ffi_encode_4d_out.len() as u32,
+                    black_box(&mut ffi_encode_4d_written),
+                    black_box(ffi_encode_4d_uses_no_data.as_ptr()),
+                    black_box(ffi_encode_4d_no_data_values.as_ptr()),
+                )
+            });
+        },
+    );
     bench("lerc2-supported-decode-into-v4-synthetic", 100_000, || {
         black_box(
             decode_lerc2_supported_into(
