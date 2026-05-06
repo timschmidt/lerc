@@ -43,8 +43,8 @@ pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
 pub use decoded::{decode_typed_values, DecodedData};
 pub use lerc1::{
-    get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats, Lerc1HeaderInfo,
-    Lerc1MaskInfo, Lerc1PartInfo, Lerc1ZStats, CNT_Z_IMAGE_KEY,
+    decode_lerc1, get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats, DecodedLerc1,
+    Lerc1HeaderInfo, Lerc1MaskInfo, Lerc1PartInfo, Lerc1ZStats, CNT_Z_IMAGE_KEY,
 };
 pub use lerc2::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,

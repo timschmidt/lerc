@@ -8,7 +8,7 @@ You may obtain a copy of the License at
 http://www.apache.org/licenses/LICENSE-2.0
 */
 
-//! Legacy Lerc1 metadata readers.
+//! Legacy Lerc1 metadata and float payload readers.
 
 use crate::types::{DataType, LercError, Result};
 use crate::{BitMask, BitStuffer2, Rle};
@@ -79,11 +79,27 @@ pub struct Lerc1ZStats {
     pub bytes_consumed: usize,
 }
 
+/// Decoded legacy Lerc1 float image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedLerc1 {
+    /// Parsed Lerc1 header metadata.
+    pub header: Lerc1HeaderInfo,
+    /// Decoded valid-pixel mask metadata.
+    pub mask_info: Lerc1MaskInfo,
+    /// Decoded float values in row-major order.
+    ///
+    /// Invalid pixels are left as `0.0`; callers should consult
+    /// [`mask_info`](Self::mask_info) before using a pixel value.
+    pub values: Vec<f32>,
+    /// Number of bytes consumed through the z-value payload.
+    pub bytes_consumed: usize,
+}
+
 /// Reads and validates the legacy Lerc1 `CntZImage` header and part headers.
 ///
-/// This is a decode-free metadata reader. Full Lerc1 tile decoding is still
-/// required before the public C metadata APIs can report exact valid-pixel
-/// counts and min/max ranges for arbitrary Lerc1 blobs.
+/// This is a decode-free structural reader. Use [`read_lerc1_count_mask`],
+/// [`read_lerc1_z_stats`], or [`decode_lerc1`] when mask counts, data ranges,
+/// or decoded pixel values are needed.
 pub fn get_lerc1_header_info(blob: &[u8]) -> Result<Lerc1HeaderInfo> {
     let mut reader = Reader::new(blob);
     if reader.read_bytes(CNT_Z_IMAGE_KEY.len())? != CNT_Z_IMAGE_KEY {
@@ -166,6 +182,43 @@ pub fn read_lerc1_count_mask(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskI
 /// can be skipped the same way as the C++ `CntZImage` reader.
 pub fn read_lerc1_z_stats(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskInfo, Lerc1ZStats)> {
     let (info, mask_info) = read_lerc1_count_mask(blob)?;
+    let mut stats = ZStatsBuilder::default();
+    let bytes_consumed = read_lerc1_z_tiles(&info, &mask_info.mask, blob, &mut stats)?;
+    let stats = stats.finish(bytes_consumed)?;
+    Ok((info, mask_info, stats))
+}
+
+/// Decodes a legacy Lerc1 blob into row-major `f32` pixels and a valid mask.
+///
+/// This covers the tiled z-part and non-tiled count/mask layout used by the
+/// checked-in Lerc1 fixture. Invalid pixels are represented in the mask and
+/// left as `0.0` in the returned value buffer.
+pub fn decode_lerc1(blob: &[u8]) -> Result<DecodedLerc1> {
+    let (info, mask_info) = read_lerc1_count_mask(blob)?;
+    let mut values = vec![0.0f32; (info.n_cols as usize) * (info.n_rows as usize)];
+    let bytes_consumed = read_lerc1_z_tiles(
+        &info,
+        &mask_info.mask,
+        blob,
+        &mut ZValueWriter {
+            values: &mut values,
+        },
+    )?;
+
+    Ok(DecodedLerc1 {
+        header: info,
+        mask_info,
+        values,
+        bytes_consumed,
+    })
+}
+
+fn read_lerc1_z_tiles(
+    info: &Lerc1HeaderInfo,
+    mask: &BitMask,
+    blob: &[u8],
+    sink: &mut impl ZValueSink,
+) -> Result<usize> {
     if info.z_part.num_tiles_vert <= 0 || info.z_part.num_tiles_hori <= 0 {
         return Err(LercError::Unsupported("non-tiled Lerc1 z parts"));
     }
@@ -178,20 +231,10 @@ pub fn read_lerc1_z_stats(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskInfo
         .get(payload_start..payload_end)
         .ok_or(LercError::BufferTooSmall)?;
     let mut reader = Reader::new(payload);
-    let mut stats = ZStatsBuilder::default();
 
     for (i0, i1) in tile_ranges(info.n_rows as usize, info.z_part.num_tiles_vert as usize)? {
         for (j0, j1) in tile_ranges(info.n_cols as usize, info.z_part.num_tiles_hori as usize)? {
-            read_z_tile(
-                &mut reader,
-                &info,
-                &mask_info.mask,
-                i0,
-                i1,
-                j0,
-                j1,
-                &mut stats,
-            )?;
+            read_z_tile(&mut reader, info, mask, i0, i1, j0, j1, sink)?;
         }
     }
 
@@ -199,8 +242,7 @@ pub fn read_lerc1_z_stats(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskInfo
         return Err(LercError::CorruptInput("unused Lerc1 z payload bytes"));
     }
 
-    let stats = stats.finish(payload_start + reader.pos)?;
-    Ok((info, mask_info, stats))
+    Ok(payload_start + reader.pos)
 }
 
 fn read_part_info(reader: &mut Reader<'_>) -> Result<Lerc1PartInfo> {
@@ -247,7 +289,7 @@ fn read_z_tile(
     i1: usize,
     j0: usize,
     j1: usize,
-    stats: &mut ZStatsBuilder,
+    sink: &mut impl ZValueSink,
 ) -> Result<()> {
     let raw_flag = reader.read_u8()?;
     let bits67 = raw_flag >> 6;
@@ -255,8 +297,7 @@ fn read_z_tile(
 
     if flag == 2 {
         for idx in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)? {
-            let _ = idx;
-            stats.add(0.0);
+            sink.add(idx, 0.0);
         }
         return Ok(());
     }
@@ -267,8 +308,7 @@ fn read_z_tile(
 
     if flag == 0 {
         for idx in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)? {
-            let _ = idx;
-            stats.add(reader.read_f32_le()?);
+            sink.add(idx, reader.read_f32_le()?);
         }
         return Ok(());
     }
@@ -277,8 +317,7 @@ fn read_z_tile(
     let offset = reader.read_lerc1_float(num_bytes)?;
     if flag == 3 {
         for idx in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)? {
-            let _ = idx;
-            stats.add(offset);
+            sink.add(idx, offset);
         }
         return Ok(());
     }
@@ -295,8 +334,14 @@ fn read_z_tile(
     reader.pos += consumed;
 
     let inv_scale = (2.0 * info.max_z_error) as f32;
-    for value in values.iter().take(valid_count) {
-        stats.add((offset + *value as f32 * inv_scale).min(info.z_part.max_value));
+    for (idx, value) in valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)?
+        .into_iter()
+        .zip(values.iter().take(valid_count))
+    {
+        sink.add(
+            idx,
+            (offset + *value as f32 * inv_scale).min(info.z_part.max_value),
+        );
     }
     Ok(())
 }
@@ -328,8 +373,18 @@ struct ZStatsBuilder {
     count: usize,
 }
 
+trait ZValueSink {
+    fn add(&mut self, idx: usize, value: f32);
+}
+
+impl ZValueSink for ZStatsBuilder {
+    fn add(&mut self, _idx: usize, value: f32) {
+        self.add_value(value);
+    }
+}
+
 impl ZStatsBuilder {
-    fn add(&mut self, value: f32) {
+    fn add_value(&mut self, value: f32) {
         if self.count == 0 {
             self.z_min = value;
             self.z_max = value;
@@ -352,6 +407,16 @@ impl ZStatsBuilder {
             num_valid_pixels: self.count,
             bytes_consumed,
         })
+    }
+}
+
+struct ZValueWriter<'a> {
+    values: &'a mut [f32],
+}
+
+impl ZValueSink for ZValueWriter<'_> {
+    fn add(&mut self, idx: usize, value: f32) {
+        self.values[idx] = value;
     }
 }
 
@@ -413,7 +478,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats};
+    use super::{decode_lerc1, get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats};
     use crate::DataType;
     use std::fs;
     use std::path::PathBuf;
@@ -471,6 +536,36 @@ mod tests {
         assert_eq!(stats.bytes_consumed, blob.len());
         assert_eq!(stats.z_min, -27.458_635);
         assert_eq!(stats.z_max, 5474.173);
+    }
+
+    #[test]
+    fn decodes_world_lerc1_float_values() {
+        let blob = fixture("world.lerc1");
+        let decoded = decode_lerc1(&blob).unwrap();
+
+        assert_eq!(decoded.header.n_cols, 257);
+        assert_eq!(decoded.header.n_rows, 257);
+        assert_eq!(decoded.values.len(), 257 * 257);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.mask_info.mask.count_valid_bits(), 65_025);
+        assert_eq!(decoded.values[0], 0.0);
+        assert_eq!(decoded.values[257 * 257 - 1], 0.0);
+
+        let mut z_min = f32::INFINITY;
+        let mut z_max = f32::NEG_INFINITY;
+        let mut invalid_non_zero = 0usize;
+        for (idx, value) in decoded.values.iter().copied().enumerate() {
+            if decoded.mask_info.mask.is_valid(idx).unwrap() {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            } else if value != 0.0 {
+                invalid_non_zero += 1;
+            }
+        }
+
+        assert_eq!(invalid_non_zero, 0);
+        assert_eq!(z_min, -27.458_635);
+        assert_eq!(z_max, 5474.173);
     }
 
     #[test]

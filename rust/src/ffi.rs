@@ -293,8 +293,9 @@ pub unsafe extern "C" fn lerc_encode_4D(
 /// C ABI equivalent of `lerc_getBlobInfo`.
 ///
 /// This function currently supports Lerc2 blobs handled by the Rust metadata
-/// parser. It fills the caller-provided arrays using the same order and
-/// partial-fill behavior as the C++ API.
+/// parser and the checked-in legacy Lerc1 metadata path. It fills the
+/// caller-provided arrays using the same order and partial-fill behavior as
+/// the C++ API.
 ///
 /// # Safety
 ///
@@ -327,7 +328,8 @@ pub unsafe extern "C" fn lerc_getBlobInfo(
 /// C ABI equivalent of `lerc_getDataRanges`.
 ///
 /// This function currently supports Lerc2 blobs handled by the Rust metadata
-/// parser. It writes minima and maxima in band-major, depth-minor order.
+/// parser and the checked-in legacy Lerc1 metadata path. It writes minima and
+/// maxima in band-major, depth-minor order.
 ///
 /// # Safety
 ///
