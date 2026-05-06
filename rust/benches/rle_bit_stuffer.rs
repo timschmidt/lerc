@@ -90,6 +90,7 @@ fn main() {
     let tiled_diff_blob = synthetic_v5_tiled_diff_blob();
     let encoded_rle = Rle::compress(&byte_data).unwrap();
     let encoded_bits = BitStuffer2::encode_simple(&uint_data, 3).unwrap();
+    let encoded_bits_pre_v3 = BitStuffer2::encode_simple(&uint_data, 2).unwrap();
     let bit_mask = BitMask::from_byte_mask(&mask_data, 1000, 1000).unwrap();
     let float_bytes: Vec<u8> = (0..250_000)
         .flat_map(|idx| ((idx as f32) * 0.25).to_le_bytes())
@@ -106,6 +107,14 @@ fn main() {
     });
     bench("bit-stuffer-decode-250k", 100, || {
         black_box(BitStuffer2::decode(black_box(&encoded_bits), uint_data.len(), 3).unwrap());
+    });
+    bench("bit-stuffer-encode-pre-v3-250k", 100, || {
+        black_box(BitStuffer2::encode_simple(black_box(&uint_data), 2).unwrap());
+    });
+    bench("bit-stuffer-decode-pre-v3-250k", 100, || {
+        black_box(
+            BitStuffer2::decode(black_box(&encoded_bits_pre_v3), uint_data.len(), 2).unwrap(),
+        );
     });
     bench("bit-mask-from-byte-mask-1mp", 100, || {
         black_box(BitMask::from_byte_mask(black_box(&mask_data), 1000, 1000).unwrap());

@@ -12,7 +12,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 use crate::types::{LercError, Result};
 
-/// Encoder and decoder for the Lerc2 v2.3+ `BitStuffer2` stream format.
+/// Encoder and decoder for Lerc2 `BitStuffer2` stream formats.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BitStuffer2;
 
@@ -58,12 +58,6 @@ impl BitStuffer2 {
         if data.is_empty() {
             return Err(LercError::WrongParam("data must not be empty"));
         }
-        if lerc2_version < 3 {
-            return Err(LercError::Unsupported(
-                "pre-v2.3 bit stuffing is not ported yet",
-            ));
-        }
-
         let max_elem = data.iter().copied().max().unwrap();
         let bits = num_bits(max_elem);
         if bits >= 32 {
@@ -87,7 +81,11 @@ impl BitStuffer2 {
         out.push(header);
         encode_uint(elem_count, elem_count_bytes, &mut out)?;
         if bits > 0 {
-            bit_stuff(data, bits, &mut out);
+            if lerc2_version >= 3 {
+                bit_stuff(data, bits, &mut out);
+            } else {
+                bit_stuff_before_lerc2v3(data, bits, &mut out);
+            }
         }
         Ok(out)
     }
@@ -100,12 +98,6 @@ impl BitStuffer2 {
         if sorted_data[0].0 != 0 {
             return Err(LercError::WrongParam("first sorted value must be zero"));
         }
-        if lerc2_version < 3 {
-            return Err(LercError::Unsupported(
-                "pre-v2.3 bit stuffing is not ported yet",
-            ));
-        }
-
         let elem_count = sorted_data.len();
         let mut lut = Vec::new();
         let mut indexes = vec![0u32; elem_count];
@@ -142,13 +134,21 @@ impl BitStuffer2 {
         out.push(header);
         encode_uint(elem_count_u32, elem_count_bytes, &mut out)?;
         out.push((lut.len() + 1) as u8);
-        bit_stuff(&lut, bits, &mut out);
+        if lerc2_version >= 3 {
+            bit_stuff(&lut, bits, &mut out);
+        } else {
+            bit_stuff_before_lerc2v3(&lut, bits, &mut out);
+        }
 
         let lut_index_bits = num_bits(lut.len() as u32);
         if lut_index_bits == 0 {
             return Err(LercError::WrongParam("invalid LUT index bit width"));
         }
-        bit_stuff(&indexes, lut_index_bits, &mut out);
+        if lerc2_version >= 3 {
+            bit_stuff(&indexes, lut_index_bits, &mut out);
+        } else {
+            bit_stuff_before_lerc2v3(&indexes, lut_index_bits, &mut out);
+        }
         Ok(out)
     }
 
@@ -163,12 +163,6 @@ impl BitStuffer2 {
         if encoded.is_empty() {
             return Err(LercError::BufferTooSmall);
         }
-        if lerc2_version < 3 {
-            return Err(LercError::Unsupported(
-                "pre-v2.3 bit unstuffing is not ported yet",
-            ));
-        }
-
         let mut pos = 0usize;
         let header = encoded[pos];
         pos += 1;
@@ -187,7 +181,11 @@ impl BitStuffer2 {
             if bits == 0 {
                 return Ok((vec![0; elem_count], pos));
             }
-            let data = bit_unstuff(encoded, &mut pos, elem_count, bits)?;
+            let data = if lerc2_version >= 3 {
+                bit_unstuff(encoded, &mut pos, elem_count, bits)?
+            } else {
+                bit_unstuff_before_lerc2v3(encoded, &mut pos, elem_count, bits)?
+            };
             return Ok((data, pos));
         }
 
@@ -197,14 +195,22 @@ impl BitStuffer2 {
         let lut_len = encoded[pos].wrapping_sub(1) as usize;
         pos += 1;
 
-        let mut lut = bit_unstuff(encoded, &mut pos, lut_len, bits)?;
+        let mut lut = if lerc2_version >= 3 {
+            bit_unstuff(encoded, &mut pos, lut_len, bits)?
+        } else {
+            bit_unstuff_before_lerc2v3(encoded, &mut pos, lut_len, bits)?
+        };
         lut.insert(0, 0);
 
         let lut_index_bits = num_bits(lut_len as u32);
         if lut_index_bits == 0 {
             return Err(LercError::CorruptInput("invalid LUT index bit width"));
         }
-        let mut indexes = bit_unstuff(encoded, &mut pos, elem_count, lut_index_bits)?;
+        let mut indexes = if lerc2_version >= 3 {
+            bit_unstuff(encoded, &mut pos, elem_count, lut_index_bits)?
+        } else {
+            bit_unstuff_before_lerc2v3(encoded, &mut pos, elem_count, lut_index_bits)?
+        };
         for idx in &mut indexes {
             let lut_idx = *idx as usize;
             *idx = *lut
@@ -320,6 +326,55 @@ fn bit_stuff(data: &[u32], bits: u8, out: &mut Vec<u8>) {
     }
 }
 
+fn bit_stuff_before_lerc2v3(data: &[u32], bits: u8, out: &mut Vec<u8>) {
+    let num_uints = (data.len() * bits as usize + 31) / 32;
+    let num_bytes = num_uints * 4;
+    let mut words = vec![0u32; num_uints];
+    let mut word_idx = 0usize;
+    let mut bit_pos = 0i32;
+    let bits_i32 = bits as i32;
+
+    for &value in data {
+        if 32 - bit_pos >= bits_i32 {
+            words[word_idx] |= value << (32 - bit_pos - bits_i32);
+            bit_pos += bits_i32;
+            if bit_pos == 32 {
+                word_idx += 1;
+                bit_pos = 0;
+            }
+        } else {
+            let n = bits_i32 - (32 - bit_pos);
+            words[word_idx] |= value >> n;
+            word_idx += 1;
+            words[word_idx] |= value << (32 - n);
+            bit_pos = n;
+        }
+    }
+
+    let tail_bytes_not_needed = num_tail_bytes_not_needed(data.len(), bits);
+    if tail_bytes_not_needed > 0 {
+        let last = words
+            .last_mut()
+            .expect("nonzero bit width should allocate at least one word");
+        for _ in 0..tail_bytes_not_needed {
+            *last >>= 8;
+        }
+    }
+
+    let bytes_used = num_bytes - tail_bytes_not_needed;
+    let start = out.len();
+    out.resize(start + bytes_used, 0);
+    for (i, word) in words.iter().enumerate() {
+        let byte_pos = start + i * 4;
+        if byte_pos >= start + bytes_used {
+            break;
+        }
+        let word_bytes = word.to_le_bytes();
+        let copy_len = ((start + bytes_used) - byte_pos).min(4);
+        out[byte_pos..byte_pos + copy_len].copy_from_slice(&word_bytes[..copy_len]);
+    }
+}
+
 fn bit_unstuff(encoded: &[u8], pos: &mut usize, elem_count: usize, bits: u8) -> Result<Vec<u32>> {
     if elem_count == 0 || bits >= 32 {
         return Err(LercError::CorruptInput(
@@ -367,6 +422,70 @@ fn bit_unstuff(encoded: &[u8], pos: &mut usize, elem_count: usize, bits: u8) -> 
     Ok(out)
 }
 
+fn bit_unstuff_before_lerc2v3(
+    encoded: &[u8],
+    pos: &mut usize,
+    elem_count: usize,
+    bits: u8,
+) -> Result<Vec<u32>> {
+    if elem_count == 0 || bits >= 32 {
+        return Err(LercError::CorruptInput(
+            "invalid bit-stuffed element count or width",
+        ));
+    }
+
+    let num_uints = (elem_count * bits as usize + 31) / 32;
+    let num_bytes = num_uints * 4;
+    let tail_bytes_not_needed = num_tail_bytes_not_needed(elem_count, bits);
+    let bytes_used = num_bytes - tail_bytes_not_needed;
+    if encoded.len().saturating_sub(*pos) < bytes_used {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut words = vec![0u32; num_uints];
+    for (i, chunk) in encoded[*pos..*pos + bytes_used].chunks(4).enumerate() {
+        let mut word_bytes = [0u8; 4];
+        word_bytes[..chunk.len()].copy_from_slice(chunk);
+        words[i] = u32::from_le_bytes(word_bytes);
+    }
+
+    if tail_bytes_not_needed > 0 {
+        let last = words
+            .last_mut()
+            .expect("nonzero bit width should allocate at least one word");
+        for _ in 0..tail_bytes_not_needed {
+            *last <<= 8;
+        }
+    }
+
+    let mut out = vec![0u32; elem_count];
+    let mut word_idx = 0usize;
+    let mut bit_pos = 0i32;
+    let bits_i32 = bits as i32;
+
+    for value in &mut out {
+        if 32 - bit_pos >= bits_i32 {
+            let shifted = words[word_idx] << bit_pos;
+            *value = shifted >> (32 - bits_i32);
+            bit_pos += bits_i32;
+
+            if bit_pos == 32 {
+                bit_pos = 0;
+                word_idx += 1;
+            }
+        } else {
+            let shifted = words[word_idx] << bit_pos;
+            word_idx += 1;
+            *value = shifted >> (32 - bits_i32);
+            bit_pos -= 32 - bits_i32;
+            *value |= words[word_idx] >> (32 - bit_pos);
+        }
+    }
+
+    *pos += bytes_used;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::BitStuffer2;
@@ -397,6 +516,28 @@ mod tests {
     }
 
     #[test]
+    fn simple_round_trips_pre_v3_bit_stuffing() {
+        for bits in 1..31 {
+            let max = (1u32 << bits) - 1;
+            let data: Vec<u32> = (0..257).map(|i| ((i * 37) as u32) & max).collect();
+            let encoded = BitStuffer2::encode_simple(&data, 2).unwrap();
+            let (decoded, consumed) = BitStuffer2::decode(&encoded, data.len(), 2).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, data);
+        }
+    }
+
+    #[test]
+    fn pre_v3_bit_stuffing_matches_legacy_word_layout() {
+        let encoded = BitStuffer2::encode_simple(&[1, 2, 7, 0], 2).unwrap();
+        assert_eq!(encoded, [0x83, 0x04, 0x80, 0x2b]);
+
+        let (decoded, consumed) = BitStuffer2::decode(&encoded, 4, 2).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, [1, 2, 7, 0]);
+    }
+
+    #[test]
     fn lut_round_trips_sparse_values() {
         let data = [0, 0, 9, 42, 9, 0, 42, 1000, 9, 1000];
         let mut sorted: Vec<(u32, u32)> = data
@@ -408,6 +549,22 @@ mod tests {
 
         let encoded = BitStuffer2::encode_lut(&sorted, 3).unwrap();
         let (decoded, consumed) = BitStuffer2::decode(&encoded, data.len(), 3).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn lut_round_trips_pre_v3_bit_stuffing() {
+        let data = [0, 0, 9, 42, 9, 0, 42, 1000, 9, 1000];
+        let mut sorted: Vec<(u32, u32)> = data
+            .iter()
+            .enumerate()
+            .map(|(idx, &value)| (value, idx as u32))
+            .collect();
+        sorted.sort_unstable();
+
+        let encoded = BitStuffer2::encode_lut(&sorted, 2).unwrap();
+        let (decoded, consumed) = BitStuffer2::decode(&encoded, data.len(), 2).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, data);
     }

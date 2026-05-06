@@ -6,7 +6,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 
 - Added a Cargo workspace at the repository root with the Rust crate in `rust/`.
 - Ported low-level `RLE` compression/decompression into `rust/src/rle.rs`.
-- Ported the Lerc2 v2.3+ `BitStuffer2` simple and LUT modes into `rust/src/bit_stuffer.rs`.
+- Ported `BitStuffer2` simple and LUT modes into `rust/src/bit_stuffer.rs`, including both the Lerc2 v2.3+ little-endian packing and the pre-v2.3 legacy word layout.
 - Ported `BitMask` into `rust/src/bit_mask.rs`, including byte-mask conversion helpers equivalent to the private C++ `Lerc::Convert` methods.
 - Added Lerc2 header parsing and multi-band metadata aggregation into `rust/src/lerc2.rs`.
 - Added Lerc2 mask-section reading, including RLE mask decompression and previous-mask reuse for concatenated bands.
@@ -41,9 +41,9 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 ## Compatibility Notes
 
 - The Rust `Rle` byte stream layout is intended to match `src/LercLib/RLE.cpp`: little-endian signed counters, negative repeated runs, positive literal runs, and `i16::MIN` end-of-stream marker.
-- The Rust `BitStuffer2` implementation currently supports Lerc2 version 3 and newer bit packing. The older pre-v2.3 packing path in `BitStuff_Before_Lerc2v3` and `BitUnStuff_Before_Lerc2v3` is explicitly rejected for now.
+- The Rust `BitStuffer2` implementation supports Lerc2 version 3 and newer bit packing plus the older pre-v2.3 packing path in `BitStuff_Before_Lerc2v3` and `BitUnStuff_Before_Lerc2v3`.
 - The Rust `BitMask` preserves the C++ MSB-first bit order from `BitMask::Bit`; padding bits may remain set after `set_all_valid`, but `count_valid_bits` excludes them.
-- The Rust Lerc2 parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo`, checksum validation used by `Lerc2::Decode`, mask reading used by `Lerc2::ReadMask`, min/max range parsing used by `Lerc2::ReadMinMaxRanges`, one-sweep raw payload expansion used by `Lerc2::ReadDataOneSweep`, raw-binary, simple bit-stuffed, LUT, and integer diff-encoded tiled payload expansion for `Lerc2::ReadTile`, single-band and multi-band supported-subset decode orchestration, and the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
+- The Rust Lerc2 parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo`, checksum validation used by `Lerc2::Decode`, mask reading used by `Lerc2::ReadMask`, min/max range parsing used by `Lerc2::ReadMinMaxRanges`, one-sweep raw payload expansion used by `Lerc2::ReadDataOneSweep`, raw-binary, simple bit-stuffed, LUT, and integer diff-encoded tiled payload expansion for `Lerc2::ReadTile`, single-band and multi-band supported-subset decode orchestration, pre-v2.3 bit-stuffed tile streams, and the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
 - `decode_lerc2_supported` is intentionally decode-only and subset-scoped. It validates v3+ checksums and supports constant images, one-sweep raw payloads, and non-Huffman tiled payloads already covered by the lower-level readers. Huffman-backed image modes currently return `Unsupported`.
 - `decode_lerc2_bands_supported` decodes concatenated Lerc2 blobs into separate band results and passes the previous band mask into later bands, matching the C++ previous-mask reuse mechanism for omitted partial masks.
 - For v6 blobs with `bPassNoDataValues` and `nDepth > 1`, supported decode remaps decoded values equal to `noDataVal` back to `noDataValOrig` on valid pixels, matching the C++ `Lerc::RemapNoData` wrapper behavior.
@@ -102,9 +102,9 @@ cargo bench --bench rle_bit_stuffer
 Last run in this branch:
 
 - `cargo check`: passed with `#![deny(missing_docs)]` enabled.
-- `cargo test`: passed, 71 unit tests.
+- `cargo test`: passed, 74 unit tests.
 - `cargo doc --no-deps`: passed and generated crate documentation.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, decoded `f64` conversion through C ABI, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, real float fixture decode, v6 supported-subset no-data decode, C API-style supported decode-into-buffer validation, C ABI decode, C ABI decode-to-double, C ABI real float fixture decode, and C ABI 4D no-data decode variants.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, pre-v2.3 BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, decoded `f64` conversion through C ABI, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, real float fixture decode, v6 supported-subset no-data decode, C API-style supported decode-into-buffer validation, C ABI decode, C ABI decode-to-double, C ABI real float fixture decode, and C ABI 4D no-data decode variants.
 
 ## Open Risks
 
