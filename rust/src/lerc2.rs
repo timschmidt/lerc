@@ -592,6 +592,158 @@ pub fn write_lerc2_one_sweep(
     Ok(writer.pos)
 }
 
+/// Computes per-depth min/max ranges from full image bytes for Lerc2 encoding.
+///
+/// `data` must contain one single-band image in row-major little-endian scalar
+/// bytes. Invalid pixels in `mask` are ignored. When no pixel is valid, the
+/// returned ranges are all zero and marked as equal.
+pub fn compute_lerc2_data_ranges_for_encode(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+) -> Result<MinMaxRanges> {
+    validate_single_band_encode_inputs(spec, data, mask, "Lerc2 range computation")?;
+    let mask = effective_encode_mask(spec, mask)?;
+    compute_lerc2_data_ranges_for_encode_with_mask(spec, data, &mask)
+}
+
+fn compute_lerc2_data_ranges_for_encode_with_mask(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: &BitMask,
+) -> Result<MinMaxRanges> {
+    let value_size = spec.data_type.size_in_bytes();
+    let mut mins = vec![f64::INFINITY; spec.n_depth];
+    let mut maxs = vec![f64::NEG_INFINITY; spec.n_depth];
+    let mut any_valid = false;
+
+    for row in 0..spec.n_rows {
+        for col in 0..spec.n_cols {
+            let pixel_idx = row * spec.n_cols + col;
+            if mask.is_valid(pixel_idx)? {
+                any_valid = true;
+                for depth in 0..spec.n_depth {
+                    let offset = (pixel_idx * spec.n_depth + depth) * value_size;
+                    let value =
+                        read_value_from_bytes(spec.data_type, &data[offset..offset + value_size]);
+                    if value.is_nan() {
+                        return Err(LercError::WrongParam("Lerc2 encode input contains NaN"));
+                    }
+                    mins[depth] = mins[depth].min(value);
+                    maxs[depth] = maxs[depth].max(value);
+                }
+            }
+        }
+    }
+
+    if !any_valid {
+        mins.fill(0.0);
+        maxs.fill(0.0);
+    }
+
+    let min_max_equal = mins
+        .iter()
+        .zip(maxs.iter())
+        .all(|(min, max)| min.to_bits() == max.to_bits());
+    Ok(MinMaxRanges {
+        mins,
+        maxs,
+        bytes_consumed: 0,
+        min_max_equal,
+    })
+}
+
+/// Encodes a single-band Lerc2 blob using the one-sweep payload layout.
+///
+/// This safe fallback encoder writes version 4 and newer blobs only. It
+/// computes per-depth min/max ranges from the input bytes, writes the header,
+/// mask, range section, and uncompressed one-sweep payload, then finalizes the
+/// version 3+ checksum.
+pub fn encode_lerc2_one_sweep(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    mask: Option<&BitMask>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    validate_single_band_encode_inputs(spec, data, mask, "one-sweep Lerc2 encode")?;
+    if max_z_error < 0.0 {
+        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
+    }
+    if !(4..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam(
+            "one-sweep Lerc2 encode requires version 4 or newer",
+        ));
+    }
+
+    let mask = effective_encode_mask(spec, mask)?;
+    let num_valid_pixel = mask.count_valid_bits();
+    let ranges = compute_lerc2_data_ranges_for_encode_with_mask(spec, data, &mask)?;
+    let z_min = ranges.mins.iter().copied().fold(f64::INFINITY, f64::min);
+    let z_max = ranges
+        .maxs
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let has_valid = num_valid_pixel > 0;
+    let header_size = compute_lerc2_header_byte_len(version)?;
+    let mut header = HeaderInfo {
+        version,
+        checksum: 0,
+        n_rows: spec.n_rows as i32,
+        n_cols: spec.n_cols as i32,
+        n_depth: spec.n_depth as i32,
+        num_valid_pixel: num_valid_pixel as i32,
+        micro_block_size: 8,
+        blob_size: 1,
+        n_blobs_more: 0,
+        b_pass_no_data_values: 0,
+        b_is_int: u8::from(data_values_are_integer(spec.data_type, data)?),
+        b_reserved_3: 0,
+        b_reserved_4: 0,
+        data_type: spec.data_type,
+        max_z_error,
+        z_min: if has_valid { z_min } else { 0.0 },
+        z_max: if has_valid { z_max } else { 0.0 },
+        no_data_val: 0.0,
+        no_data_val_orig: 0.0,
+        header_size,
+    };
+
+    let encode_mask = mask.count_valid_bits() < spec.n_cols * spec.n_rows;
+    let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
+    let ranges_len = if has_valid && header.z_min != header.z_max {
+        compute_lerc2_min_max_ranges_byte_len(&header)?
+    } else {
+        0
+    };
+    let payload_len = if has_valid && header.z_min != header.z_max && !ranges.min_max_equal {
+        compute_lerc2_one_sweep_byte_len(&header)?
+    } else {
+        0
+    };
+    header.blob_size = header
+        .header_size
+        .checked_add(mask_len)
+        .and_then(|len| len.checked_add(ranges_len))
+        .and_then(|len| len.checked_add(payload_len))
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or(LercError::WrongParam("Lerc2 one-sweep blob size overflow"))?;
+
+    let mut blob = vec![0; header.blob_size as usize];
+    let mut offset = write_lerc2_header(&header, &mut blob)?;
+    offset += write_lerc2_mask(&header, Some(&mask), encode_mask, &mut blob[offset..])?;
+    if ranges_len > 0 {
+        offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
+    }
+    if payload_len > 0 {
+        offset += write_lerc2_one_sweep(&header, &mask, data, &mut blob[offset..])?;
+    }
+    debug_assert_eq!(offset, blob.len());
+    finalize_lerc2_checksum(&mut blob)?;
+    Ok(blob)
+}
+
 /// Encodes a single-band constant Lerc2 blob.
 ///
 /// This is the first narrow encode path: all valid pixels and depths are
@@ -1626,6 +1778,80 @@ fn validate_lerc2_one_sweep_for_write(
     Ok(())
 }
 
+fn validate_single_band_encode_inputs(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    context: &'static str,
+) -> Result<()> {
+    spec.validate()?;
+    if spec.n_bands != 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 encode currently supports one band",
+        ));
+    }
+    if spec.n_masks > 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 encode mask count must be 0 or 1",
+        ));
+    }
+    if spec.n_cols > i32::MAX as usize
+        || spec.n_rows > i32::MAX as usize
+        || spec.n_depth > i32::MAX as usize
+    {
+        return Err(LercError::WrongParam("Lerc2 encode dimensions overflow"));
+    }
+    if data.len() != spec.data_byte_len()? {
+        return Err(LercError::WrongParam("Lerc2 encode data length mismatch"));
+    }
+    if mask.is_some() && spec.n_masks == 0 {
+        return Err(LercError::WrongParam(
+            "Lerc2 encode mask count must be nonzero when a mask is supplied",
+        ));
+    }
+    if let Some(mask) = mask {
+        if mask.cols() != spec.n_cols || mask.rows() != spec.n_rows {
+            return Err(LercError::WrongParam(
+                "Lerc2 encode mask dimensions do not match spec",
+            ));
+        }
+    }
+
+    let _ = context;
+    Ok(())
+}
+
+fn effective_encode_mask(spec: EncodeSpec, mask: Option<&BitMask>) -> Result<BitMask> {
+    if let Some(mask) = mask {
+        return Ok(mask.clone());
+    }
+
+    let mut mask = BitMask::new(spec.n_cols, spec.n_rows)?;
+    mask.set_all_valid();
+    Ok(mask)
+}
+
+fn data_values_are_integer(data_type: DataType, data: &[u8]) -> Result<bool> {
+    if (data_type as i32) < (DataType::Float as i32) {
+        return Ok(true);
+    }
+
+    let value_size = data_type.size_in_bytes();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let value = read_value_from_bytes(data_type, &data[offset..offset + value_size]);
+        if value.is_nan() {
+            return Err(LercError::WrongParam("Lerc2 encode input contains NaN"));
+        }
+        if value.fract() != 0.0 {
+            return Ok(false);
+        }
+        offset += value_size;
+    }
+
+    Ok(true)
+}
+
 fn validate_decode_into_spec(spec: DecodeIntoSpec, has_mask_output: bool) -> Result<()> {
     if spec.n_depth == 0 || spec.n_cols == 0 || spec.n_rows == 0 || spec.n_bands == 0 {
         return Err(LercError::WrongParam(
@@ -2581,17 +2807,19 @@ impl<'a> Writer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
+        compute_checksum_fletcher32, compute_lerc2_data_ranges_for_encode,
+        compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
         decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
         decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
-        finalize_lerc2_checksum, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-        get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep,
-        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-        read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-        write_lerc2_one_sweep, DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        encode_lerc2_one_sweep, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
+        DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -3605,6 +3833,106 @@ mod tests {
         assert_eq!(
             encode_lerc2_constant(multi_band, 1.0, 0.0, None, 6).unwrap_err(),
             LercError::WrongParam("constant Lerc2 encode currently supports one band")
+        );
+    }
+
+    #[test]
+    fn computes_lerc2_encode_ranges_from_valid_pixels() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let data = [1u8, 2, 99, 99, 3, 9, 5, 6, 7, 8, 0, 0];
+        let ranges = compute_lerc2_data_ranges_for_encode(spec, &data, Some(&mask)).unwrap();
+
+        assert_eq!(ranges.mins, [1.0, 2.0]);
+        assert_eq!(ranges.maxs, [7.0, 9.0]);
+        assert!(!ranges.min_max_equal);
+    }
+
+    #[test]
+    fn encodes_one_sweep_lerc2_blob_for_supported_decode_round_trip() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let data = [1u8, 2, 99, 99, 3, 9, 5, 6, 7, 8, 0, 0];
+        let blob = encode_lerc2_one_sweep(spec, &data, 0.5, Some(&mask), 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 6);
+        assert_eq!(decoded.header.n_depth, 2);
+        assert_eq!(decoded.header.num_valid_pixel, 4);
+        assert_eq!(decoded.header.z_min, 1.0);
+        assert_eq!(decoded.header.z_max, 9.0);
+        assert_eq!(decoded.mask, mask);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(
+            validate_lerc2_checksum(&blob).unwrap().blob_size as usize,
+            blob.len()
+        );
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 9, 5, 6, 7, 8, 0, 0])
+        );
+    }
+
+    #[test]
+    fn encodes_one_sweep_lerc2_all_depths_constant_as_range_only_blob() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2];
+        let blob = encode_lerc2_one_sweep(spec, &data, 0.5, None, 4).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 4);
+        assert_eq!(decoded.header.z_min, 1.0);
+        assert_eq!(decoded.header.z_max, 2.0);
+        assert!(decoded.ranges.as_ref().unwrap().min_max_equal);
+        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+    }
+
+    #[test]
+    fn rejects_invalid_one_sweep_lerc2_encode_inputs() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1.0f32, 2.0, f32::NAN, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            encode_lerc2_one_sweep(spec, &data, 0.0, None, 6).unwrap_err(),
+            LercError::WrongParam("Lerc2 encode input contains NaN")
+        );
+        assert_eq!(
+            encode_lerc2_one_sweep(spec, &[1, 2, 3], 0.0, None, 6).unwrap_err(),
+            LercError::WrongParam("Lerc2 encode data length mismatch")
+        );
+        assert_eq!(
+            encode_lerc2_one_sweep(spec, &data, 0.0, None, 3).unwrap_err(),
+            LercError::WrongParam("one-sweep Lerc2 encode requires version 4 or newer")
         );
     }
 

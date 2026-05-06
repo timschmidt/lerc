@@ -6,7 +6,7 @@ use lerc::{
     compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len, decode_lerc1,
     decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
     decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_typed_values,
-    encode_lerc2_constant, finalize_lerc2_checksum, get_lerc1_header_info,
+    encode_lerc2_constant, encode_lerc2_one_sweep, finalize_lerc2_checksum, get_lerc1_header_info,
     get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
     get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
     read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
@@ -467,6 +467,18 @@ fn main() {
             encode_lerc2_constant(
                 constant_encode_spec,
                 7.0,
+                0.5,
+                Some(black_box(&encode_mask)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-one-sweep-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_one_sweep(
+                constant_encode_spec,
+                black_box(&encode_one_sweep_data),
                 0.5,
                 Some(black_box(&encode_mask)),
                 6,
