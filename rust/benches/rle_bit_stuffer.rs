@@ -309,6 +309,11 @@ fn main() {
                 .unwrap(),
         );
     });
+    bench("decode-into-spec-byte-counts", 100_000, || {
+        black_box(decode_into_spec.data_byte_len().unwrap());
+        black_box(decode_into_spec.value_count().unwrap());
+        black_box(decode_into_spec.mask_byte_len().unwrap());
+    });
     bench("lerc2-supported-decode-into-v4-synthetic", 100_000, || {
         black_box(
             decode_lerc2_supported_into(

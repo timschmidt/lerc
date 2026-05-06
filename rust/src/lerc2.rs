@@ -308,6 +308,35 @@ pub struct DecodeIntoSpec {
     pub n_masks: usize,
 }
 
+impl DecodeIntoSpec {
+    /// Returns the byte count needed for decoded scalar output.
+    pub fn data_byte_len(self) -> Result<usize> {
+        self.n_bands
+            .checked_mul(self.n_rows)
+            .and_then(|count| count.checked_mul(self.n_cols))
+            .and_then(|count| count.checked_mul(self.n_depth))
+            .and_then(|count| count.checked_mul(self.data_type.size_in_bytes()))
+            .ok_or(LercError::WrongParam("decode output byte count overflow"))
+    }
+
+    /// Returns the scalar value count represented by the decoded output.
+    pub fn value_count(self) -> Result<usize> {
+        self.n_bands
+            .checked_mul(self.n_rows)
+            .and_then(|count| count.checked_mul(self.n_cols))
+            .and_then(|count| count.checked_mul(self.n_depth))
+            .ok_or(LercError::WrongParam("decode output value count overflow"))
+    }
+
+    /// Returns the byte count needed for decoded byte-mask output.
+    pub fn mask_byte_len(self) -> Result<usize> {
+        self.n_masks
+            .checked_mul(self.n_rows)
+            .and_then(|count| count.checked_mul(self.n_cols))
+            .ok_or(LercError::WrongParam("decode mask byte count overflow"))
+    }
+}
+
 /// Byte counts produced by a supported decode-into operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeIntoResult {
@@ -730,13 +759,7 @@ pub fn decode_lerc2_supported_into(
         ));
     }
 
-    let data_bytes_needed = spec
-        .n_bands
-        .checked_mul(spec.n_rows)
-        .and_then(|count| count.checked_mul(spec.n_cols))
-        .and_then(|count| count.checked_mul(spec.n_depth))
-        .and_then(|count| count.checked_mul(spec.data_type.size_in_bytes()))
-        .ok_or(LercError::WrongParam("decode output byte count overflow"))?;
+    let data_bytes_needed = spec.data_byte_len()?;
     if data_output.len() < data_bytes_needed {
         return Err(LercError::BufferTooSmall);
     }
@@ -750,11 +773,7 @@ pub fn decode_lerc2_supported_into(
         (0, _) => 0,
         (1, Some(output)) => selected_bands[0].write_mask_bytes(output)?,
         (_, Some(output)) => {
-            let mask_bytes_needed = spec
-                .n_masks
-                .checked_mul(spec.n_rows)
-                .and_then(|count| count.checked_mul(spec.n_cols))
-                .ok_or(LercError::WrongParam("decode mask byte count overflow"))?;
+            let mask_bytes_needed = spec.mask_byte_len()?;
             if output.len() < mask_bytes_needed {
                 return Err(LercError::BufferTooSmall);
             }
@@ -3165,6 +3184,48 @@ mod tests {
         assert_eq!(result.mask_bytes_written, 6);
         assert_eq!(data, [1, 0, 2, 3, 0, 4, 10, 0, 20, 30, 0, 40]);
         assert_eq!(mask, [1, 0, 1, 1, 0, 1]);
+    }
+
+    #[test]
+    fn decode_into_spec_reports_buffer_lengths_and_overflow() {
+        let spec = DecodeIntoSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 5,
+            n_bands: 7,
+            n_masks: 1,
+        };
+
+        assert_eq!(spec.value_count().unwrap(), 210);
+        assert_eq!(spec.data_byte_len().unwrap(), 840);
+        assert_eq!(spec.mask_byte_len().unwrap(), 15);
+
+        let overflow = DecodeIntoSpec {
+            data_type: DataType::Double,
+            n_depth: usize::MAX,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        assert_eq!(
+            overflow.value_count().unwrap_err(),
+            LercError::WrongParam("decode output value count overflow")
+        );
+        assert_eq!(
+            overflow.data_byte_len().unwrap_err(),
+            LercError::WrongParam("decode output byte count overflow")
+        );
+
+        let mask_overflow = DecodeIntoSpec {
+            n_masks: usize::MAX,
+            ..spec
+        };
+        assert_eq!(
+            mask_overflow.mask_byte_len().unwrap_err(),
+            LercError::WrongParam("decode mask byte count overflow")
+        );
     }
 
     #[test]

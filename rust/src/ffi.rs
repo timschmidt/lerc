@@ -761,11 +761,11 @@ unsafe fn lerc_decode_impl(
         n_masks: n_masks as usize,
     };
 
-    let data_len = match decoded_data_byte_len(spec) {
+    let data_len = match spec.data_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
-    let mask_len = match decoded_mask_byte_len(spec) {
+    let mask_len = match spec.mask_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
@@ -832,11 +832,11 @@ unsafe fn lerc_decode_4d_impl(
         n_bands: n_bands as usize,
         n_masks: n_masks as usize,
     };
-    let data_len = match decoded_data_byte_len(spec) {
+    let data_len = match spec.data_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
-    let mask_len = match decoded_mask_byte_len(spec) {
+    let mask_len = match spec.mask_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
@@ -921,15 +921,15 @@ unsafe fn lerc_decode_to_double_impl(
         n_masks: n_masks as usize,
     };
 
-    let data_len = match decoded_data_byte_len(spec) {
+    let data_len = match spec.data_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
-    let value_count = match decoded_value_count(spec) {
+    let value_count = match spec.value_count() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
-    let mask_len = match decoded_mask_byte_len(spec) {
+    let mask_len = match spec.mask_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
@@ -999,15 +999,15 @@ unsafe fn lerc_decode_to_double_4d_impl(
         n_masks: n_masks as usize,
     };
 
-    let data_len = match decoded_data_byte_len(spec) {
+    let data_len = match spec.data_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
-    let value_count = match decoded_value_count(spec) {
+    let value_count = match spec.value_count() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
-    let mask_len = match decoded_mask_byte_len(spec) {
+    let mask_len = match spec.mask_byte_len() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
     };
@@ -1039,30 +1039,6 @@ unsafe fn lerc_decode_to_double_4d_impl(
     } else {
         ErrCode::Ok as u32
     }
-}
-
-fn decoded_data_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
-    spec.n_bands
-        .checked_mul(spec.n_rows)
-        .and_then(|count| count.checked_mul(spec.n_cols))
-        .and_then(|count| count.checked_mul(spec.n_depth))
-        .and_then(|count| count.checked_mul(spec.data_type.size_in_bytes()))
-        .ok_or(LercError::WrongParam("decode output byte count overflow"))
-}
-
-fn decoded_value_count(spec: DecodeIntoSpec) -> Result<usize, LercError> {
-    spec.n_bands
-        .checked_mul(spec.n_rows)
-        .and_then(|count| count.checked_mul(spec.n_cols))
-        .and_then(|count| count.checked_mul(spec.n_depth))
-        .ok_or(LercError::WrongParam("decode output value count overflow"))
-}
-
-fn decoded_mask_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
-    spec.n_masks
-        .checked_mul(spec.n_rows)
-        .and_then(|count| count.checked_mul(spec.n_cols))
-        .ok_or(LercError::WrongParam("decode mask byte count overflow"))
 }
 
 fn decode_native_into_typed(
