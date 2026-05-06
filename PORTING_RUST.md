@@ -9,7 +9,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Ported the Lerc2 v2.3+ `BitStuffer2` simple and LUT modes into `rust/src/bit_stuffer.rs`.
 - Ported `BitMask` into `rust/src/bit_mask.rs`, including byte-mask conversion helpers equivalent to the private C++ `Lerc::Convert` methods.
 - Added Lerc2 header parsing and multi-band metadata aggregation into `rust/src/lerc2.rs`.
-- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, Lerc2 fixture metadata, and malformed input.
+- Added Lerc2 mask-section reading, including RLE mask decompression and previous-mask reuse for concatenated bands.
+- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, Lerc2 fixture metadata, Lerc2 masks, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -17,7 +18,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - The Rust `Rle` byte stream layout is intended to match `src/LercLib/RLE.cpp`: little-endian signed counters, negative repeated runs, positive literal runs, and `i16::MIN` end-of-stream marker.
 - The Rust `BitStuffer2` implementation currently supports Lerc2 version 3 and newer bit packing. The older pre-v2.3 packing path in `BitStuff_Before_Lerc2v3` and `BitUnStuff_Before_Lerc2v3` is explicitly rejected for now.
 - The Rust `BitMask` preserves the C++ MSB-first bit order from `BitMask::Bit`; padding bits may remain set after `set_all_valid`, but `count_valid_bits` excludes them.
-- The Rust Lerc2 metadata parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo` plus the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
+- The Rust Lerc2 metadata parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo`, mask reading used by `Lerc2::ReadMask`, and the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
+- Lerc2 previous-mask reuse is explicit in Rust via `read_lerc2_mask_with_previous`; calling `read_lerc2_mask` on a blob that omits a partial mask returns an unsupported error.
 - Public Rust APIs return `Result<T, LercError>` instead of bool/status pairs. C-compatible FFI wrappers should be added after the safe Rust codec surface is stable.
 
 ## Next Porting Steps
@@ -32,6 +34,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
    - Compare Rust `get_lerc_info` with C API output for all `testData/*.lerc2` fixtures.
    - Decide whether the Rust crate should implement Lerc1 metadata fallback or expose Lerc2-only behavior explicitly.
 4. Port decode-only Lerc2 block paths.
+   - Add checksum validation before tile reads for version 3+ blobs.
+   - Port min/max range section parsing for version 4+ blobs.
    - Decode uncompressed, bit-stuffed, RLE, and Huffman-backed blocks separately.
    - Keep each block codec independently fuzzable and benchmarkable.
 5. Add encode paths after decode parity is established.
@@ -50,8 +54,8 @@ cargo bench --bench rle_bit_stuffer
 
 Last run in this branch:
 
-- `cargo test`: passed, 16 unit tests.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, and Lerc2 metadata parsing.
+- `cargo test`: passed, 18 unit tests.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, Lerc2 metadata parsing, and Lerc2 mask reading.
 
 ## Open Risks
 

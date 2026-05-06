@@ -9,6 +9,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 */
 
 use crate::types::{DataType, LercError, Result};
+use crate::{BitMask, Rle};
 
 pub const CURRENT_VERSION: i32 = 6;
 pub const FILE_KEY: &[u8; 6] = b"Lerc2 ";
@@ -49,6 +50,13 @@ pub struct HeaderProbe {
     pub has_mask: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskInfo {
+    pub mask: BitMask,
+    pub num_bytes_mask: i32,
+    pub bytes_consumed: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LercInfo {
     pub version: i32,
@@ -74,6 +82,20 @@ pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
         header,
         has_mask: mask_bytes > 0,
     })
+}
+
+pub fn read_lerc2_mask(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo)> {
+    read_lerc2_mask_with_previous(blob, None)
+}
+
+pub fn read_lerc2_mask_with_previous(
+    blob: &[u8],
+    previous_mask: Option<&BitMask>,
+) -> Result<(HeaderInfo, MaskInfo)> {
+    let mut reader = Reader::new(blob);
+    let header = read_header(&mut reader)?;
+    let mask = read_mask(&mut reader, &header, previous_mask)?;
+    Ok((header, mask))
 }
 
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
@@ -162,6 +184,57 @@ pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
     }
 
     Ok(info)
+}
+
+fn read_mask(
+    reader: &mut Reader<'_>,
+    header: &HeaderInfo,
+    previous_mask: Option<&BitMask>,
+) -> Result<MaskInfo> {
+    let num_valid = header.num_valid_pixel;
+    let width = header.n_cols;
+    let height = header.n_rows;
+    let total = width
+        .checked_mul(height)
+        .ok_or(LercError::CorruptInput("Lerc2 mask pixel count overflow"))?;
+
+    let num_bytes_mask = reader.read_i32_le()?;
+    if num_bytes_mask < 0 {
+        return Err(LercError::CorruptInput("negative Lerc2 mask byte count"));
+    }
+
+    if (num_valid == 0 || num_valid == total) && num_bytes_mask != 0 {
+        return Err(LercError::CorruptInput(
+            "Lerc2 mask bytes present for all-valid or all-invalid image",
+        ));
+    }
+
+    let mut mask = BitMask::new(width as usize, height as usize)?;
+    if num_valid == 0 {
+        mask.set_all_invalid();
+    } else if num_valid == total {
+        mask.set_all_valid();
+    } else if num_bytes_mask > 0 {
+        let mask_bytes = reader.read_bytes(num_bytes_mask as usize)?;
+        Rle::decompress_into(mask_bytes, mask.bits_mut())?;
+    } else if let Some(previous) = previous_mask {
+        if previous.cols() != width as usize || previous.rows() != height as usize {
+            return Err(LercError::WrongParam(
+                "previous Lerc2 mask dimensions do not match header",
+            ));
+        }
+        mask = previous.clone();
+    } else {
+        return Err(LercError::Unsupported(
+            "Lerc2 partial mask omitted; previous-mask reuse is not supported yet",
+        ));
+    }
+
+    Ok(MaskInfo {
+        mask,
+        num_bytes_mask,
+        bytes_consumed: reader.pos,
+    })
 }
 
 fn read_header(reader: &mut Reader<'_>) -> Result<HeaderInfo> {
@@ -345,7 +418,9 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_lerc2_header_info, get_lerc_info};
+    use super::{
+        get_lerc2_header_info, get_lerc_info, read_lerc2_mask, read_lerc2_mask_with_previous,
+    };
     use crate::DataType;
     use std::fs;
     use std::path::PathBuf;
@@ -381,6 +456,25 @@ mod tests {
     }
 
     #[test]
+    fn reads_single_band_float_fixture_mask() {
+        let blob = fixture("california_400_400_1_float.lerc2");
+        let (header, mask_info) = read_lerc2_mask(&blob).unwrap();
+
+        assert_eq!(header.num_valid_pixel, 58_515);
+        assert!(mask_info.num_bytes_mask > 0);
+        assert_eq!(
+            mask_info.bytes_consumed,
+            header.header_size + 4 + mask_info.num_bytes_mask as usize
+        );
+        assert_eq!(mask_info.mask.cols(), 400);
+        assert_eq!(mask_info.mask.rows(), 400);
+        assert_eq!(
+            mask_info.mask.count_valid_bits() as i32,
+            header.num_valid_pixel
+        );
+    }
+
+    #[test]
     fn aggregates_concatenated_byte_fixture_info() {
         let blob = fixture("bluemarble_256_256_3_byte.lerc2");
         let info = get_lerc_info(&blob).unwrap();
@@ -401,10 +495,37 @@ mod tests {
     }
 
     #[test]
+    fn reads_each_concatenated_byte_fixture_mask() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        let mut offset = 0usize;
+        let mut valid_counts = Vec::new();
+        let mut previous_mask = None;
+
+        while offset < blob.len() {
+            let (header, mask_info) =
+                read_lerc2_mask_with_previous(&blob[offset..], previous_mask.as_ref()).unwrap();
+            assert_eq!(mask_info.mask.cols(), 256);
+            assert_eq!(mask_info.mask.rows(), 256);
+            assert_eq!(
+                mask_info.mask.count_valid_bits() as i32,
+                header.num_valid_pixel
+            );
+            assert!(mask_info.bytes_consumed <= header.blob_size as usize);
+            valid_counts.push(header.num_valid_pixel);
+            offset += header.blob_size as usize;
+            previous_mask = Some(mask_info.mask);
+        }
+
+        assert_eq!(offset, blob.len());
+        assert_eq!(valid_counts, [43_008, 43_008, 43_008]);
+    }
+
+    #[test]
     fn detects_truncated_header_and_blob() {
         let blob = fixture("california_400_400_1_float.lerc2");
         assert!(get_lerc2_header_info(&blob[..12]).is_err());
         assert!(get_lerc_info(&blob[..blob.len() - 1]).is_err());
+        assert!(read_lerc2_mask(&blob[..80]).is_err());
     }
 
     #[test]
