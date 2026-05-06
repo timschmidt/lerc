@@ -941,8 +941,8 @@ pub fn encode_lerc2_auto_with_no_data(
         version,
     )?;
     if !matches!(spec.data_type, DataType::UChar | DataType::Char)
-        || max_z_error != 0.5
         || version < 6
+        || !auto_byte_huffman_max_z_error_is_lossless_byte(spec, data, max_z_error, masks)?
     {
         return Ok(baseline);
     }
@@ -984,8 +984,8 @@ pub fn encode_lerc2_auto(
 ) -> Result<Vec<u8>> {
     let baseline = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
     if !matches!(spec.data_type, DataType::UChar | DataType::Char)
-        || max_z_error != 0.5
         || version < 4
+        || !auto_byte_huffman_max_z_error_is_lossless_byte(spec, data, max_z_error, masks)?
     {
         return Ok(baseline);
     }
@@ -1029,6 +1029,73 @@ pub fn encode_lerc2_auto(
         }
         Err(err) => Err(err),
     }
+}
+
+fn auto_byte_huffman_max_z_error_is_lossless_byte(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+) -> Result<bool> {
+    if max_z_error == 0.5 {
+        return Ok(true);
+    }
+    if max_z_error >= 0.0 || !matches!(spec.data_type, DataType::UChar | DataType::Char) {
+        return Ok(false);
+    }
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    let mask_len = spec.mask_byte_len()?;
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 band data offset overflow"))?;
+        let data_end = data_start
+            .checked_add(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 band data offset overflow"))?;
+        let band_data = data
+            .get(data_start..data_end)
+            .ok_or(LercError::WrongParam("Lerc2 encode data length mismatch"))?;
+        let band_mask = match (masks, spec.n_masks) {
+            (None, _) | (_, 0) => None,
+            (Some(mask_bytes), 1) => Some(BitMask::from_byte_mask(
+                &mask_bytes[..mask_len],
+                spec.n_cols,
+                spec.n_rows,
+            )?),
+            (Some(mask_bytes), _) => {
+                let mask_start = band
+                    .checked_mul(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 mask offset overflow"))?;
+                let mask_end = mask_start
+                    .checked_add(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 mask offset overflow"))?;
+                Some(BitMask::from_byte_mask(
+                    mask_bytes
+                        .get(mask_start..mask_end)
+                        .ok_or(LercError::WrongParam("Lerc2 mask byte length mismatch"))?,
+                    spec.n_cols,
+                    spec.n_rows,
+                )?)
+            }
+        };
+        let effective_mask = effective_encode_mask(band_spec, band_mask.as_ref())?;
+        let normalized = normalize_lerc2_max_z_error_for_encode(
+            band_spec,
+            band_data,
+            &effective_mask,
+            max_z_error,
+        )?;
+        if normalized != 0.5 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Encodes band-major byte data as concatenated byte-Huffman Lerc2 blobs.
@@ -7405,10 +7472,25 @@ mod tests {
         let auto =
             encode_lerc2_auto_with_no_data(spec, &data, 0.5, None, Some(&[1]), Some(&[255.0]), 6)
                 .unwrap();
+        let negative_auto =
+            encode_lerc2_auto_with_no_data(spec, &data, -0.2, None, Some(&[1]), Some(&[255.0]), 6)
+                .unwrap();
+        let negative_baseline = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            -0.2,
+            None,
+            Some(&[1]),
+            Some(&[255.0]),
+            6,
+        )
+        .unwrap();
         let decoded = decode_lerc2_supported(&auto).unwrap();
 
         assert!(explicit.len() < baseline.len());
         assert_eq!(auto, explicit);
+        assert!(negative_auto.len() < negative_baseline.len());
+        assert_eq!(negative_auto, explicit);
         assert!(decoded.header.has_no_data_values());
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
         assert_eq!(
@@ -7541,8 +7623,15 @@ mod tests {
         let decoded = decode_lerc2_supported(&auto).unwrap();
 
         assert!(auto.len() < uncompressed.len());
-        assert_eq!(decoded.data, DecodedData::UChar(data));
+        assert_eq!(decoded.data, DecodedData::UChar(data.clone()));
         assert_eq!(decoded.bytes_consumed, auto.len());
+
+        let negative_auto = encode_lerc2_auto(spec, &data, -0.2, None, 6).unwrap();
+        let negative_uncompressed = encode_lerc2_uncompressed(spec, &data, -0.2, None, 6).unwrap();
+        let negative_decoded = decode_lerc2_supported(&negative_auto).unwrap();
+        assert!(negative_auto.len() < negative_uncompressed.len());
+        assert_eq!(negative_decoded.header.max_z_error, 0.5);
+        assert_eq!(negative_decoded.data, DecodedData::UChar(data));
     }
 
     #[test]
