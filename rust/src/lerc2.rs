@@ -9,7 +9,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 */
 
 use crate::types::{DataType, LercError, Result};
-use crate::{BitMask, Rle};
+use crate::{BitMask, BitStuffer2, Rle};
 
 pub const CURRENT_VERSION: i32 = 6;
 pub const FILE_KEY: &[u8; 6] = b"Lerc2 ";
@@ -255,7 +255,18 @@ pub fn read_lerc2_tiled_raw(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, TiledD
     read_lerc2_tiled_raw_with_previous(blob, None)
 }
 
+pub fn read_lerc2_tiled_payload(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
+    read_lerc2_tiled_payload_with_previous(blob, None)
+}
+
 pub fn read_lerc2_tiled_raw_with_previous(
+    blob: &[u8],
+    previous_mask: Option<&BitMask>,
+) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
+    read_lerc2_tiled_payload_with_previous(blob, previous_mask)
+}
+
+pub fn read_lerc2_tiled_payload_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
 ) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
@@ -285,7 +296,7 @@ pub fn read_lerc2_tiled_raw_with_previous(
         ));
     }
 
-    let data = read_tiled_raw(&mut reader, &header, &mask.mask)?;
+    let data = read_tiled_payload(&mut reader, &header, &mask.mask)?;
     Ok((header, mask, data))
 }
 
@@ -505,7 +516,7 @@ fn read_data_one_sweep(
     })
 }
 
-fn read_tiled_raw(
+fn read_tiled_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
     mask: &BitMask,
@@ -547,7 +558,7 @@ fn read_tiled_raw(
             let j1 = (j0 + mb_size).min(n_cols);
 
             for i_depth in 0..n_depth {
-                read_raw_tile(reader, header, mask, &mut data, i0, i1, j0, j1, i_depth)?;
+                read_tile_payload(reader, header, mask, &mut data, i0, i1, j0, j1, i_depth)?;
             }
         }
     }
@@ -558,7 +569,7 @@ fn read_tiled_raw(
     })
 }
 
-fn read_raw_tile(
+fn read_tile_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
     mask: &BitMask,
@@ -587,6 +598,7 @@ fn read_raw_tile(
     let value_size = header.data_type.size_in_bytes();
     let n_cols = header.n_cols as usize;
     let n_depth = header.n_depth as usize;
+    let bits67 = raw_flag >> 6;
     let tile_mode = raw_flag & 3;
 
     match tile_mode {
@@ -604,10 +616,136 @@ fn read_raw_tile(
             Ok(())
         }
         2 => Ok(()),
-        1 | 3 => Err(LercError::Unsupported(
-            "Lerc2 bit-stuffed tiled payloads are not ported yet",
-        )),
+        3 => {
+            let dt_used = get_data_type_used(header.data_type, bits67)?;
+            let offset = reader.read_value_as_f64(dt_used)?;
+            fill_tile_with_value(header, mask, data, i0, i1, j0, j1, i_depth, offset)
+        }
+        1 => {
+            let dt_used = get_data_type_used(header.data_type, bits67)?;
+            let offset = reader.read_value_as_f64(dt_used)?;
+            let max_element_count = (i1 - i0) * (j1 - j0);
+            let remaining = &reader.bytes[reader.pos..];
+            let (quantized, consumed) =
+                BitStuffer2::decode(remaining, max_element_count, header.version)?;
+            reader.pos += consumed;
+            scale_quantized_tile(
+                header, mask, data, i0, i1, j0, j1, i_depth, offset, &quantized,
+            )
+        }
         _ => unreachable!(),
+    }
+}
+
+fn fill_tile_with_value(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &mut [u8],
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    i_depth: usize,
+    value: f64,
+) -> Result<()> {
+    let value_size = header.data_type.size_in_bytes();
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+    let value_bytes = encode_value_as_bytes(header.data_type, value);
+
+    for row in i0..i1 {
+        for col in j0..j1 {
+            let pixel_idx = row * n_cols + col;
+            if mask.is_valid(pixel_idx)? {
+                let dst_offset = (pixel_idx * n_depth + i_depth) * value_size;
+                data[dst_offset..dst_offset + value_size].copy_from_slice(&value_bytes);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn scale_quantized_tile(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &mut [u8],
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    i_depth: usize,
+    offset: f64,
+    quantized: &[u32],
+) -> Result<()> {
+    let max_element_count = (i1 - i0) * (j1 - j0);
+    let all_valid_tile = quantized.len() == max_element_count;
+    let value_size = header.data_type.size_in_bytes();
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+    let inv_scale = 2.0 * header.max_z_error;
+    let mut src_idx = 0usize;
+
+    for row in i0..i1 {
+        for col in j0..j1 {
+            let pixel_idx = row * n_cols + col;
+            if all_valid_tile || mask.is_valid(pixel_idx)? {
+                if src_idx >= quantized.len() {
+                    return Err(LercError::CorruptInput(
+                        "Lerc2 tiled bit-stuffed payload is too short",
+                    ));
+                }
+
+                let mut value = offset + quantized[src_idx] as f64 * inv_scale;
+                value = value.min(header.z_max);
+                let value_bytes = encode_value_as_bytes(header.data_type, value);
+                let dst_offset = (pixel_idx * n_depth + i_depth) * value_size;
+                data[dst_offset..dst_offset + value_size].copy_from_slice(&value_bytes);
+                src_idx += 1;
+            }
+        }
+    }
+
+    if src_idx != quantized.len() {
+        return Err(LercError::CorruptInput(
+            "Lerc2 tiled bit-stuffed payload has unused values",
+        ));
+    }
+
+    Ok(())
+}
+
+fn get_data_type_used(data_type: DataType, tc: u8) -> Result<DataType> {
+    let dt = data_type as i32;
+    let tc = tc as i32;
+    let used = match data_type {
+        DataType::Short | DataType::Int => dt - tc,
+        DataType::UShort | DataType::UInt => dt - 2 * tc,
+        DataType::Float => {
+            if tc == 0 {
+                dt
+            } else if tc == 1 {
+                DataType::Short as i32
+            } else {
+                DataType::UChar as i32
+            }
+        }
+        DataType::Double => dt - 2 * tc + 1,
+        _ => dt,
+    };
+    DataType::try_from(used)
+}
+
+fn encode_value_as_bytes(data_type: DataType, value: f64) -> Vec<u8> {
+    match data_type {
+        DataType::Char => vec![(value as i8) as u8],
+        DataType::UChar => vec![value as u8],
+        DataType::Short => (value as i16).to_le_bytes().to_vec(),
+        DataType::UShort => (value as u16).to_le_bytes().to_vec(),
+        DataType::Int => (value as i32).to_le_bytes().to_vec(),
+        DataType::UInt => (value as u32).to_le_bytes().to_vec(),
+        DataType::Float => (value as f32).to_le_bytes().to_vec(),
+        DataType::Double => value.to_le_bytes().to_vec(),
     }
 }
 
@@ -816,9 +954,10 @@ mod tests {
     use super::{
         compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info,
         read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_tiled_raw, validate_lerc2_checksum, FILE_KEY,
+        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        validate_lerc2_checksum, FILE_KEY,
     };
-    use crate::{DataType, Rle};
+    use crate::{BitStuffer2, DataType, Rle};
     use std::fs;
     use std::path::PathBuf;
 
@@ -931,6 +1070,58 @@ mod tests {
             blob.extend_from_slice(payload);
         }
         blob
+    }
+
+    fn synthetic_v4_tiled_block_blob(
+        data_type: DataType,
+        n_depth: i32,
+        valid: &[u8],
+        range_bytes: &[u8],
+        blocks: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let num_valid = valid.iter().filter(|&&value| value != 0).count();
+        let encoded_mask = if num_valid > 0 && num_valid < valid.len() {
+            let mask = crate::BitMask::from_byte_mask(valid, 5, 3).unwrap();
+            Rle::compress(mask.bits()).unwrap()
+        } else {
+            Vec::new()
+        };
+        let tile_bytes_len: usize = blocks.iter().map(Vec::len).sum();
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size =
+            header_size + 4 + encoded_mask.len() + range_bytes.len() + 1 + tile_bytes_len;
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [
+            3,
+            5,
+            n_depth,
+            num_valid as i32,
+            2,
+            blob_size as i32,
+            data_type as i32,
+        ] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&10.0f64.to_le_bytes());
+        blob.extend_from_slice(&24.0f64.to_le_bytes());
+        blob.extend_from_slice(&(encoded_mask.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&encoded_mask);
+        blob.extend_from_slice(range_bytes);
+        blob.push(0);
+        for block in blocks {
+            blob.extend_from_slice(block);
+        }
+        blob
+    }
+
+    fn bit_stuffed_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
+        let mut block = vec![1, offset];
+        block.extend_from_slice(&BitStuffer2::encode_simple(quantized, 4).unwrap());
+        block
     }
 
     #[test]
@@ -1167,6 +1358,44 @@ mod tests {
         blob[tile_start] = 0;
         blob.pop();
         assert!(read_lerc2_tiled_raw(&blob).is_err());
+    }
+
+    #[test]
+    fn reads_v4_simple_bit_stuffed_tiled_payload() {
+        let valid = [1; 15];
+        let ranges = [10u8, 24];
+        let mut const_block = vec![3, 24];
+        let blocks = vec![
+            bit_stuffed_tile_block(10, &[0, 1, 5, 6]),
+            bit_stuffed_tile_block(10, &[2, 3, 7, 8]),
+            bit_stuffed_tile_block(10, &[4, 9]),
+            bit_stuffed_tile_block(10, &[10, 11]),
+            bit_stuffed_tile_block(10, &[12, 13]),
+            std::mem::take(&mut const_block),
+        ];
+        let blob = synthetic_v4_tiled_block_blob(DataType::UChar, 1, &valid, &ranges, &blocks);
+        let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
+
+        assert_eq!(tiled.data, (10u8..=24).collect::<Vec<_>>());
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn rejects_truncated_bit_stuffed_tiled_payload() {
+        let valid = [1; 15];
+        let ranges = [10u8, 24];
+        let blocks = vec![
+            bit_stuffed_tile_block(10, &[0, 1, 5, 6]),
+            bit_stuffed_tile_block(10, &[2, 3, 7, 8]),
+            bit_stuffed_tile_block(10, &[4, 9]),
+            bit_stuffed_tile_block(10, &[10, 11]),
+            bit_stuffed_tile_block(10, &[12, 13]),
+            vec![3, 24],
+        ];
+        let mut blob = synthetic_v4_tiled_block_blob(DataType::UChar, 1, &valid, &ranges, &blocks);
+        blob.pop();
+
+        assert!(read_lerc2_tiled_payload(&blob).is_err());
     }
 
     #[test]
