@@ -117,6 +117,12 @@ pub struct DecodedLerc2 {
     pub bytes_consumed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedLerc2Bands {
+    pub bands: Vec<DecodedLerc2>,
+    pub bytes_consumed: usize,
+}
+
 pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     let mut reader = Reader::new(blob);
     let header = read_header(&mut reader)?;
@@ -327,6 +333,50 @@ pub fn read_lerc2_tiled_payload_with_previous(
 
 pub fn decode_lerc2_supported(blob: &[u8]) -> Result<DecodedLerc2> {
     decode_lerc2_supported_with_previous(blob, None)
+}
+
+pub fn decode_lerc2_bands_supported(blob: &[u8]) -> Result<DecodedLerc2Bands> {
+    let mut bands = Vec::new();
+    let mut offset = 0usize;
+    let mut previous_mask: Option<BitMask> = None;
+    let mut first_header: Option<HeaderInfo> = None;
+
+    loop {
+        let decoded =
+            decode_lerc2_supported_with_previous(&blob[offset..], previous_mask.as_ref())?;
+        let blob_size = decoded.header.blob_size as usize;
+        if blob_size == 0 || blob_size > blob.len().saturating_sub(offset) {
+            return Err(LercError::BufferTooSmall);
+        }
+
+        if let Some(first) = &first_header {
+            if decoded.header.n_depth != first.n_depth
+                || decoded.header.n_cols != first.n_cols
+                || decoded.header.n_rows != first.n_rows
+                || decoded.header.data_type != first.data_type
+            {
+                return Err(LercError::CorruptInput(
+                    "concatenated Lerc2 header mismatch",
+                ));
+            }
+        } else {
+            first_header = Some(decoded.header.clone());
+        }
+
+        let has_more = decoded.header.version <= 5 || decoded.header.n_blobs_more > 0;
+        offset += blob_size;
+        previous_mask = Some(decoded.mask.clone());
+        bands.push(decoded);
+
+        if !has_more || offset >= blob.len() {
+            break;
+        }
+    }
+
+    Ok(DecodedLerc2Bands {
+        bands,
+        bytes_consumed: offset,
+    })
 }
 
 pub fn decode_lerc2_supported_with_previous(
@@ -1245,10 +1295,10 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, decode_lerc2_supported, get_lerc2_header_info, get_lerc_info,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, FILE_KEY,
+        compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
+        get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
+        read_lerc2_tiled_raw, validate_lerc2_checksum, FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, Rle};
     use std::fs;
@@ -1317,6 +1367,41 @@ mod tests {
         blob.extend_from_slice(&1000.0f64.to_le_bytes());
         blob.extend_from_slice(&(encoded_mask.len() as i32).to_le_bytes());
         blob.extend_from_slice(&encoded_mask);
+        blob.extend_from_slice(range_bytes);
+        blob.push(1);
+        blob.extend_from_slice(payload);
+        set_lerc2_checksum(&mut blob);
+        blob
+    }
+
+    fn synthetic_v4_one_sweep_blob_reusing_previous_mask(
+        data_type: DataType,
+        n_depth: i32,
+        num_valid: i32,
+        range_bytes: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size = header_size + 4 + range_bytes.len() + 1 + payload.len();
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [
+            2,
+            3,
+            n_depth,
+            num_valid,
+            8,
+            blob_size as i32,
+            data_type as i32,
+        ] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&(-10.0f64).to_le_bytes());
+        blob.extend_from_slice(&1000.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
         blob.extend_from_slice(range_bytes);
         blob.push(1);
         blob.extend_from_slice(payload);
@@ -1882,6 +1967,43 @@ mod tests {
         let const_blob = synthetic_v4_const_blob();
         let decoded = decode_lerc2_supported(&const_blob).unwrap();
         assert_eq!(decoded.data, DecodedData::UChar(vec![7, 7, 7, 7]));
+    }
+
+    #[test]
+    fn decodes_supported_concatenated_bands_with_previous_mask() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let mut ranges = Vec::new();
+        for value in [1u8, 20] {
+            ranges.push(value);
+        }
+
+        let first_payload = [1u8, 2, 3, 4];
+        let second_payload = [10u8, 20, 30, 40];
+        let first =
+            synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &first_payload);
+        let second = synthetic_v4_one_sweep_blob_reusing_previous_mask(
+            DataType::UChar,
+            1,
+            4,
+            &ranges,
+            &second_payload,
+        );
+
+        let mut concatenated = first.clone();
+        concatenated.extend_from_slice(&second);
+
+        let decoded = decode_lerc2_bands_supported(&concatenated).unwrap();
+        assert_eq!(decoded.bytes_consumed, concatenated.len());
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![1, 0, 2, 3, 0, 4])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(vec![10, 0, 20, 30, 0, 40])
+        );
     }
 
     #[test]

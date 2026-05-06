@@ -2,9 +2,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    compute_checksum_fletcher32, decode_lerc2_supported, decode_typed_values,
-    get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
+    decode_typed_values, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
+    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
     validate_lerc2_checksum, BitMask, BitStuffer2, DataType, Rle,
 };
 
@@ -42,6 +42,8 @@ fn main() {
     .unwrap();
     let min_max_blob = synthetic_v4_min_max_blob();
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
+    let mut one_sweep_bands_blob = one_sweep_blob.clone();
+    one_sweep_bands_blob.extend_from_slice(&one_sweep_blob);
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
@@ -109,6 +111,9 @@ fn main() {
     });
     bench("lerc2-supported-decode-v4-synthetic", 100_000, || {
         black_box(decode_lerc2_supported(black_box(&one_sweep_blob)).unwrap());
+    });
+    bench("lerc2-supported-bands-decode-v4-synthetic", 100_000, || {
+        black_box(decode_lerc2_bands_supported(black_box(&one_sweep_bands_blob)).unwrap());
     });
 
     std::thread::sleep(Duration::from_millis(1));
