@@ -10,10 +10,10 @@ use lerc::{
     encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data,
     encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
     encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-    encode_lerc2_uncompressed, finalize_lerc2_checksum, get_lerc1_header_info,
-    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-    get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
-    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
+    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
+    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
     write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
     BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
@@ -539,6 +539,20 @@ fn main() {
                 black_box(&encode_one_sweep_data),
                 0.5,
                 Some(black_box(&encode_mask_byte_mask)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-uncompressed-no-data-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_uncompressed_with_no_data(
+                no_data_encode_spec,
+                black_box(&ffi_encode_4d_active_data),
+                0.5,
+                None,
+                Some(black_box(&ffi_encode_4d_active_no_data)),
+                Some(black_box(&ffi_encode_4d_active_no_data_values)),
                 6,
             )
             .unwrap(),

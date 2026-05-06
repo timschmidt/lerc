@@ -812,6 +812,40 @@ pub fn encode_lerc2_uncompressed(
     }
 }
 
+/// Encodes Lerc2 data using the current uncompressed fallback strategy with optional no-data metadata.
+///
+/// When `uses_no_data` is absent or contains only zero values, this delegates to
+/// [`encode_lerc2_uncompressed`] and may still choose the constant path. When
+/// any band is flagged as using no-data, this writes version 6+ no-data
+/// metadata through the one-sweep encoder. Source data is expected to already
+/// contain the per-band no-data sentinel wherever no-data should be represented.
+pub fn encode_lerc2_uncompressed_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    let has_active_no_data = uses_no_data
+        .as_ref()
+        .is_some_and(|uses| uses.iter().any(|&uses| uses != 0));
+    if has_active_no_data {
+        encode_lerc2_one_sweep_bands_with_no_data(
+            spec,
+            data,
+            max_z_error,
+            masks,
+            uses_no_data,
+            no_data_values,
+            version,
+        )
+    } else {
+        encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)
+    }
+}
+
 /// Encodes a single-band Lerc2 blob using one-sweep payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
@@ -3857,14 +3891,14 @@ mod tests {
         encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-        encode_lerc2_uncompressed, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
-        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
-        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
-        write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
+        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges,
+        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -4999,6 +5033,56 @@ mod tests {
         assert_eq!(
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
+        );
+    }
+
+    #[test]
+    fn encodes_uncompressed_lerc2_with_inactive_no_data_via_selector_path() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [7u8; 6];
+        let blob =
+            encode_lerc2_uncompressed_with_no_data(spec, &data, 0.5, None, Some(&[0]), None, 6)
+                .unwrap();
+        let expected = encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+
+        assert_eq!(blob, expected);
+    }
+
+    #[test]
+    fn encodes_uncompressed_lerc2_with_active_no_data_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
+        let blob = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[255.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
         );
     }
 
