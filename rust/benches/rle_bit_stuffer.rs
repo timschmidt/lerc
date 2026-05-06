@@ -10,13 +10,13 @@ use lerc::{
     encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data,
     encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
     encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-    finalize_lerc2_checksum, get_lerc1_header_info, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
-    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-    validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-    write_lerc2_one_sweep, write_lerc2_tiled_raw, BitMask, BitStuffer2, DataType, DecodeIntoSpec,
-    EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
+    encode_lerc2_uncompressed, finalize_lerc2_checksum, get_lerc1_header_info,
+    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+    get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
+    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
+    write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
+    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -124,6 +124,7 @@ fn main() {
     };
     let mut encode_header_bytes = vec![0; encode_header.header_size];
     let encode_mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap();
+    let encode_mask_byte_mask = encode_mask.to_byte_mask();
     let mut encode_mask_bytes =
         vec![0; compute_lerc2_mask_byte_len(&encode_header, Some(&encode_mask), true).unwrap()];
     let encode_ranges = MinMaxRanges {
@@ -514,6 +515,30 @@ fn main() {
                 7.0,
                 0.5,
                 Some(black_box(&encode_mask)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-uncompressed-encode-constant-v6", 100_000, || {
+        black_box(
+            encode_lerc2_uncompressed(
+                constant_encode_spec,
+                black_box(&ffi_constant_encode_data),
+                0.5,
+                Some(black_box(&ffi_constant_encode_mask)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-uncompressed-encode-one-sweep-v6", 100_000, || {
+        black_box(
+            encode_lerc2_uncompressed(
+                constant_encode_spec,
+                black_box(&encode_one_sweep_data),
+                0.5,
+                Some(black_box(&encode_mask_byte_mask)),
                 6,
             )
             .unwrap(),

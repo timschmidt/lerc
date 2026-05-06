@@ -778,6 +778,40 @@ pub fn encode_lerc2_one_sweep(
     encode_lerc2_one_sweep_band(spec, data, max_z_error, mask, version, 0, true, None)
 }
 
+/// Encodes Lerc2 data using the current uncompressed fallback strategy.
+///
+/// This helper chooses the smallest safe uncompressed path currently ported by
+/// the Rust encoder: single-band constant images use [`encode_lerc2_constant`],
+/// single-band non-constant images use [`encode_lerc2_one_sweep`], and
+/// multi-band images use [`encode_lerc2_one_sweep_bands`]. `masks` follows the
+/// public C API convention: no masks means all pixels are valid, one mask is
+/// shared by all bands, and `n_bands` masks provide one mask per band.
+pub fn encode_lerc2_uncompressed(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    validate_encode_bands_inputs(spec, data, masks, "uncompressed Lerc2 encode")?;
+    if spec.n_bands != 1 {
+        return encode_lerc2_one_sweep_bands(spec, data, max_z_error, masks, version);
+    }
+
+    let mask = match masks {
+        Some(mask_bytes) => Some(BitMask::from_byte_mask(
+            &mask_bytes[..spec.mask_byte_len()?],
+            spec.n_cols,
+            spec.n_rows,
+        )?),
+        None => None,
+    };
+    match constant_value_for_uncompressed_encode(spec.data_type, data)? {
+        Some(value) => encode_lerc2_constant(spec, value, max_z_error, mask.as_ref(), version),
+        None => encode_lerc2_one_sweep(spec, data, max_z_error, mask.as_ref(), version),
+    }
+}
+
 /// Encodes a single-band Lerc2 blob using one-sweep payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
@@ -2663,6 +2697,26 @@ fn data_values_are_integer(data_type: DataType, data: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
+fn constant_value_for_uncompressed_encode(data_type: DataType, data: &[u8]) -> Result<Option<f64>> {
+    let value_size = data_type.size_in_bytes();
+    if data.len() < value_size || data.len() % value_size != 0 {
+        return Err(LercError::WrongParam(
+            "encode data byte length does not match type",
+        ));
+    }
+    let first = &data[..value_size];
+    let value = read_value_from_bytes(data_type, first);
+    if value.is_nan() {
+        return Err(LercError::WrongParam("Lerc2 encode input contains NaN"));
+    }
+    for chunk in data[value_size..].chunks_exact(value_size) {
+        if chunk != first {
+            return Ok(None);
+        }
+    }
+    Ok(Some(value))
+}
+
 struct PreparedNoDataBand {
     data: Vec<u8>,
     mask: Option<BitMask>,
@@ -3803,13 +3857,14 @@ mod tests {
         encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-        finalize_lerc2_checksum, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-        get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep,
-        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-        read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        encode_lerc2_uncompressed, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
+        write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -4877,6 +4932,74 @@ mod tests {
         assert_eq!(ranges.mins, [1.0, 2.0]);
         assert_eq!(ranges.maxs, [7.0, 9.0]);
         assert!(!ranges.min_max_equal);
+    }
+
+    #[test]
+    fn encodes_uncompressed_lerc2_constant_via_constant_path() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [7u8; 6];
+        let blob = encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+        let expected = encode_lerc2_constant(spec, 7.0, 0.5, None, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(blob, expected);
+        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+    }
+
+    #[test]
+    fn encodes_uncompressed_lerc2_nonconstant_via_one_sweep_path() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let data = [1u8, 2, 99, 99, 3, 4, 5, 6, 7, 8, 11, 12];
+        let mask = [1u8, 0, 1, 1, 1, 1];
+        let blob = encode_lerc2_uncompressed(spec, &data, 0.5, Some(&mask), 6).unwrap();
+        let expected_mask = BitMask::from_byte_mask(&mask, 3, 2).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.mask, expected_mask);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 11, 12])
+        );
+    }
+
+    #[test]
+    fn encodes_uncompressed_lerc2_multi_band_via_one_sweep_bands_path() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let mask = [1u8, 0, 1, 1, 1, 0];
+        let blob = encode_lerc2_uncompressed(spec, &data, 0.5, Some(&mask), 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![1, 0, 3, 5, 7, 0])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
+        );
     }
 
     #[test]
