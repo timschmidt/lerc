@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use lerc::{
     compute_checksum_fletcher32, decode_lerc1, decode_lerc2_bands_supported,
-    decode_lerc2_supported, decode_lerc2_supported_into, decode_typed_values,
-    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
+    decode_typed_values, get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
     get_lerc2_header_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
     read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
@@ -95,6 +95,16 @@ fn main() {
     let mut ffi_lerc1_mask = vec![0; 257 * 257];
     let mut ffi_lerc1_double_data = vec![0.0f64; 257 * 257];
     let mut ffi_lerc1_double_mask = vec![0; 257 * 257];
+    let lerc1_decode_into_spec = DecodeIntoSpec {
+        data_type: DataType::Float,
+        n_depth: 1,
+        n_cols: 257,
+        n_rows: 257,
+        n_bands: 1,
+        n_masks: 1,
+    };
+    let mut lerc1_decode_into_data = vec![0; 257 * 257 * 4];
+    let mut lerc1_decode_into_mask = vec![0; 257 * 257];
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
@@ -153,6 +163,17 @@ fn main() {
     });
     bench("lerc1-decode-float-values", 1_000, || {
         black_box(decode_lerc1(black_box(&lerc1_blob)).unwrap());
+    });
+    bench("lerc-supported-decode-into-lerc1", 1_000, || {
+        black_box(
+            decode_lerc_supported_into(
+                black_box(&lerc1_blob),
+                lerc1_decode_into_spec,
+                black_box(&mut lerc1_decode_into_data),
+                Some(black_box(&mut lerc1_decode_into_mask)),
+            )
+            .unwrap(),
+        );
     });
     bench("ffi-decode-lerc1", 1_000, || {
         black_box(unsafe {

@@ -11,7 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! Lerc2 metadata readers and supported-subset decoders.
 
 use crate::types::{DataType, LercError, Result};
-use crate::{decode_typed_values, read_lerc1_z_stats, DecodedData};
+use crate::{decode_lerc1, decode_typed_values, read_lerc1_z_stats, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
 
 /// Highest Lerc2 codec version recognized by this crate.
@@ -730,6 +730,61 @@ pub fn decode_lerc2_supported_into(
     Ok(DecodeIntoResult {
         bytes_consumed: decoded.bytes_consumed,
         data_bytes_written: data_offset,
+        mask_bytes_written,
+    })
+}
+
+/// Decodes supported LERC data directly into caller-provided byte buffers.
+///
+/// This is the format-agnostic safe helper used by the C ABI decode wrappers.
+/// It dispatches legacy Lerc1 `CntZImage` blobs to the Lerc1 float decoder and
+/// all other blobs to [`decode_lerc2_supported_into`].
+pub fn decode_lerc_supported_into(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data_output: &mut [u8],
+    mask_output: Option<&mut [u8]>,
+) -> Result<DecodeIntoResult> {
+    validate_decode_into_spec(spec, mask_output.is_some())?;
+    if blob.starts_with(CNT_Z_IMAGE_KEY) {
+        decode_lerc1_supported_into(blob, spec, data_output, mask_output)
+    } else {
+        decode_lerc2_supported_into(blob, spec, data_output, mask_output)
+    }
+}
+
+fn decode_lerc1_supported_into(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data_output: &mut [u8],
+    mask_output: Option<&mut [u8]>,
+) -> Result<DecodeIntoResult> {
+    let decoded = decode_lerc1(blob)?;
+    if spec.data_type != DataType::Float
+        || spec.n_depth != 1
+        || spec.n_bands != 1
+        || spec.n_cols != decoded.header.n_cols as usize
+        || spec.n_rows != decoded.header.n_rows as usize
+        || !(spec.n_masks == 0 || spec.n_masks == 1)
+    {
+        return Err(LercError::WrongParam("Lerc1 decode shape/type mismatch"));
+    }
+
+    let data_bytes_written = DecodedData::Float(decoded.values).write_le_bytes(data_output)?;
+    let mask_bytes_written = if let Some(mask_output) = mask_output {
+        let byte_mask = decoded.mask_info.mask.to_byte_mask();
+        if mask_output.len() < byte_mask.len() {
+            return Err(LercError::BufferTooSmall);
+        }
+        mask_output[..byte_mask.len()].copy_from_slice(&byte_mask);
+        byte_mask.len()
+    } else {
+        0
+    };
+
+    Ok(DecodeIntoResult {
+        bytes_consumed: decoded.bytes_consumed,
+        data_bytes_written,
         mask_bytes_written,
     })
 }
@@ -1969,11 +2024,11 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        decode_lerc2_supported_into, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-        get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
-        read_lerc2_tiled_raw, validate_lerc2_checksum, DecodeIntoSpec, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        decode_lerc2_supported_into, decode_lerc_supported_into, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
+        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, DecodeIntoSpec,
+        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -3068,6 +3123,72 @@ mod tests {
         assert_eq!(result.mask_bytes_written, 6);
         assert_eq!(data, [1, 0, 2, 3, 0, 4, 10, 0, 20, 30, 0, 40]);
         assert_eq!(mask, [1, 0, 1, 1, 0, 1]);
+    }
+
+    #[test]
+    fn decodes_supported_lerc_dispatches_lerc2_into_c_api_style_buffers() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 20];
+        let payload = [1u8, 2, 3, 4];
+        let blob = synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &payload);
+        let spec = DecodeIntoSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = [0u8; 6];
+        let mut mask = [0u8; 6];
+
+        let result = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(result.bytes_consumed, blob.len());
+        assert_eq!(result.data_bytes_written, 6);
+        assert_eq!(result.mask_bytes_written, 6);
+        assert_eq!(data, [1, 0, 2, 3, 0, 4]);
+        assert_eq!(mask, valid);
+    }
+
+    #[test]
+    fn decodes_supported_lerc_dispatches_lerc1_into_c_api_style_buffers() {
+        let blob = fixture("world.lerc1");
+        let spec = DecodeIntoSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 257,
+            n_rows: 257,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = vec![0u8; 257 * 257 * 4];
+        let mut mask = vec![0u8; 257 * 257];
+
+        let result = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(result.bytes_consumed, blob.len());
+        assert_eq!(result.data_bytes_written, data.len());
+        assert_eq!(result.mask_bytes_written, mask.len());
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+
+        let values = match crate::decode_typed_values(DataType::Float, &data).unwrap() {
+            DecodedData::Float(values) => values,
+            _ => unreachable!("requested float output"),
+        };
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[257 * 257 - 1], 0.0);
+
+        let mut z_min = f32::INFINITY;
+        let mut z_max = f32::NEG_INFINITY;
+        for (&value, &valid) in values.iter().zip(mask.iter()) {
+            if valid != 0 {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            }
+        }
+        assert_eq!(z_min, -27.458_635);
+        assert_eq!(z_max, 5474.173);
     }
 
     #[test]
