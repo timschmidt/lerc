@@ -2440,6 +2440,37 @@ mod tests {
     }
 
     #[test]
+    fn fills_float_fixture_blob_info_arrays() {
+        let blob = fixture("california_400_400_1_float.lerc2");
+        let mut info_array = [123u32; BLOB_INFO_ARRAY_LEN];
+        let mut range_array = [123.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+        let info = get_lerc2_blob_info_arrays(&blob, Some(&mut info_array), Some(&mut range_array))
+            .unwrap();
+
+        assert_eq!(info.n_bands, 1);
+        assert_eq!(
+            info_array,
+            [
+                3,
+                DataType::Float as u32,
+                1,
+                400,
+                400,
+                1,
+                58_515,
+                blob.len() as u32,
+                1,
+                1,
+                0,
+            ]
+        );
+        assert_eq!(
+            range_array,
+            [-82.972_091_674_804_69, 4080.613_769_531_25, 0.000_075]
+        );
+    }
+
+    #[test]
     fn fills_partial_blob_info_arrays_and_no_data_range_sentinels() {
         let blob = synthetic_v6_uchar_one_sweep_no_data_blob();
         let mut info_array = [123u32; 4];
