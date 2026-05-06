@@ -67,6 +67,14 @@ fn main() {
     let mut ffi_decode_double_data = vec![0.0f64; 24];
     let mut ffi_decode_double_mask = vec![0; 6];
     let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+    let mut ffi_decode_4d_data = vec![0u8; 12];
+    let mut ffi_decode_4d_mask = vec![0; 6];
+    let mut ffi_decode_4d_uses_no_data = vec![0; 1];
+    let mut ffi_decode_4d_no_data_values = vec![0.0f64; 1];
+    let mut ffi_decode_double_4d_data = vec![0.0f64; 12];
+    let mut ffi_decode_double_4d_mask = vec![0; 6];
+    let mut ffi_decode_double_4d_uses_no_data = vec![0; 1];
+    let mut ffi_decode_double_4d_no_data_values = vec![0.0f64; 1];
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
@@ -226,6 +234,45 @@ fn main() {
             )
         });
     });
+    bench("ffi-decode-4d-v6-no-data-synthetic", 100_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decode_4D(
+                black_box(one_sweep_no_data_blob.as_ptr()),
+                one_sweep_no_data_blob.len() as u32,
+                1,
+                black_box(ffi_decode_4d_mask.as_mut_ptr()),
+                2,
+                3,
+                2,
+                1,
+                DataType::UChar as u32,
+                black_box(ffi_decode_4d_data.as_mut_ptr().cast()),
+                black_box(ffi_decode_4d_uses_no_data.as_mut_ptr()),
+                black_box(ffi_decode_4d_no_data_values.as_mut_ptr()),
+            )
+        });
+    });
+    bench(
+        "ffi-decode-to-double-4d-v6-no-data-synthetic",
+        100_000,
+        || {
+            black_box(unsafe {
+                lerc::ffi::lerc_decodeToDouble_4D(
+                    black_box(one_sweep_no_data_blob.as_ptr()),
+                    one_sweep_no_data_blob.len() as u32,
+                    1,
+                    black_box(ffi_decode_double_4d_mask.as_mut_ptr()),
+                    2,
+                    3,
+                    2,
+                    1,
+                    black_box(ffi_decode_double_4d_data.as_mut_ptr()),
+                    black_box(ffi_decode_double_4d_uses_no_data.as_mut_ptr()),
+                    black_box(ffi_decode_double_4d_no_data_values.as_mut_ptr()),
+                )
+            });
+        },
+    );
 
     std::thread::sleep(Duration::from_millis(1));
 }
