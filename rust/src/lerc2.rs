@@ -72,6 +72,12 @@ pub struct DataOneSweep {
     pub bytes_consumed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TiledData {
+    pub data: Vec<u8>,
+    pub bytes_consumed: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LercInfo {
     pub version: i32,
@@ -242,6 +248,44 @@ pub fn read_lerc2_data_one_sweep_with_previous(
     }
 
     let data = read_data_one_sweep(&mut reader, &header, &mask.mask)?;
+    Ok((header, mask, data))
+}
+
+pub fn read_lerc2_tiled_raw(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
+    read_lerc2_tiled_raw_with_previous(blob, None)
+}
+
+pub fn read_lerc2_tiled_raw_with_previous(
+    blob: &[u8],
+    previous_mask: Option<&BitMask>,
+) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
+    let mut reader = Reader::new(blob);
+    let header = read_header(&mut reader)?;
+    let mask = read_mask(&mut reader, &header, previous_mask)?;
+
+    if header.num_valid_pixel == 0 || header.z_min == header.z_max {
+        return Err(LercError::Unsupported(
+            "Lerc2 const or empty blobs do not carry tiled payloads",
+        ));
+    }
+
+    if header.version >= 4 {
+        let ranges = read_min_max_ranges(&mut reader, &header)?;
+        if ranges.min_max_equal {
+            return Err(LercError::Unsupported(
+                "Lerc2 all-constant min/max ranges do not carry tiled payloads",
+            ));
+        }
+    }
+
+    let one_sweep_flag = reader.read_bytes(1)?[0];
+    if one_sweep_flag != 0 {
+        return Err(LercError::Unsupported(
+            "Lerc2 blob is not encoded with tiled payloads",
+        ));
+    }
+
+    let data = read_tiled_raw(&mut reader, &header, &mask.mask)?;
     Ok((header, mask, data))
 }
 
@@ -461,6 +505,112 @@ fn read_data_one_sweep(
     })
 }
 
+fn read_tiled_raw(
+    reader: &mut Reader<'_>,
+    header: &HeaderInfo,
+    mask: &BitMask,
+) -> Result<TiledData> {
+    if header.micro_block_size > 32 {
+        return Err(LercError::CorruptInput(
+            "Lerc2 micro block size is too large",
+        ));
+    }
+    if mask.count_valid_bits() != header.num_valid_pixel as usize {
+        return Err(LercError::CorruptInput(
+            "Lerc2 tiled mask valid count does not match header",
+        ));
+    }
+
+    let n_depth = header.n_depth as usize;
+    let value_size = header.data_type.size_in_bytes();
+    let pixel_count = (header.n_cols as usize)
+        .checked_mul(header.n_rows as usize)
+        .ok_or(LercError::CorruptInput("Lerc2 tiled pixel count overflow"))?;
+    let output_len = pixel_count
+        .checked_mul(n_depth)
+        .and_then(|count| count.checked_mul(value_size))
+        .ok_or(LercError::CorruptInput("Lerc2 tiled output size overflow"))?;
+    let mut data = vec![0; output_len];
+
+    let mb_size = header.micro_block_size as usize;
+    let n_rows = header.n_rows as usize;
+    let n_cols = header.n_cols as usize;
+    let tiles_vert = n_rows.div_ceil(mb_size);
+    let tiles_hori = n_cols.div_ceil(mb_size);
+
+    for i_tile in 0..tiles_vert {
+        let i0 = i_tile * mb_size;
+        let i1 = (i0 + mb_size).min(n_rows);
+
+        for j_tile in 0..tiles_hori {
+            let j0 = j_tile * mb_size;
+            let j1 = (j0 + mb_size).min(n_cols);
+
+            for i_depth in 0..n_depth {
+                read_raw_tile(reader, header, mask, &mut data, i0, i1, j0, j1, i_depth)?;
+            }
+        }
+    }
+
+    Ok(TiledData {
+        data,
+        bytes_consumed: reader.pos,
+    })
+}
+
+fn read_raw_tile(
+    reader: &mut Reader<'_>,
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &mut [u8],
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    i_depth: usize,
+) -> Result<()> {
+    let raw_flag = reader.read_bytes(1)?[0];
+    let diff_encoded = header.version >= 5 && (raw_flag & 4) != 0;
+    if diff_encoded {
+        return Err(LercError::Unsupported(
+            "Lerc2 diff-encoded raw tiles are not ported yet",
+        ));
+    }
+
+    let pattern = if header.version >= 5 { 14 } else { 15 };
+    if ((raw_flag >> 2) & pattern) != (((j0 >> 3) as u8) & pattern) {
+        return Err(LercError::CorruptInput(
+            "Lerc2 tile integrity bits mismatch",
+        ));
+    }
+
+    let value_size = header.data_type.size_in_bytes();
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+    let tile_mode = raw_flag & 3;
+
+    match tile_mode {
+        0 => {
+            for row in i0..i1 {
+                for col in j0..j1 {
+                    let pixel_idx = row * n_cols + col;
+                    if mask.is_valid(pixel_idx)? {
+                        let src = reader.read_bytes(value_size)?;
+                        let dst_offset = (pixel_idx * n_depth + i_depth) * value_size;
+                        data[dst_offset..dst_offset + value_size].copy_from_slice(src);
+                    }
+                }
+            }
+            Ok(())
+        }
+        2 => Ok(()),
+        1 | 3 => Err(LercError::Unsupported(
+            "Lerc2 bit-stuffed tiled payloads are not ported yet",
+        )),
+        _ => unreachable!(),
+    }
+}
+
 fn read_header(reader: &mut Reader<'_>) -> Result<HeaderInfo> {
     let start = reader.pos;
     if reader.read_bytes(FILE_KEY.len())? != FILE_KEY {
@@ -666,7 +816,7 @@ mod tests {
     use super::{
         compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info,
         read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, validate_lerc2_checksum, FILE_KEY,
+        read_lerc2_min_max_ranges, read_lerc2_tiled_raw, validate_lerc2_checksum, FILE_KEY,
     };
     use crate::{DataType, Rle};
     use std::fs;
@@ -738,6 +888,48 @@ mod tests {
         blob.extend_from_slice(range_bytes);
         blob.push(1);
         blob.extend_from_slice(payload);
+        blob
+    }
+
+    fn synthetic_v4_tiled_raw_blob(
+        data_type: DataType,
+        n_depth: i32,
+        valid: &[u8],
+        range_bytes: &[u8],
+        tile_payloads: &[&[u8]],
+    ) -> Vec<u8> {
+        let mask = crate::BitMask::from_byte_mask(valid, 5, 3).unwrap();
+        let encoded_mask = Rle::compress(mask.bits()).unwrap();
+        let tile_bytes_len: usize = tile_payloads.iter().map(|payload| 1 + payload.len()).sum();
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size =
+            header_size + 4 + encoded_mask.len() + range_bytes.len() + 1 + tile_bytes_len;
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [
+            3,
+            5,
+            n_depth,
+            valid.iter().filter(|&&value| value != 0).count() as i32,
+            2,
+            blob_size as i32,
+            data_type as i32,
+        ] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&(-10.0f64).to_le_bytes());
+        blob.extend_from_slice(&1000.0f64.to_le_bytes());
+        blob.extend_from_slice(&(encoded_mask.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&encoded_mask);
+        blob.extend_from_slice(range_bytes);
+        blob.push(0);
+        for payload in tile_payloads {
+            blob.push(0);
+            blob.extend_from_slice(payload);
+        }
         blob
     }
 
@@ -937,6 +1129,44 @@ mod tests {
         blob[flag_offset] = 1;
         blob.pop();
         assert!(read_lerc2_data_one_sweep(&blob).is_err());
+    }
+
+    #[test]
+    fn reads_v4_raw_tiled_payload_with_mask() {
+        let valid = [1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1];
+        let ranges = [10u8, 20];
+        let tile_payloads: [&[u8]; 6] =
+            [&[10, 11], &[12, 13, 14], &[15, 16], &[17, 18], &[19], &[20]];
+        let blob = synthetic_v4_tiled_raw_blob(DataType::UChar, 1, &valid, &ranges, &tile_payloads);
+        let (_, _, tiled) = read_lerc2_tiled_raw(&blob).unwrap();
+
+        assert_eq!(
+            tiled.data,
+            [10, 0, 12, 13, 15, 0, 11, 14, 0, 16, 17, 18, 0, 19, 20]
+        );
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn rejects_raw_tile_integrity_mismatch_and_truncation() {
+        let valid = [1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1];
+        let ranges = [10u8, 20];
+        let tile_payloads: [&[u8]; 6] =
+            [&[10, 11], &[12, 13, 14], &[15, 16], &[17, 18], &[19], &[20]];
+        let mut blob =
+            synthetic_v4_tiled_raw_blob(DataType::UChar, 1, &valid, &ranges, &tile_payloads);
+        let tile_start = blob.len()
+            - tile_payloads
+                .iter()
+                .map(|payload| 1 + payload.len())
+                .sum::<usize>();
+
+        blob[tile_start] = 4;
+        assert!(read_lerc2_tiled_raw(&blob).is_err());
+
+        blob[tile_start] = 0;
+        blob.pop();
+        assert!(read_lerc2_tiled_raw(&blob).is_err());
     }
 
     #[test]
