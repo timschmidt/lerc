@@ -26,6 +26,57 @@ pub const BLOB_INFO_ARRAY_LEN: usize = 11;
 /// Number of doubles currently produced by the C API data-range summary array.
 pub const BLOB_DATA_RANGE_ARRAY_LEN: usize = 3;
 const CHECKSUM_START_OFFSET: usize = FILE_KEY.len() + 4 + 4;
+#[allow(dead_code)]
+const FP_MAX_DELTA: u8 = 5;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FpPredictor {
+    None,
+    Delta1,
+    RowsCols,
+}
+
+#[allow(dead_code)]
+impl FpPredictor {
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Delta1),
+            2 => Some(Self::RowsCols),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Delta1 => 1,
+            Self::RowsCols => 2,
+        }
+    }
+
+    fn int_delta(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Delta1 => 1,
+            Self::RowsCols => 2,
+        }
+    }
+
+    fn max_byte_delta(self) -> u8 {
+        FP_MAX_DELTA - self.int_delta()
+    }
+
+    fn from_delta_and_cross(delta: i32, cross: bool) -> Option<Self> {
+        match (delta, cross) {
+            (0, _) => Some(Self::None),
+            (1, false) => Some(Self::Delta1),
+            (2, true) => Some(Self::RowsCols),
+            _ => None,
+        }
+    }
+}
 
 /// Parsed Lerc2 header fields.
 #[derive(Debug, Clone, PartialEq)]
@@ -4390,6 +4441,24 @@ fn write_huffman_symbol(
     bits.push_bits(code, len)
 }
 
+#[allow(dead_code)]
+fn restore_fp_byte_delta_sequence(data: &[u8], level: u8) -> Result<Vec<u8>> {
+    if level > FP_MAX_DELTA {
+        return Err(LercError::CorruptInput(
+            "floating-point Huffman byte delta level is invalid",
+        ));
+    }
+
+    let mut restored = data.to_vec();
+    for delta in (1..=level as usize).rev() {
+        for idx in delta..restored.len() {
+            let previous = restored[idx - 1];
+            restored[idx] = restored[idx].wrapping_add(previous);
+        }
+    }
+    Ok(restored)
+}
+
 fn read_huffman_int_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
@@ -5116,9 +5185,10 @@ mod tests {
         get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        restore_fp_byte_delta_sequence, validate_lerc2_checksum, write_lerc2_header,
+        write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
+        DecodeIntoSpec, FpPredictor, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -6072,6 +6142,68 @@ mod tests {
         assert_eq!(finalize_lerc2_checksum(&mut blob).unwrap(), 0);
         assert_eq!(blob, before);
         assert_eq!(validate_lerc2_checksum(&blob).unwrap().version, 2);
+    }
+
+    #[test]
+    fn maps_floating_point_predictor_codes_like_cpp() {
+        assert_eq!(FpPredictor::from_code(0), Some(FpPredictor::None));
+        assert_eq!(FpPredictor::from_code(1), Some(FpPredictor::Delta1));
+        assert_eq!(FpPredictor::from_code(2), Some(FpPredictor::RowsCols));
+        assert_eq!(FpPredictor::from_code(3), None);
+
+        assert_eq!(FpPredictor::None.code(), 0);
+        assert_eq!(FpPredictor::Delta1.code(), 1);
+        assert_eq!(FpPredictor::RowsCols.code(), 2);
+        assert_eq!(FpPredictor::None.int_delta(), 0);
+        assert_eq!(FpPredictor::Delta1.int_delta(), 1);
+        assert_eq!(FpPredictor::RowsCols.int_delta(), 2);
+        assert_eq!(FpPredictor::None.max_byte_delta(), 5);
+        assert_eq!(FpPredictor::Delta1.max_byte_delta(), 4);
+        assert_eq!(FpPredictor::RowsCols.max_byte_delta(), 3);
+
+        assert_eq!(
+            FpPredictor::from_delta_and_cross(0, false),
+            Some(FpPredictor::None)
+        );
+        assert_eq!(
+            FpPredictor::from_delta_and_cross(0, true),
+            Some(FpPredictor::None)
+        );
+        assert_eq!(
+            FpPredictor::from_delta_and_cross(1, false),
+            Some(FpPredictor::Delta1)
+        );
+        assert_eq!(
+            FpPredictor::from_delta_and_cross(2, true),
+            Some(FpPredictor::RowsCols)
+        );
+        assert_eq!(FpPredictor::from_delta_and_cross(1, true), None);
+        assert_eq!(FpPredictor::from_delta_and_cross(2, false), None);
+        assert_eq!(FpPredictor::from_delta_and_cross(-1, false), None);
+    }
+
+    #[test]
+    fn restores_floating_point_huffman_byte_delta_sequences() {
+        assert_eq!(
+            restore_fp_byte_delta_sequence(&[5, 2, 250, 4], 0).unwrap(),
+            [5, 2, 250, 4]
+        );
+        assert_eq!(
+            restore_fp_byte_delta_sequence(&[5, 2, 250, 4], 1).unwrap(),
+            [5, 7, 1, 5]
+        );
+        assert_eq!(
+            restore_fp_byte_delta_sequence(&[5, 2, 250, 4], 2).unwrap(),
+            [5, 7, 3, 3]
+        );
+        assert_eq!(
+            restore_fp_byte_delta_sequence(&[1, 2, 3, 4, 5], 5).unwrap(),
+            [1, 3, 8, 20, 48]
+        );
+        assert_eq!(
+            restore_fp_byte_delta_sequence(&[1, 2, 3], 6).unwrap_err(),
+            LercError::CorruptInput("floating-point Huffman byte delta level is invalid")
+        );
     }
 
     #[test]
