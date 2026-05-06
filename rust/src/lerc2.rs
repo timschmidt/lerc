@@ -191,6 +191,23 @@ pub struct DataRanges {
     pub bytes_consumed: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeIntoSpec {
+    pub data_type: DataType,
+    pub n_depth: usize,
+    pub n_cols: usize,
+    pub n_rows: usize,
+    pub n_bands: usize,
+    pub n_masks: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeIntoResult {
+    pub bytes_consumed: usize,
+    pub data_bytes_written: usize,
+    pub mask_bytes_written: usize,
+}
+
 pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     let mut reader = Reader::new(blob);
     let header = read_header(&mut reader)?;
@@ -496,6 +513,85 @@ pub fn decode_lerc2_bands_supported(blob: &[u8]) -> Result<DecodedLerc2Bands> {
     })
 }
 
+pub fn decode_lerc2_supported_into(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data_output: &mut [u8],
+    mask_output: Option<&mut [u8]>,
+) -> Result<DecodeIntoResult> {
+    validate_decode_into_spec(spec, mask_output.is_some())?;
+    let decoded = decode_lerc2_bands_supported(blob)?;
+    if spec.n_bands > decoded.bands.len() {
+        return Err(LercError::WrongParam(
+            "requested more bands than the Lerc2 blob contains",
+        ));
+    }
+
+    let selected_bands = &decoded.bands[..spec.n_bands];
+    for band in selected_bands {
+        if band.header.data_type != spec.data_type
+            || band.header.n_depth as usize != spec.n_depth
+            || band.header.n_cols as usize != spec.n_cols
+            || band.header.n_rows as usize != spec.n_rows
+        {
+            return Err(LercError::WrongParam(
+                "decode output shape does not match the Lerc2 blob",
+            ));
+        }
+    }
+
+    let required_masks = required_mask_count(selected_bands);
+    if spec.n_masks < required_masks {
+        return Err(LercError::WrongParam(
+            "caller did not provide enough mask buffers for the Lerc2 blob",
+        ));
+    }
+
+    let data_bytes_needed = spec
+        .n_bands
+        .checked_mul(spec.n_rows)
+        .and_then(|count| count.checked_mul(spec.n_cols))
+        .and_then(|count| count.checked_mul(spec.n_depth))
+        .and_then(|count| count.checked_mul(spec.data_type.size_in_bytes()))
+        .ok_or(LercError::WrongParam("decode output byte count overflow"))?;
+    if data_output.len() < data_bytes_needed {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut data_offset = 0usize;
+    for band in selected_bands {
+        data_offset += band.write_data_le_bytes(&mut data_output[data_offset..])?;
+    }
+
+    let mask_bytes_written = match (spec.n_masks, mask_output) {
+        (0, _) => 0,
+        (1, Some(output)) => selected_bands[0].write_mask_bytes(output)?,
+        (_, Some(output)) => {
+            let mask_bytes_needed = spec
+                .n_masks
+                .checked_mul(spec.n_rows)
+                .and_then(|count| count.checked_mul(spec.n_cols))
+                .ok_or(LercError::WrongParam("decode mask byte count overflow"))?;
+            if output.len() < mask_bytes_needed {
+                return Err(LercError::BufferTooSmall);
+            }
+
+            let mut mask_offset = 0usize;
+            for band in selected_bands {
+                mask_offset += band.write_mask_bytes(&mut output[mask_offset..])?;
+            }
+            mask_offset
+        }
+        (_, None) => unreachable!("mask output presence is validated before decode"),
+    };
+
+    Ok(DecodeIntoResult {
+        bytes_consumed: decoded.bytes_consumed,
+        data_bytes_written: data_offset,
+        mask_bytes_written,
+    })
+}
+
 pub fn decode_lerc2_supported_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -726,6 +822,40 @@ fn read_mask(
         num_bytes_mask,
         bytes_consumed: reader.pos,
     })
+}
+
+fn validate_decode_into_spec(spec: DecodeIntoSpec, has_mask_output: bool) -> Result<()> {
+    if spec.n_depth == 0 || spec.n_cols == 0 || spec.n_rows == 0 || spec.n_bands == 0 {
+        return Err(LercError::WrongParam(
+            "decode output dimensions must be positive",
+        ));
+    }
+    if !(spec.n_masks == 0 || spec.n_masks == 1 || spec.n_masks == spec.n_bands) {
+        return Err(LercError::WrongParam(
+            "decode mask count must be 0, 1, or n_bands",
+        ));
+    }
+    if spec.n_masks > 0 && !has_mask_output {
+        return Err(LercError::WrongParam(
+            "decode mask output buffer is required when n_masks is nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn required_mask_count(bands: &[DecodedLerc2]) -> usize {
+    if bands.iter().all(|band| {
+        band.mask.count_valid_bits()
+            == (band.header.n_cols as usize) * (band.header.n_rows as usize)
+    }) {
+        return 0;
+    }
+
+    if bands.windows(2).all(|pair| pair[0].mask == pair[1].mask) {
+        1
+    } else {
+        bands.len()
+    }
 }
 
 fn read_min_max_ranges(reader: &mut Reader<'_>, header: &HeaderInfo) -> Result<MinMaxRanges> {
@@ -1618,9 +1748,10 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
-        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, FILE_KEY,
+        decode_lerc2_supported_into, get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        validate_lerc2_checksum, DecodeIntoSpec, FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -2460,6 +2591,99 @@ mod tests {
         assert_eq!(masks, [1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1]);
         assert!(decoded.write_data_le_bytes(&mut [0; 11]).is_err());
         assert!(decoded.write_mask_bytes(&mut [0; 11]).is_err());
+    }
+
+    #[test]
+    fn decodes_supported_lerc2_into_c_api_style_buffers() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 20];
+        let first_payload = [1u8, 2, 3, 4];
+        let second_payload = [10u8, 20, 30, 40];
+        let first =
+            synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &first_payload);
+        let second = synthetic_v4_one_sweep_blob_reusing_previous_mask(
+            DataType::UChar,
+            1,
+            4,
+            &ranges,
+            &second_payload,
+        );
+        let mut concatenated = first;
+        concatenated.extend_from_slice(&second);
+
+        let spec = DecodeIntoSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let mut data = [0u8; 12];
+        let mut mask = [0u8; 6];
+        let result =
+            decode_lerc2_supported_into(&concatenated, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(result.bytes_consumed, concatenated.len());
+        assert_eq!(result.data_bytes_written, 12);
+        assert_eq!(result.mask_bytes_written, 6);
+        assert_eq!(data, [1, 0, 2, 3, 0, 4, 10, 0, 20, 30, 0, 40]);
+        assert_eq!(mask, [1, 0, 1, 1, 0, 1]);
+    }
+
+    #[test]
+    fn decode_into_validates_shape_type_masks_and_buffer_sizes() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 20];
+        let payload = [1u8, 2, 3, 4];
+        let blob = synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &payload);
+        let spec = DecodeIntoSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let mut data = [0u8; 6];
+        let err = decode_lerc2_supported_into(&blob, spec, &mut data, None).unwrap_err();
+        assert_eq!(
+            err,
+            LercError::WrongParam("caller did not provide enough mask buffers for the Lerc2 blob")
+        );
+
+        let mut mask = [0u8; 6];
+        let mut spec_with_mask = spec;
+        spec_with_mask.n_masks = 1;
+        let mut bad_type = spec;
+        bad_type.data_type = DataType::UInt;
+        let err =
+            decode_lerc2_supported_into(&blob, bad_type, &mut data, Some(&mut mask)).unwrap_err();
+        assert_eq!(
+            err,
+            LercError::WrongParam("decode output shape does not match the Lerc2 blob")
+        );
+
+        let mut bad_shape = spec;
+        bad_shape.n_cols = 2;
+        let err =
+            decode_lerc2_supported_into(&blob, bad_shape, &mut data, Some(&mut mask)).unwrap_err();
+        assert_eq!(
+            err,
+            LercError::WrongParam("decode output shape does not match the Lerc2 blob")
+        );
+
+        let mut short_data = [0u8; 5];
+        let err =
+            decode_lerc2_supported_into(&blob, spec_with_mask, &mut short_data, Some(&mut mask))
+                .unwrap_err();
+        assert_eq!(err, LercError::BufferTooSmall);
+
+        let mut short_mask = [0u8; 5];
+        let err =
+            decode_lerc2_supported_into(&blob, spec_with_mask, &mut data, Some(&mut short_mask))
+                .unwrap_err();
+        assert_eq!(err, LercError::BufferTooSmall);
     }
 
     #[test]

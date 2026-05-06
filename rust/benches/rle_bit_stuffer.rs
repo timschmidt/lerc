@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 
 use lerc::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-    decode_typed_values, get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info,
-    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    decode_lerc2_supported_into, decode_typed_values, get_lerc2_data_ranges, get_lerc2_header_info,
+    get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
-    DataType, Rle,
+    DataType, DecodeIntoSpec, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -48,6 +48,16 @@ fn main() {
     let one_sweep_bands_decoded = decode_lerc2_bands_supported(&one_sweep_bands_blob).unwrap();
     let mut decoded_data_bytes = vec![0; one_sweep_bands_decoded.data_byte_len()];
     let mut decoded_mask_bytes = vec![0; one_sweep_bands_decoded.mask_byte_len()];
+    let decode_into_spec = DecodeIntoSpec {
+        data_type: DataType::UChar,
+        n_depth: 2,
+        n_cols: 3,
+        n_rows: 2,
+        n_bands: 2,
+        n_masks: 1,
+    };
+    let mut decode_into_data = vec![0; one_sweep_bands_decoded.data_byte_len()];
+    let mut decode_into_mask = vec![0; 6];
     let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
@@ -142,6 +152,17 @@ fn main() {
             one_sweep_bands_decoded
                 .write_mask_bytes(black_box(&mut decoded_mask_bytes))
                 .unwrap(),
+        );
+    });
+    bench("lerc2-supported-decode-into-v4-synthetic", 100_000, || {
+        black_box(
+            decode_lerc2_supported_into(
+                black_box(&one_sweep_bands_blob),
+                decode_into_spec,
+                black_box(&mut decode_into_data),
+                Some(black_box(&mut decode_into_mask)),
+            )
+            .unwrap(),
         );
     });
 
