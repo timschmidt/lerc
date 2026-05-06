@@ -445,6 +445,57 @@ pub fn write_lerc2_header(header: &HeaderInfo, output: &mut [u8]) -> Result<usiz
     Ok(writer.pos)
 }
 
+/// Computes the serialized byte count for a Lerc2 mask section.
+///
+/// The returned size always includes the 4-byte encoded-mask length field. When
+/// the image is partially valid and `encode_mask` is true, `mask` must contain
+/// the packed valid-pixel mask to be RLE-compressed.
+pub fn compute_lerc2_mask_byte_len(
+    header: &HeaderInfo,
+    mask: Option<&BitMask>,
+    encode_mask: bool,
+) -> Result<usize> {
+    let need_mask = validate_lerc2_mask_for_write(header, mask, encode_mask)?;
+    let encoded_len = if need_mask && encode_mask {
+        Rle::compress(mask.expect("validated mask").bits())?.len()
+    } else {
+        0
+    };
+    4usize
+        .checked_add(encoded_len)
+        .ok_or(LercError::WrongParam("Lerc2 mask byte count overflow"))
+}
+
+/// Writes a Lerc2 mask section in little-endian byte order.
+///
+/// The section is a 4-byte encoded-mask length followed by RLE-compressed
+/// packed mask bytes when a partial mask is present and `encode_mask` is true.
+/// Passing `encode_mask = false` writes a zero-length section, matching the
+/// previous-mask reuse layout used by concatenated Lerc2 bands.
+pub fn write_lerc2_mask(
+    header: &HeaderInfo,
+    mask: Option<&BitMask>,
+    encode_mask: bool,
+    output: &mut [u8],
+) -> Result<usize> {
+    let need_mask = validate_lerc2_mask_for_write(header, mask, encode_mask)?;
+    let encoded_mask = if need_mask && encode_mask {
+        Rle::compress(mask.expect("validated mask").bits())?
+    } else {
+        Vec::new()
+    };
+
+    let mask_len = compute_lerc2_mask_byte_len(header, mask, encode_mask)?;
+    if output.len() < mask_len {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut writer = Writer::new(output);
+    writer.write_i32_le(encoded_mask.len() as i32)?;
+    writer.write_bytes(&encoded_mask)?;
+    Ok(writer.pos)
+}
+
 /// Reads and decodes the Lerc2 mask section.
 pub fn read_lerc2_mask(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo)> {
     read_lerc2_mask_with_previous(blob, None)
@@ -1271,6 +1322,45 @@ fn read_mask(
         num_bytes_mask,
         bytes_consumed: reader.pos,
     })
+}
+
+fn validate_lerc2_mask_for_write(
+    header: &HeaderInfo,
+    mask: Option<&BitMask>,
+    encode_mask: bool,
+) -> Result<bool> {
+    let total = header
+        .n_cols
+        .checked_mul(header.n_rows)
+        .ok_or(LercError::WrongParam("Lerc2 mask pixel count overflow"))?;
+    if header.num_valid_pixel < 0 || header.num_valid_pixel > total {
+        return Err(LercError::WrongParam("invalid Lerc2 valid pixel count"));
+    }
+
+    let need_mask = header.num_valid_pixel > 0 && header.num_valid_pixel < total;
+    if !need_mask {
+        return Ok(false);
+    }
+
+    if !encode_mask {
+        return Ok(true);
+    }
+
+    let mask = mask.ok_or(LercError::WrongParam(
+        "partial Lerc2 mask is required when encode_mask is true",
+    ))?;
+    if mask.cols() != header.n_cols as usize || mask.rows() != header.n_rows as usize {
+        return Err(LercError::WrongParam(
+            "Lerc2 mask dimensions do not match header",
+        ));
+    }
+    if mask.count_valid_bits() != header.num_valid_pixel as usize {
+        return Err(LercError::WrongParam(
+            "Lerc2 mask valid count does not match header",
+        ));
+    }
+
+    Ok(true)
 }
 
 fn validate_decode_into_spec(spec: DecodeIntoSpec, has_mask_output: bool) -> Result<()> {
@@ -2228,16 +2318,16 @@ impl<'a> Writer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, compute_lerc2_header_byte_len, decode_lerc2_bands_supported,
-        decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-        decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-        get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep,
-        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
-        write_lerc2_header, DecodeIntoSpec, HeaderInfo, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
+        decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+        decode_lerc_supported_into, decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, DecodeIntoSpec, HeaderInfo,
+        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
-    use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
+    use crate::{BitMask, BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2273,6 +2363,22 @@ mod tests {
             no_data_val_orig: if version >= 6 { -32768.0 } else { 0.0 },
             header_size,
         }
+    }
+
+    fn blob_with_written_header_and_mask(
+        header: &HeaderInfo,
+        mask: Option<&BitMask>,
+        encode_mask: bool,
+    ) -> Vec<u8> {
+        let header_len = compute_lerc2_header_byte_len(header.version).unwrap();
+        let mask_len = compute_lerc2_mask_byte_len(header, mask, encode_mask).unwrap();
+        let mut blob = vec![0; header_len + mask_len];
+        let written_header = write_lerc2_header(header, &mut blob).unwrap();
+        let written_mask =
+            write_lerc2_mask(header, mask, encode_mask, &mut blob[written_header..]).unwrap();
+        assert_eq!(written_header, header_len);
+        assert_eq!(written_mask, mask_len);
+        blob
     }
 
     fn synthetic_v4_blob(data_type: DataType, n_depth: i32, range_bytes: &[u8]) -> Vec<u8> {
@@ -2777,6 +2883,81 @@ mod tests {
         assert_eq!(
             write_lerc2_header(&bad_dims, &mut output).unwrap_err(),
             LercError::WrongParam("invalid Lerc2 header dimensions")
+        );
+    }
+
+    #[test]
+    fn writes_lerc2_partial_mask_for_parser_round_trip() {
+        let header = header_for_write(4);
+        let byte_mask = [1, 0, 1, 1, 1, 1];
+        let mask = BitMask::from_byte_mask(&byte_mask, 3, 2).unwrap();
+        let blob = blob_with_written_header_and_mask(&header, Some(&mask), true);
+
+        assert!(blob.len() > header.header_size + 4);
+        let (_, mask_info) = read_lerc2_mask(&blob).unwrap();
+        assert_eq!(mask_info.mask, mask);
+        assert_eq!(
+            mask_info.num_bytes_mask as usize,
+            blob.len() - header.header_size - 4
+        );
+        assert_eq!(mask_info.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn writes_lerc2_zero_mask_sections_for_trivial_masks() {
+        let mut all_valid = header_for_write(4);
+        all_valid.num_valid_pixel = all_valid.n_cols * all_valid.n_rows;
+        all_valid.blob_size = (all_valid.header_size + 4) as i32;
+        let blob = blob_with_written_header_and_mask(&all_valid, None, true);
+        let (_, mask_info) = read_lerc2_mask(&blob).unwrap();
+        assert_eq!(blob.len(), all_valid.header_size + 4);
+        assert_eq!(mask_info.num_bytes_mask, 0);
+        assert_eq!(mask_info.mask.count_valid_bits(), 6);
+
+        let mut all_invalid = all_valid;
+        all_invalid.num_valid_pixel = 0;
+        let blob = blob_with_written_header_and_mask(&all_invalid, None, true);
+        let (_, mask_info) = read_lerc2_mask(&blob).unwrap();
+        assert_eq!(blob.len(), all_invalid.header_size + 4);
+        assert_eq!(mask_info.num_bytes_mask, 0);
+        assert_eq!(mask_info.mask.count_valid_bits(), 0);
+    }
+
+    #[test]
+    fn writes_lerc2_omitted_partial_mask_for_previous_reuse() {
+        let header = header_for_write(4);
+        let previous = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap();
+        let blob = blob_with_written_header_and_mask(&header, Some(&previous), false);
+
+        assert_eq!(blob.len(), header.header_size + 4);
+        let (_, mask_info) = read_lerc2_mask_with_previous(&blob, Some(&previous)).unwrap();
+        assert_eq!(mask_info.mask, previous);
+        assert_eq!(mask_info.num_bytes_mask, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_lerc2_mask_write_inputs() {
+        let header = header_for_write(4);
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap();
+        assert_eq!(
+            write_lerc2_mask(&header, Some(&mask), true, &mut [0; 3]).unwrap_err(),
+            LercError::BufferTooSmall
+        );
+        assert_eq!(
+            write_lerc2_mask(&header, None, true, &mut [0; 16]).unwrap_err(),
+            LercError::WrongParam("partial Lerc2 mask is required when encode_mask is true")
+        );
+
+        let wrong_dims = BitMask::from_byte_mask(&[1, 1, 1, 1], 2, 2).unwrap();
+        assert_eq!(
+            write_lerc2_mask(&header, Some(&wrong_dims), true, &mut [0; 16]).unwrap_err(),
+            LercError::WrongParam("Lerc2 mask dimensions do not match header")
+        );
+
+        let wrong_count = BitMask::from_byte_mask(&[1, 1, 1, 1, 1, 1], 3, 2).unwrap();
+        assert_eq!(
+            write_lerc2_mask(&header, Some(&wrong_count), true, &mut [0; 16]).unwrap_err(),
+            LercError::WrongParam("Lerc2 mask valid count does not match header")
         );
     }
 

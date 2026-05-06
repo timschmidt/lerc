@@ -2,14 +2,14 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    compute_checksum_fletcher32, compute_lerc2_header_byte_len, decode_lerc1,
-    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_typed_values,
-    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
+    decode_lerc1, decode_lerc2_bands_supported, decode_lerc2_supported,
+    decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
+    decode_typed_values, get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
     get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
     read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
-    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, Rle,
+    write_lerc2_mask, BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -87,7 +87,7 @@ fn main() {
         n_rows: 2,
         n_cols: 3,
         n_depth: 2,
-        num_valid_pixel: 6,
+        num_valid_pixel: 5,
         micro_block_size: 8,
         blob_size: (compute_lerc2_header_byte_len(6).unwrap() + 4) as i32,
         n_blobs_more: 0,
@@ -104,6 +104,9 @@ fn main() {
         header_size: compute_lerc2_header_byte_len(6).unwrap(),
     };
     let mut encode_header_bytes = vec![0; encode_header.header_size];
+    let encode_mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap();
+    let mut encode_mask_bytes =
+        vec![0; compute_lerc2_mask_byte_len(&encode_header, Some(&encode_mask), true).unwrap()];
     let mut decode_into_data = vec![0; one_sweep_bands_decoded.data_byte_len()];
     let mut decode_into_mask = vec![0; 6];
     let mut decode_to_f64_data = vec![0.0f64; decode_into_spec.value_count().unwrap()];
@@ -373,6 +376,25 @@ fn main() {
             write_lerc2_header(
                 black_box(&encode_header),
                 black_box(&mut encode_header_bytes),
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-mask-write-partial", 100_000, || {
+        black_box(
+            compute_lerc2_mask_byte_len(
+                black_box(&encode_header),
+                Some(black_box(&encode_mask)),
+                true,
+            )
+            .unwrap(),
+        );
+        black_box(
+            write_lerc2_mask(
+                black_box(&encode_header),
+                Some(black_box(&encode_mask)),
+                true,
+                black_box(&mut encode_mask_bytes),
             )
             .unwrap(),
         );
