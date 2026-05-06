@@ -3,15 +3,16 @@ use std::time::{Duration, Instant};
 
 use lerc::{
     compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
-    compute_lerc2_min_max_ranges_byte_len, decode_lerc1, decode_lerc2_bands_supported,
-    decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_constant,
-    finalize_lerc2_checksum, get_lerc1_header_info, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
-    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-    validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
+    compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len, decode_lerc1,
+    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_typed_values,
+    encode_lerc2_constant, finalize_lerc2_checksum, get_lerc1_header_info,
+    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+    get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
+    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
+    write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, BitMask, BitStuffer2,
+    DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -125,6 +126,9 @@ fn main() {
     };
     let mut encode_range_bytes =
         vec![0; compute_lerc2_min_max_ranges_byte_len(&encode_header).unwrap()];
+    let encode_one_sweep_data = [1u8, 2, 9, 9, 3, 4, 5, 6, 7, 8, 11, 12];
+    let mut encode_one_sweep_bytes =
+        vec![0; compute_lerc2_one_sweep_byte_len(&encode_header).unwrap()];
     let mut checksum_header = encode_header.clone();
     checksum_header.blob_size = (checksum_header.header_size + encode_mask_bytes.len()) as i32;
     let mut checksum_blob = vec![0; checksum_header.blob_size as usize];
@@ -443,6 +447,17 @@ fn main() {
                 black_box(&encode_header),
                 black_box(&encode_ranges),
                 black_box(&mut encode_range_bytes),
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-one-sweep-write-v6", 100_000, || {
+        black_box(
+            write_lerc2_one_sweep(
+                black_box(&encode_header),
+                black_box(&encode_mask),
+                black_box(&encode_one_sweep_data),
+                black_box(&mut encode_one_sweep_bytes),
             )
             .unwrap(),
         );
