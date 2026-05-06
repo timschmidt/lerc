@@ -1932,8 +1932,10 @@ fn encode_lerc2_one_sweep_band(
 /// `data` must contain `n_bands` complete bands in band-major order. Masks
 /// follow the public C API convention: no masks means all pixels are valid, one
 /// mask is shared by all bands, and `n_bands` masks provide one mask per band.
-/// Version 6 blobs carry `nBlobsMore`; version 4 and 5 concatenation relies on
-/// the following blob header, matching the legacy C++ behavior.
+/// Version 6 blobs carry `nBlobsMore`; earlier concatenation relies on the
+/// following blob header, matching the legacy C++ behavior. Version 2 and 3
+/// blobs are limited to `n_depth == 1` because those headers do not carry a
+/// depth field.
 pub fn encode_lerc2_one_sweep_bands(
     spec: EncodeSpec,
     data: &[u8],
@@ -1963,9 +1965,14 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
 ) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "one-sweep Lerc2 band encode")?;
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
-    if !(4..=CURRENT_VERSION).contains(&version) {
+    if !(2..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
-            "one-sweep Lerc2 encode requires version 4 or newer",
+            "one-sweep Lerc2 encode requires version 2 or newer",
+        ));
+    }
+    if version < 4 && spec.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 encode can only store depth 1",
         ));
     }
     validate_encode_no_data_inputs(spec, uses_no_data, no_data_values, version)?;
@@ -8436,6 +8443,44 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
         );
+    }
+
+    #[test]
+    fn encodes_pre_v4_one_sweep_lerc2_bands_with_shared_mask() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let values = [1u16, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let data = values
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mask = [1u8, 0, 1, 1, 1, 0];
+        let blob = encode_lerc2_one_sweep_bands(spec, &data, 0.0, Some(&mask), 3).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.version, 3);
+        assert_eq!(decoded.bands[1].header.version, 3);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 0);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert!(decoded.bands[0].ranges.is_none());
+        assert!(decoded.bands[1].ranges.is_none());
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UShort(vec![1, 0, 3, 5, 7, 0])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UShort(vec![10, 0, 30, 50, 70, 0])
+        );
+        assert_eq!(decoded.bytes_consumed, blob.len());
     }
 
     #[test]

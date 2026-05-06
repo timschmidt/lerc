@@ -2072,6 +2072,72 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_encode_supports_pre_v4_one_sweep_multi_band_input() {
+        let values = [1u16, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let data = values
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let valid = [1u8, 0, 1, 1, 1, 0];
+        let mut computed_size = 0u32;
+        let mut out = [0u8; 512];
+        let mut written = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                3,
+                DataType::UShort as u32,
+                1,
+                3,
+                2,
+                2,
+                1,
+                valid.as_ptr(),
+                0.0,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                3,
+                DataType::UShort as u32,
+                1,
+                3,
+                2,
+                2,
+                1,
+                valid.as_ptr(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        let info = get_lerc_info(&out[..written as usize]).unwrap();
+        assert_eq!(info.version, 3);
+        assert_eq!(info.n_depth, 1);
+        assert_eq!(info.n_bands, 2);
+        assert_eq!(info.data_type, DataType::UShort);
+
+        let decoded_bands = crate::decode_lerc2_bands_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded_bands.bands.len(), 2);
+        assert_eq!(
+            decoded_bands.bands[0].data,
+            DecodedData::UShort(vec![1, 0, 3, 5, 7, 0])
+        );
+        assert_eq!(
+            decoded_bands.bands[1].data,
+            DecodedData::UShort(vec![10, 0, 30, 50, 70, 0])
+        );
+    }
+
+    #[test]
     fn c_abi_encode_constant_reports_buffer_too_small() {
         let data = [7u8; 6];
         let mut out = [0u8; 8];
