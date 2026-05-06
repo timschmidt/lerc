@@ -138,17 +138,16 @@ pub fn get_lerc1_header_info(blob: &[u8]) -> Result<Lerc1HeaderInfo> {
 
 /// Reads the legacy Lerc1 count part as a valid-pixel mask.
 ///
-/// This covers the non-tiled count-part form used by the checked-in Lerc1
-/// fixture: either a constant count value or an RLE-compressed packed bit mask.
-/// Tiled Lerc1 count payloads are left for the full legacy tile decoder.
+/// This covers both the non-tiled count-part form used by the checked-in Lerc1
+/// fixture and tiled count parts from older legacy blobs. Count values greater
+/// than zero are mapped to valid pixels.
 pub fn read_lerc1_count_mask(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskInfo)> {
     let info = get_lerc1_header_info(blob)?;
-    if info.count_part.num_tiles_vert != 0 || info.count_part.num_tiles_hori != 0 {
-        return Err(LercError::Unsupported("tiled Lerc1 count parts"));
-    }
-
     let mut mask = BitMask::new(info.n_cols as usize, info.n_rows as usize)?;
-    if info.count_part.num_bytes == 0 {
+
+    if info.count_part.num_tiles_vert != 0 || info.count_part.num_tiles_hori != 0 {
+        read_lerc1_count_tiles(&info, blob, &mut mask)?;
+    } else if info.count_part.num_bytes == 0 {
         if info.count_part.max_value > 0.0 {
             mask.set_all_valid();
         }
@@ -173,6 +172,115 @@ pub fn read_lerc1_count_mask(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskI
             all_valid,
         },
     ))
+}
+
+fn read_lerc1_count_tiles(info: &Lerc1HeaderInfo, blob: &[u8], mask: &mut BitMask) -> Result<()> {
+    if info.count_part.num_tiles_vert <= 0 || info.count_part.num_tiles_hori <= 0 {
+        return Err(LercError::CorruptInput("invalid Lerc1 count tile grid"));
+    }
+
+    let payload_start = info.count_part.payload_offset;
+    let payload_end = payload_start
+        .checked_add(info.count_part.num_bytes as usize)
+        .ok_or(LercError::CorruptInput("Lerc1 count payload overflow"))?;
+    let payload = blob
+        .get(payload_start..payload_end)
+        .ok_or(LercError::BufferTooSmall)?;
+    let mut reader = Reader::new(payload);
+
+    for (i0, i1) in tile_ranges(
+        info.n_rows as usize,
+        info.count_part.num_tiles_vert as usize,
+    )? {
+        for (j0, j1) in tile_ranges(
+            info.n_cols as usize,
+            info.count_part.num_tiles_hori as usize,
+        )? {
+            read_lerc1_count_tile(&mut reader, info.n_cols as usize, i0, i1, j0, j1, mask)?;
+        }
+    }
+
+    if reader.pos != payload.len() {
+        return Err(LercError::CorruptInput("unused Lerc1 count payload bytes"));
+    }
+    Ok(())
+}
+
+fn read_lerc1_count_tile(
+    reader: &mut Reader<'_>,
+    width: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    mask: &mut BitMask,
+) -> Result<()> {
+    let raw_flag = reader.read_u8()?;
+    if raw_flag == 2 || raw_flag == 3 {
+        return Ok(());
+    }
+    if raw_flag == 4 {
+        set_lerc1_count_tile_mask(mask, width, i0, i1, j0, j1, true)?;
+        return Ok(());
+    }
+    if (raw_flag & 63) > 4 {
+        return Err(LercError::CorruptInput("invalid Lerc1 count tile flag"));
+    }
+
+    if raw_flag == 0 {
+        for row in i0..i1 {
+            for col in j0..j1 {
+                let valid = reader.read_f32_le()? > 0.0;
+                if valid {
+                    mask.set_valid(row * width + col)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let bits67 = raw_flag >> 6;
+    let num_bytes = if bits67 == 0 { 4 } else { 3 - bits67 as usize };
+    let offset = reader.read_lerc1_float(num_bytes)?;
+    let tile_pixel_count = (i1 - i0) * (j1 - j0);
+    let (values, consumed) = BitStuffer2::decode(&reader.bytes[reader.pos..], tile_pixel_count, 2)?;
+    if values.len() < tile_pixel_count {
+        return Err(LercError::CorruptInput("Lerc1 count tile value underrun"));
+    }
+    reader.pos += consumed;
+
+    let mut src_idx = 0usize;
+    for row in i0..i1 {
+        for col in j0..j1 {
+            if offset + values[src_idx] as f32 > 0.0 {
+                mask.set_valid(row * width + col)?;
+            }
+            src_idx += 1;
+        }
+    }
+    Ok(())
+}
+
+fn set_lerc1_count_tile_mask(
+    mask: &mut BitMask,
+    width: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    valid: bool,
+) -> Result<()> {
+    for row in i0..i1 {
+        for col in j0..j1 {
+            let idx = row * width + col;
+            if valid {
+                mask.set_valid(idx)?;
+            } else {
+                mask.set_invalid(idx)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reads legacy Lerc1 z tiles and returns min/max statistics for valid pixels.
@@ -479,7 +587,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{decode_lerc1, get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats};
-    use crate::DataType;
+    use crate::{BitStuffer2, DataType};
     use std::fs;
     use std::path::PathBuf;
 
@@ -489,6 +597,33 @@ mod tests {
         path.push("testData");
         path.push(name);
         fs::read(path).unwrap()
+    }
+
+    fn synthetic_lerc1_with_count_part(
+        n_cols: i32,
+        n_rows: i32,
+        num_tiles_vert: i32,
+        num_tiles_hori: i32,
+        count_payload: &[u8],
+        count_max: f32,
+    ) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(super::CNT_Z_IMAGE_KEY);
+        blob.extend_from_slice(&11i32.to_le_bytes());
+        blob.extend_from_slice(&8i32.to_le_bytes());
+        blob.extend_from_slice(&n_rows.to_le_bytes());
+        blob.extend_from_slice(&n_cols.to_le_bytes());
+        blob.extend_from_slice(&0.1f64.to_le_bytes());
+        blob.extend_from_slice(&num_tiles_vert.to_le_bytes());
+        blob.extend_from_slice(&num_tiles_hori.to_le_bytes());
+        blob.extend_from_slice(&(count_payload.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&count_max.to_le_bytes());
+        blob.extend_from_slice(count_payload);
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        blob
     }
 
     #[test]
@@ -524,6 +659,38 @@ mod tests {
         assert_eq!(mask_info.bytes_consumed, 1622);
         assert_eq!(mask_info.mask.byte_len(), 8257);
         assert_eq!(mask_info.mask.count_valid_bits(), 65_025);
+        assert!(!mask_info.all_valid);
+    }
+
+    #[test]
+    fn reads_tiled_lerc1_count_mask_constants_and_raw_counts() {
+        let mut count_payload = Vec::new();
+        count_payload.push(4); // first 2x2 tile is constant valid
+        count_payload.push(0); // second 2x2 tile stores raw float counts
+        for value in [0.0f32, 1.0, -1.0, 2.0] {
+            count_payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let blob = synthetic_lerc1_with_count_part(4, 2, 1, 2, &count_payload, 2.0);
+        let (header, mask_info) = read_lerc1_count_mask(&blob).unwrap();
+
+        assert_eq!(header.count_part.num_tiles_vert, 1);
+        assert_eq!(header.count_part.num_tiles_hori, 2);
+        assert_eq!(mask_info.mask.to_byte_mask(), [1, 1, 0, 1, 1, 1, 0, 1]);
+        assert_eq!(mask_info.mask.count_valid_bits(), 6);
+        assert!(!mask_info.all_valid);
+    }
+
+    #[test]
+    fn reads_tiled_lerc1_count_mask_bit_stuffed_counts() {
+        let mut count_payload = Vec::new();
+        count_payload.push(0b1000_0001); // one-byte offset plus bit-stuffed counts
+        count_payload.push(0); // offset
+        count_payload.extend_from_slice(&BitStuffer2::encode_simple(&[0, 1, 2, 0], 2).unwrap());
+        let blob = synthetic_lerc1_with_count_part(4, 1, 1, 1, &count_payload, 2.0);
+        let (_, mask_info) = read_lerc1_count_mask(&blob).unwrap();
+
+        assert_eq!(mask_info.mask.to_byte_mask(), [0, 1, 1, 0]);
+        assert_eq!(mask_info.mask.count_valid_bits(), 2);
         assert!(!mask_info.all_valid);
     }
 
