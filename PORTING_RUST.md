@@ -20,7 +20,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added typed decoded-data conversion helpers for all Lerc native data types, plus typed accessors for one-sweep and tiled decode outputs.
 - Added a high-level supported-subset Lerc2 decode dispatcher that validates checksums, reads headers/masks/min-max ranges, dispatches const/one-sweep/tiled payloads, and returns typed decoded data.
 - Added a high-level supported-subset multi-band Lerc2 decode dispatcher for concatenated blobs, including previous-mask reuse between bands.
-- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, high-level supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, unsupported Huffman dispatch, and malformed input.
+- Added v6 no-data remapping in the supported decoder so temporary encoded no-data values are restored to the original no-data sentinel for valid pixels in multi-depth blobs.
+- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, high-level supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, unsupported Huffman dispatch, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -31,6 +32,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - The Rust Lerc2 parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo`, checksum validation used by `Lerc2::Decode`, mask reading used by `Lerc2::ReadMask`, min/max range parsing used by `Lerc2::ReadMinMaxRanges`, one-sweep raw payload expansion used by `Lerc2::ReadDataOneSweep`, raw-binary, simple bit-stuffed, LUT, and integer diff-encoded tiled payload expansion for `Lerc2::ReadTile`, single-band and multi-band supported-subset decode orchestration, and the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
 - `decode_lerc2_supported` is intentionally decode-only and subset-scoped. It validates v3+ checksums and supports constant images, one-sweep raw payloads, and non-Huffman tiled payloads already covered by the lower-level readers. Huffman-backed image modes currently return `Unsupported`.
 - `decode_lerc2_bands_supported` decodes concatenated Lerc2 blobs into separate band results and passes the previous band mask into later bands, matching the C++ previous-mask reuse mechanism for omitted partial masks.
+- For v6 blobs with `bPassNoDataValues` and `nDepth > 1`, supported decode remaps decoded values equal to `noDataVal` back to `noDataValOrig` on valid pixels, matching the C++ `Lerc::RemapNoData` wrapper behavior.
 - Lerc2 previous-mask reuse is explicit in Rust via `read_lerc2_mask_with_previous`; calling `read_lerc2_mask` on a blob that omits a partial mask returns an unsupported error.
 - Public Rust APIs return `Result<T, LercError>` instead of bool/status pairs. C-compatible FFI wrappers should be added after the safe Rust codec surface is stable.
 
@@ -48,6 +50,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 4. Port decode-only Lerc2 block paths.
    - Add C++ parity tests for `decode_lerc2_supported` on synthetic and fixture blobs that avoid Huffman.
    - Add C++ parity tests for `decode_lerc2_bands_supported` on concatenated non-Huffman fixtures.
+   - Add C++ parity coverage for v6 no-data remapping across all supported native data types.
    - Extend diff-encoded coverage to LUT and floating-point cases where C++ supports them.
    - Decode Huffman-backed blocks separately.
    - Keep each block codec independently fuzzable and benchmarkable.
@@ -67,8 +70,8 @@ cargo bench --bench rle_bit_stuffer
 
 Last run in this branch:
 
-- `cargo test`: passed, 41 unit tests.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, Lerc2 metadata parsing, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, and high-level supported-subset multi-band Lerc2 decode.
+- `cargo test`: passed, 42 unit tests.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, Lerc2 metadata parsing, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, and v6 supported-subset no-data decode.
 
 ## Open Risks
 

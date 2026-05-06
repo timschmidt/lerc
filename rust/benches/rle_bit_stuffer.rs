@@ -44,6 +44,7 @@ fn main() {
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let mut one_sweep_bands_blob = one_sweep_blob.clone();
     one_sweep_bands_blob.extend_from_slice(&one_sweep_blob);
+    let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
@@ -115,6 +116,13 @@ fn main() {
     bench("lerc2-supported-bands-decode-v4-synthetic", 100_000, || {
         black_box(decode_lerc2_bands_supported(black_box(&one_sweep_bands_blob)).unwrap());
     });
+    bench(
+        "lerc2-supported-no-data-decode-v6-synthetic",
+        100_000,
+        || {
+            black_box(decode_lerc2_supported(black_box(&one_sweep_no_data_blob)).unwrap());
+        },
+    );
 
     std::thread::sleep(Duration::from_millis(1));
 }
@@ -347,6 +355,45 @@ fn synthetic_v4_min_max_blob() -> Vec<u8> {
     blob.extend_from_slice(&40.0f64.to_le_bytes());
     blob.extend_from_slice(&0i32.to_le_bytes());
     blob.extend_from_slice(&range_bytes);
+    set_lerc2_checksum(&mut blob);
+    blob
+}
+
+fn synthetic_v6_uchar_one_sweep_no_data_blob() -> Vec<u8> {
+    let n_rows = 2i32;
+    let n_cols = 3i32;
+    let n_depth = 2i32;
+    let num_valid = n_rows * n_cols;
+    let range_bytes = [1u8, 1, 99, 99];
+    let payload = [1u8, 99, 2, 3, 99, 4, 5, 6, 7, 99, 8, 9];
+    let header_size = 6 + 4 + 4 + 8 * 4 + 4 + 5 * 8;
+    let blob_size = header_size + 4 + range_bytes.len() + 1 + payload.len();
+    let mut blob = Vec::with_capacity(blob_size);
+    blob.extend_from_slice(b"Lerc2 ");
+    blob.extend_from_slice(&6i32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    for value in [
+        n_rows,
+        n_cols,
+        n_depth,
+        num_valid,
+        8,
+        blob_size as i32,
+        DataType::UChar as i32,
+        0,
+    ] {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    blob.extend_from_slice(&[1, 1, 0, 0]);
+    blob.extend_from_slice(&0.5f64.to_le_bytes());
+    blob.extend_from_slice(&1.0f64.to_le_bytes());
+    blob.extend_from_slice(&99.0f64.to_le_bytes());
+    blob.extend_from_slice(&99.0f64.to_le_bytes());
+    blob.extend_from_slice(&255.0f64.to_le_bytes());
+    blob.extend_from_slice(&0i32.to_le_bytes());
+    blob.extend_from_slice(&range_bytes);
+    blob.push(1);
+    blob.extend_from_slice(&payload);
     set_lerc2_checksum(&mut blob);
     blob
 }

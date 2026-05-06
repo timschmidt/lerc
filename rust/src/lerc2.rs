@@ -397,25 +397,28 @@ pub fn decode_lerc2_supported_with_previous(
         ))?;
 
     if header.num_valid_pixel == 0 {
+        let data = decode_lerc2_typed_values(
+            &header,
+            &mask_info.mask,
+            &vec![0; value_count * header.data_type.size_in_bytes()],
+        )?;
         return Ok(DecodedLerc2 {
             header: header.clone(),
             mask: mask_info.mask,
             ranges: None,
-            data: decode_typed_values(
-                header.data_type,
-                &vec![0; value_count * header.data_type.size_in_bytes()],
-            )?,
+            data,
             bytes_consumed: reader.pos,
         });
     }
 
     if header.z_min == header.z_max {
-        let data = const_image_bytes(&header, &mask_info.mask, None)?;
+        let raw = const_image_bytes(&header, &mask_info.mask, None)?;
+        let data = decode_lerc2_typed_values(&header, &mask_info.mask, &raw)?;
         return Ok(DecodedLerc2 {
             header: header.clone(),
             mask: mask_info.mask,
             ranges: None,
-            data: decode_typed_values(header.data_type, &data)?,
+            data,
             bytes_consumed: reader.pos,
         });
     }
@@ -423,12 +426,13 @@ pub fn decode_lerc2_supported_with_previous(
     let ranges = if header.version >= 4 {
         let ranges = read_min_max_ranges(&mut reader, &header)?;
         if ranges.min_max_equal {
-            let data = const_image_bytes(&header, &mask_info.mask, Some(&ranges))?;
+            let raw = const_image_bytes(&header, &mask_info.mask, Some(&ranges))?;
+            let data = decode_lerc2_typed_values(&header, &mask_info.mask, &raw)?;
             return Ok(DecodedLerc2 {
                 header: header.clone(),
                 mask: mask_info.mask,
                 ranges: Some(ranges),
-                data: decode_typed_values(header.data_type, &data)?,
+                data,
                 bytes_consumed: reader.pos,
             });
         }
@@ -457,12 +461,13 @@ pub fn decode_lerc2_supported_with_previous(
         }
         read_tiled_payload(&mut reader, &header, &mask_info.mask, ranges.as_ref())?.data
     };
+    let data = decode_lerc2_typed_values(&header, &mask_info.mask, &raw)?;
 
     Ok(DecodedLerc2 {
         header: header.clone(),
         mask: mask_info.mask,
         ranges,
-        data: decode_typed_values(header.data_type, &raw)?,
+        data,
         bytes_consumed: reader.pos,
     })
 }
@@ -1045,6 +1050,141 @@ fn try_huffman_float(header: &HeaderInfo) -> bool {
         && header.max_z_error == 0.0
 }
 
+fn decode_lerc2_typed_values(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    bytes: &[u8],
+) -> Result<DecodedData> {
+    let mut data = decode_typed_values(header.data_type, bytes)?;
+    remap_no_data_values(&mut data, header, mask)?;
+    Ok(data)
+}
+
+fn remap_no_data_values(data: &mut DecodedData, header: &HeaderInfo, mask: &BitMask) -> Result<()> {
+    if !header.has_no_data_values()
+        || header.n_depth <= 1
+        || header.no_data_val.to_bits() == header.no_data_val_orig.to_bits()
+    {
+        return Ok(());
+    }
+
+    let n_depth = header.n_depth as usize;
+    let n_cols = header.n_cols as usize;
+    let n_rows = header.n_rows as usize;
+    let expected_len = n_cols
+        .checked_mul(n_rows)
+        .and_then(|count| count.checked_mul(n_depth))
+        .ok_or(LercError::CorruptInput(
+            "Lerc2 no-data value count overflow",
+        ))?;
+    if data.len() != expected_len {
+        return Err(LercError::CorruptInput(
+            "Lerc2 decoded no-data remap length mismatch",
+        ));
+    }
+
+    match data {
+        DecodedData::Char(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as i8,
+            header.no_data_val_orig as i8,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::UChar(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as u8,
+            header.no_data_val_orig as u8,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::Short(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as i16,
+            header.no_data_val_orig as i16,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::UShort(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as u16,
+            header.no_data_val_orig as u16,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::Int(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as i32,
+            header.no_data_val_orig as i32,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::UInt(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as u32,
+            header.no_data_val_orig as u32,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::Float(values) => remap_no_data_slice(
+            values,
+            header.no_data_val as f32,
+            header.no_data_val_orig as f32,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+        DecodedData::Double(values) => remap_no_data_slice(
+            values,
+            header.no_data_val,
+            header.no_data_val_orig,
+            n_cols,
+            n_rows,
+            n_depth,
+            mask,
+        ),
+    }
+}
+
+fn remap_no_data_slice<T: Copy + PartialEq>(
+    values: &mut [T],
+    old_value: T,
+    new_value: T,
+    n_cols: usize,
+    n_rows: usize,
+    n_depth: usize,
+    mask: &BitMask,
+) -> Result<()> {
+    for row in 0..n_rows {
+        for col in 0..n_cols {
+            let pixel_idx = row * n_cols + col;
+            if mask.is_valid(pixel_idx)? {
+                let base = pixel_idx * n_depth;
+                for depth in 0..n_depth {
+                    if values[base + depth] == old_value {
+                        values[base + depth] = new_value;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn get_data_type_used(data_type: DataType, tc: u8) -> Result<DataType> {
     let dt = data_type as i32;
     let tc = tc as i32;
@@ -1576,6 +1716,45 @@ mod tests {
         blob
     }
 
+    fn synthetic_v6_uchar_one_sweep_no_data_blob() -> Vec<u8> {
+        let n_rows = 2i32;
+        let n_cols = 3i32;
+        let n_depth = 2i32;
+        let num_valid = n_rows * n_cols;
+        let range_bytes = [1u8, 1, 99, 99];
+        let payload = [1u8, 99, 2, 3, 99, 4, 5, 6, 7, 99, 8, 9];
+        let header_size = FILE_KEY.len() + 4 + 4 + 8 * 4 + 4 + 5 * 8;
+        let blob_size = header_size + 4 + range_bytes.len() + 1 + payload.len();
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&6i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [
+            n_rows,
+            n_cols,
+            n_depth,
+            num_valid,
+            8,
+            blob_size as i32,
+            DataType::UChar as i32,
+            0,
+        ] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&[1, 1, 0, 0]);
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&1.0f64.to_le_bytes());
+        blob.extend_from_slice(&99.0f64.to_le_bytes());
+        blob.extend_from_slice(&99.0f64.to_le_bytes());
+        blob.extend_from_slice(&255.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&range_bytes);
+        blob.push(1);
+        blob.extend_from_slice(&payload);
+        set_lerc2_checksum(&mut blob);
+        blob
+    }
+
     fn set_lerc2_checksum(blob: &mut [u8]) {
         let checksum = compute_checksum_fletcher32(&blob[14..]);
         blob[10..14].copy_from_slice(&checksum.to_le_bytes());
@@ -2003,6 +2182,20 @@ mod tests {
         assert_eq!(
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 20, 30, 0, 40])
+        );
+    }
+
+    #[test]
+    fn decodes_v6_no_data_values_to_original_sentinel() {
+        let blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 99.0);
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 255, 2, 3, 255, 4, 5, 6, 7, 255, 8, 9])
         );
     }
 
