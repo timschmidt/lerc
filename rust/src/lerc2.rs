@@ -11,7 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! Lerc2 metadata readers and supported-subset decoders.
 
 use crate::types::{DataType, LercError, Result};
-use crate::{decode_typed_values, DecodedData};
+use crate::{decode_typed_values, read_lerc1_z_stats, DecodedData};
 use crate::{BitMask, BitStuffer2, Rle};
 
 /// Highest Lerc2 codec version recognized by this crate.
@@ -141,10 +141,12 @@ impl TiledData {
     }
 }
 
-/// Aggregated Lerc2 blob information matching the public C API shape.
+/// Aggregated blob information matching the public C API shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LercInfo {
-    /// Lerc2 format version of the first blob.
+    /// LERC format version of the first blob.
+    ///
+    /// Legacy Lerc1 blobs report version `0`, matching the C++ public API.
     pub version: i32,
     /// Number of values per pixel.
     pub n_depth: i32,
@@ -808,9 +810,16 @@ pub fn decode_lerc2_supported_with_previous(
     })
 }
 
-/// Aggregates public Lerc2 metadata across concatenated blobs.
+/// Aggregates public LERC metadata.
+///
+/// Lerc2 blobs are aggregated across concatenated bands. Legacy Lerc1 blobs
+/// currently report single-band metadata from the decoded count mask and z
+/// statistics.
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
-    let first = get_lerc2_header_info(blob)?;
+    let first = match get_lerc2_header_info(blob) {
+        Ok(first) => first,
+        Err(_) => return get_lerc1_info(blob),
+    };
     let mut info = LercInfo {
         version: first.header.version,
         n_depth: first.header.n_depth,
@@ -897,7 +906,26 @@ pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
     Ok(info)
 }
 
-/// Fills C API-style blob info and data-range arrays for Lerc2 blobs.
+fn get_lerc1_info(blob: &[u8]) -> Result<LercInfo> {
+    let (header, mask, stats) = read_lerc1_z_stats(blob)?;
+    Ok(LercInfo {
+        version: 0,
+        n_depth: 1,
+        n_cols: header.n_cols,
+        n_rows: header.n_rows,
+        num_valid_pixel: stats.num_valid_pixels as i32,
+        n_bands: 1,
+        blob_size: stats.bytes_consumed as i32,
+        n_masks: if mask.all_valid { 0 } else { 1 },
+        n_uses_no_data_value: 0,
+        data_type: DataType::Float,
+        z_min: stats.z_min as f64,
+        z_max: stats.z_max as f64,
+        max_z_error: header.max_z_error,
+    })
+}
+
+/// Fills C API-style blob info and data-range arrays.
 ///
 /// `info_array`, when provided, is zeroed and then filled up to its length with
 /// `{ version, dataType, nDepth, nCols, nRows, nBands, nValidPixels, blobSize,
@@ -2419,6 +2447,26 @@ mod tests {
     }
 
     #[test]
+    fn reports_legacy_lerc1_fixture_info() {
+        let blob = fixture("world.lerc1");
+        let info = get_lerc_info(&blob).unwrap();
+
+        assert_eq!(info.version, 0);
+        assert_eq!(info.n_rows, 257);
+        assert_eq!(info.n_cols, 257);
+        assert_eq!(info.n_depth, 1);
+        assert_eq!(info.n_bands, 1);
+        assert_eq!(info.blob_size as usize, blob.len());
+        assert_eq!(info.data_type, DataType::Float);
+        assert_eq!(info.n_masks, 1);
+        assert_eq!(info.n_uses_no_data_value, 0);
+        assert_eq!(info.num_valid_pixel, 65_025);
+        assert_eq!(info.max_z_error, 0.1);
+        assert_eq!(info.z_min, -27.458_635_330_200_195);
+        assert_eq!(info.z_max, 5474.172_851_562_5);
+    }
+
+    #[test]
     fn fills_c_api_style_blob_info_arrays() {
         let blob = fixture("bluemarble_256_256_3_byte.lerc2");
         let mut info_array = [123u32; BLOB_INFO_ARRAY_LEN + 2];
@@ -2437,6 +2485,37 @@ mod tests {
             &[0.0, 255.0, 0.5]
         );
         assert_eq!(&range_array[BLOB_DATA_RANGE_ARRAY_LEN..], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn fills_legacy_lerc1_blob_info_arrays() {
+        let blob = fixture("world.lerc1");
+        let mut info_array = [123u32; BLOB_INFO_ARRAY_LEN];
+        let mut range_array = [123.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+        let info = get_lerc2_blob_info_arrays(&blob, Some(&mut info_array), Some(&mut range_array))
+            .unwrap();
+
+        assert_eq!(info.version, 0);
+        assert_eq!(
+            info_array,
+            [
+                0,
+                DataType::Float as u32,
+                1,
+                257,
+                257,
+                1,
+                65_025,
+                blob.len() as u32,
+                1,
+                1,
+                0,
+            ]
+        );
+        assert_eq!(
+            range_array,
+            [-27.458_635_330_200_195, 5474.172_851_562_5, 0.1]
+        );
     }
 
     #[test]

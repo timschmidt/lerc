@@ -146,6 +146,9 @@ fn main() {
     bench("lerc1-z-stats-read", 1_000, || {
         black_box(read_lerc1_z_stats(black_box(&lerc1_blob)).unwrap());
     });
+    bench("lerc1-info", 1_000, || {
+        black_box(get_lerc_info(black_box(&lerc1_blob)).unwrap());
+    });
     bench("lerc2-header-parse", 100_000, || {
         black_box(get_lerc2_header_info(black_box(&lerc2_blob)).unwrap());
     });
