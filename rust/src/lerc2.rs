@@ -59,6 +59,14 @@ pub struct MaskInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MinMaxRanges {
+    pub mins: Vec<f64>,
+    pub maxs: Vec<f64>,
+    pub bytes_consumed: usize,
+    pub min_max_equal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LercInfo {
     pub version: i32,
     pub n_depth: i32,
@@ -152,6 +160,45 @@ pub fn validate_lerc2_checksum(blob: &[u8]) -> Result<HeaderInfo> {
     }
 
     Ok(header)
+}
+
+pub fn read_lerc2_min_max_ranges(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, MinMaxRanges)> {
+    read_lerc2_min_max_ranges_with_previous(blob, None)
+}
+
+pub fn read_lerc2_min_max_ranges_with_previous(
+    blob: &[u8],
+    previous_mask: Option<&BitMask>,
+) -> Result<(HeaderInfo, MaskInfo, MinMaxRanges)> {
+    let mut reader = Reader::new(blob);
+    let header = read_header(&mut reader)?;
+    let mask = read_mask(&mut reader, &header, previous_mask)?;
+
+    if header.version < 4 {
+        return Err(LercError::Unsupported(
+            "Lerc2 min/max range section is only present for version 4+ blobs",
+        ));
+    }
+
+    let ranges = if header.num_valid_pixel == 0 {
+        MinMaxRanges {
+            mins: vec![0.0; header.n_depth as usize],
+            maxs: vec![0.0; header.n_depth as usize],
+            bytes_consumed: reader.pos,
+            min_max_equal: true,
+        }
+    } else if header.z_min == header.z_max {
+        MinMaxRanges {
+            mins: vec![header.z_min; header.n_depth as usize],
+            maxs: vec![header.z_max; header.n_depth as usize],
+            bytes_consumed: reader.pos,
+            min_max_equal: true,
+        }
+    } else {
+        read_min_max_ranges(&mut reader, &header)?
+    };
+
+    Ok((header, mask, ranges))
 }
 
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
@@ -290,6 +337,31 @@ fn read_mask(
         mask,
         num_bytes_mask,
         bytes_consumed: reader.pos,
+    })
+}
+
+fn read_min_max_ranges(reader: &mut Reader<'_>, header: &HeaderInfo) -> Result<MinMaxRanges> {
+    let n_depth = header.n_depth as usize;
+    let mut mins = Vec::with_capacity(n_depth);
+    let mut maxs = Vec::with_capacity(n_depth);
+
+    for _ in 0..n_depth {
+        mins.push(reader.read_value_as_f64(header.data_type)?);
+    }
+    for _ in 0..n_depth {
+        maxs.push(reader.read_value_as_f64(header.data_type)?);
+    }
+
+    let min_max_equal = mins
+        .iter()
+        .zip(maxs.iter())
+        .all(|(min, max)| min.to_bits() == max.to_bits());
+
+    Ok(MinMaxRanges {
+        mins,
+        maxs,
+        bytes_consumed: reader.pos,
+        min_max_equal,
     })
 }
 
@@ -462,6 +534,27 @@ impl<'a> Reader<'a> {
         Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
+    fn read_value_as_f64(&mut self, data_type: DataType) -> Result<f64> {
+        match data_type {
+            DataType::Char => Ok(i8::from_le_bytes(self.read_bytes(1)?.try_into().unwrap()) as f64),
+            DataType::UChar => Ok(self.read_bytes(1)?[0] as f64),
+            DataType::Short => {
+                Ok(i16::from_le_bytes(self.read_bytes(2)?.try_into().unwrap()) as f64)
+            }
+            DataType::UShort => {
+                Ok(u16::from_le_bytes(self.read_bytes(2)?.try_into().unwrap()) as f64)
+            }
+            DataType::Int => Ok(i32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()) as f64),
+            DataType::UInt => {
+                Ok(u32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()) as f64)
+            }
+            DataType::Float => {
+                Ok(f32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()) as f64)
+            }
+            DataType::Double => self.read_f64_le(),
+        }
+    }
+
     fn peek_i32_le(&self) -> Result<i32> {
         if self.bytes.len().saturating_sub(self.pos) < 4 {
             return Err(LercError::BufferTooSmall);
@@ -476,7 +569,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_mask,
-        read_lerc2_mask_with_previous, validate_lerc2_checksum,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, validate_lerc2_checksum,
+        FILE_KEY,
     };
     use crate::DataType;
     use std::fs;
@@ -488,6 +582,24 @@ mod tests {
         path.push("testData");
         path.push(name);
         fs::read(path).unwrap()
+    }
+
+    fn synthetic_v4_blob(data_type: DataType, n_depth: i32, range_bytes: &[u8]) -> Vec<u8> {
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size = header_size + 4 + range_bytes.len();
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [2, 3, n_depth, 6, 8, blob_size as i32, data_type as i32] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&(-10.0f64).to_le_bytes());
+        blob.extend_from_slice(&1000.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(range_bytes);
+        blob
     }
 
     #[test]
@@ -598,6 +710,48 @@ mod tests {
         assert_eq!(offset, bluemarble.len());
         assert_eq!(checksums.len(), 3);
         assert_eq!(checksums, [0x86ce_e665, 0x2419_e3dc, 0x5e2d_64e2]);
+    }
+
+    #[test]
+    fn reads_v4_byte_min_max_ranges() {
+        let range_bytes = [1u8, 2, 3, 10, 20, 30];
+        let blob = synthetic_v4_blob(DataType::UChar, 3, &range_bytes);
+        let (_, mask, ranges) = read_lerc2_min_max_ranges(&blob).unwrap();
+
+        assert_eq!(mask.mask.count_valid_bits(), 6);
+        assert_eq!(ranges.mins, [1.0, 2.0, 3.0]);
+        assert_eq!(ranges.maxs, [10.0, 20.0, 30.0]);
+        assert_eq!(ranges.bytes_consumed, blob.len());
+        assert!(!ranges.min_max_equal);
+    }
+
+    #[test]
+    fn reads_v4_float_and_double_min_max_ranges() {
+        let mut float_ranges = Vec::new();
+        for value in [-1.25f32, 2.5, 9.75, 10.5] {
+            float_ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        let float_blob = synthetic_v4_blob(DataType::Float, 2, &float_ranges);
+        let (_, _, ranges) = read_lerc2_min_max_ranges(&float_blob).unwrap();
+        assert_eq!(ranges.mins, [-1.25, 2.5]);
+        assert_eq!(ranges.maxs, [9.75, 10.5]);
+
+        let mut double_ranges = Vec::new();
+        for value in [-100.0f64, 7.0, -100.0, 7.0] {
+            double_ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        let double_blob = synthetic_v4_blob(DataType::Double, 2, &double_ranges);
+        let (_, _, ranges) = read_lerc2_min_max_ranges(&double_blob).unwrap();
+        assert_eq!(ranges.mins, [-100.0, 7.0]);
+        assert_eq!(ranges.maxs, [-100.0, 7.0]);
+        assert!(ranges.min_max_equal);
+    }
+
+    #[test]
+    fn rejects_truncated_v4_min_max_ranges() {
+        let range_bytes = [1u8, 2, 3, 10, 20];
+        let blob = synthetic_v4_blob(DataType::UChar, 3, &range_bytes);
+        assert!(read_lerc2_min_max_ranges(&blob).is_err());
     }
 
     #[test]
