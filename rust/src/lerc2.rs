@@ -108,6 +108,15 @@ pub struct LercInfo {
     pub max_z_error: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedLerc2 {
+    pub header: HeaderInfo,
+    pub mask: BitMask,
+    pub ranges: Option<MinMaxRanges>,
+    pub data: DecodedData,
+    pub bytes_consumed: usize,
+}
+
 pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     let mut reader = Reader::new(blob);
     let header = read_header(&mut reader)?;
@@ -314,6 +323,98 @@ pub fn read_lerc2_tiled_payload_with_previous(
 
     let data = read_tiled_payload(&mut reader, &header, &mask.mask, ranges.as_ref())?;
     Ok((header, mask, data))
+}
+
+pub fn decode_lerc2_supported(blob: &[u8]) -> Result<DecodedLerc2> {
+    decode_lerc2_supported_with_previous(blob, None)
+}
+
+pub fn decode_lerc2_supported_with_previous(
+    blob: &[u8],
+    previous_mask: Option<&BitMask>,
+) -> Result<DecodedLerc2> {
+    validate_lerc2_checksum(blob)?;
+
+    let mut reader = Reader::new(blob);
+    let header = read_header(&mut reader)?;
+    let mask_info = read_mask(&mut reader, &header, previous_mask)?;
+
+    let value_count = (header.n_cols as usize)
+        .checked_mul(header.n_rows as usize)
+        .and_then(|count| count.checked_mul(header.n_depth as usize))
+        .ok_or(LercError::CorruptInput(
+            "Lerc2 decoded value count overflow",
+        ))?;
+
+    if header.num_valid_pixel == 0 {
+        return Ok(DecodedLerc2 {
+            header: header.clone(),
+            mask: mask_info.mask,
+            ranges: None,
+            data: decode_typed_values(
+                header.data_type,
+                &vec![0; value_count * header.data_type.size_in_bytes()],
+            )?,
+            bytes_consumed: reader.pos,
+        });
+    }
+
+    if header.z_min == header.z_max {
+        let data = const_image_bytes(&header, &mask_info.mask, None)?;
+        return Ok(DecodedLerc2 {
+            header: header.clone(),
+            mask: mask_info.mask,
+            ranges: None,
+            data: decode_typed_values(header.data_type, &data)?,
+            bytes_consumed: reader.pos,
+        });
+    }
+
+    let ranges = if header.version >= 4 {
+        let ranges = read_min_max_ranges(&mut reader, &header)?;
+        if ranges.min_max_equal {
+            let data = const_image_bytes(&header, &mask_info.mask, Some(&ranges))?;
+            return Ok(DecodedLerc2 {
+                header: header.clone(),
+                mask: mask_info.mask,
+                ranges: Some(ranges),
+                data: decode_typed_values(header.data_type, &data)?,
+                bytes_consumed: reader.pos,
+            });
+        }
+        Some(ranges)
+    } else {
+        None
+    };
+
+    let one_sweep_flag = reader.read_bytes(1)?[0];
+    let raw = if one_sweep_flag != 0 {
+        read_data_one_sweep(&mut reader, &header, &mask_info.mask)?.data
+    } else {
+        if try_huffman_int(&header) || try_huffman_float(&header) {
+            let image_mode = reader.read_bytes(1)?[0];
+            if image_mode > 3
+                || (image_mode > 2 && header.version < 6)
+                || (image_mode > 1 && header.version < 4)
+            {
+                return Err(LercError::CorruptInput("invalid Lerc2 image encode mode"));
+            }
+            if image_mode != 0 {
+                return Err(LercError::Unsupported(
+                    "Lerc2 Huffman-backed image modes are not ported yet",
+                ));
+            }
+        }
+        read_tiled_payload(&mut reader, &header, &mask_info.mask, ranges.as_ref())?.data
+    };
+
+    Ok(DecodedLerc2 {
+        header: header.clone(),
+        mask: mask_info.mask,
+        ranges,
+        data: decode_typed_values(header.data_type, &raw)?,
+        bytes_consumed: reader.pos,
+    })
 }
 
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
@@ -588,6 +689,41 @@ fn read_tiled_payload(
     })
 }
 
+fn const_image_bytes(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    ranges: Option<&MinMaxRanges>,
+) -> Result<Vec<u8>> {
+    let value_size = header.data_type.size_in_bytes();
+    let n_cols = header.n_cols as usize;
+    let n_rows = header.n_rows as usize;
+    let n_depth = header.n_depth as usize;
+    let mut data = vec![0; n_cols * n_rows * n_depth * value_size];
+    let depth_values: Vec<f64> = if n_depth > 1 && header.z_min != header.z_max {
+        ranges
+            .ok_or(LercError::CorruptInput("missing Lerc2 const depth ranges"))?
+            .mins
+            .clone()
+    } else {
+        vec![header.z_min; n_depth]
+    };
+
+    for row in 0..n_rows {
+        for col in 0..n_cols {
+            let pixel_idx = row * n_cols + col;
+            if mask.is_valid(pixel_idx)? {
+                for (depth, &value) in depth_values.iter().enumerate() {
+                    let offset = (pixel_idx * n_depth + depth) * value_size;
+                    let value_bytes = encode_value_as_bytes(header.data_type, value);
+                    data[offset..offset + value_size].copy_from_slice(&value_bytes);
+                }
+            }
+        }
+    }
+
+    Ok(data)
+}
+
 fn read_tile_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
@@ -847,6 +983,18 @@ fn z_max_for_depth(header: &HeaderInfo, ranges: Option<&MinMaxRanges>, i_depth: 
     }
 }
 
+fn try_huffman_int(header: &HeaderInfo) -> bool {
+    header.version >= 2
+        && matches!(header.data_type, DataType::UChar | DataType::Char)
+        && header.max_z_error == 0.5
+}
+
+fn try_huffman_float(header: &HeaderInfo) -> bool {
+    header.version >= 6
+        && matches!(header.data_type, DataType::Float | DataType::Double)
+        && header.max_z_error == 0.0
+}
+
 fn get_data_type_used(data_type: DataType, tc: u8) -> Result<DataType> {
     let dt = data_type as i32;
     let tc = tc as i32;
@@ -1097,7 +1245,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info,
+        compute_checksum_fletcher32, decode_lerc2_supported, get_lerc2_header_info, get_lerc_info,
         read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
         read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         validate_lerc2_checksum, FILE_KEY,
@@ -1172,6 +1320,7 @@ mod tests {
         blob.extend_from_slice(range_bytes);
         blob.push(1);
         blob.extend_from_slice(payload);
+        set_lerc2_checksum(&mut blob);
         blob
     }
 
@@ -1291,6 +1440,60 @@ mod tests {
             blob.extend_from_slice(&block);
         }
         blob
+    }
+
+    fn synthetic_v4_ushort_tiled_raw_blob() -> Vec<u8> {
+        let values = [100u16, 200, 300, 400];
+        let mut payload = vec![0u8];
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut range_bytes = Vec::new();
+        range_bytes.extend_from_slice(&100u16.to_le_bytes());
+        range_bytes.extend_from_slice(&400u16.to_le_bytes());
+
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size = header_size + 4 + range_bytes.len() + 1 + payload.len();
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [2, 2, 1, 4, 2, blob_size as i32, DataType::UShort as i32] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&100.0f64.to_le_bytes());
+        blob.extend_from_slice(&400.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&range_bytes);
+        blob.push(0);
+        blob.extend_from_slice(&payload);
+        set_lerc2_checksum(&mut blob);
+        blob
+    }
+
+    fn synthetic_v4_const_blob() -> Vec<u8> {
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size = header_size + 4;
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [2, 2, 1, 4, 2, blob_size as i32, DataType::UChar as i32] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&7.0f64.to_le_bytes());
+        blob.extend_from_slice(&7.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        set_lerc2_checksum(&mut blob);
+        blob
+    }
+
+    fn set_lerc2_checksum(blob: &mut [u8]) {
+        let checksum = compute_checksum_fletcher32(&blob[14..]);
+        blob[10..14].copy_from_slice(&checksum.to_le_bytes());
     }
 
     fn bit_stuffed_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
@@ -1646,6 +1849,45 @@ mod tests {
         blob.pop();
 
         assert!(read_lerc2_tiled_payload(&blob).is_err());
+    }
+
+    #[test]
+    fn decodes_supported_tiled_payload_to_typed_values() {
+        let blob = synthetic_v4_ushort_tiled_raw_blob();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.data_type, DataType::UShort);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.mask.count_valid_bits(), 4);
+        assert_eq!(decoded.data, DecodedData::UShort(vec![100, 200, 300, 400]));
+    }
+
+    #[test]
+    fn decodes_supported_one_sweep_and_const_payloads() {
+        let valid = [1, 1, 1, 1, 1, 1];
+        let mut ranges = Vec::new();
+        for value in [-1.0f32, 10.0] {
+            ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        let values = [1.25f32, 2.5, 3.75, 4.0, 5.5, 6.25];
+        let mut payload = Vec::new();
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let one_sweep = synthetic_v4_one_sweep_blob(DataType::Float, 1, &valid, &ranges, &payload);
+        let decoded = decode_lerc2_supported(&one_sweep).unwrap();
+        assert_eq!(decoded.data, DecodedData::Float(values.to_vec()));
+
+        let const_blob = synthetic_v4_const_blob();
+        let decoded = decode_lerc2_supported(&const_blob).unwrap();
+        assert_eq!(decoded.data, DecodedData::UChar(vec![7, 7, 7, 7]));
+    }
+
+    #[test]
+    fn reports_unsupported_huffman_fixture_in_dispatcher() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        assert!(decode_lerc2_supported(&blob).is_err());
     }
 
     #[test]

@@ -2,8 +2,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    decode_typed_values, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
-    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    compute_checksum_fletcher32, decode_lerc2_supported, decode_typed_values,
+    get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
     validate_lerc2_checksum, BitMask, BitStuffer2, DataType, Rle,
 };
 
@@ -106,6 +107,9 @@ fn main() {
     bench("lerc2-tiled-diff-v5-synthetic", 100_000, || {
         black_box(read_lerc2_tiled_payload(black_box(&tiled_diff_blob)).unwrap());
     });
+    bench("lerc2-supported-decode-v4-synthetic", 100_000, || {
+        black_box(decode_lerc2_supported(black_box(&one_sweep_blob)).unwrap());
+    });
 
     std::thread::sleep(Duration::from_millis(1));
 }
@@ -145,6 +149,7 @@ fn synthetic_v4_tiled_raw_blob() -> Vec<u8> {
         blob.push(0);
         blob.extend_from_slice(payload);
     }
+    set_lerc2_checksum(&mut blob);
     blob
 }
 
@@ -210,6 +215,7 @@ fn synthetic_v5_tiled_diff_blob() -> Vec<u8> {
     for block in blocks {
         blob.extend_from_slice(&block);
     }
+    set_lerc2_checksum(&mut blob);
     blob
 }
 
@@ -266,6 +272,7 @@ fn synthetic_v4_tiled_blocks(
     for block in blocks {
         blob.extend_from_slice(block);
     }
+    set_lerc2_checksum(&mut blob);
     blob
 }
 
@@ -302,6 +309,7 @@ fn synthetic_v4_one_sweep_blob() -> Vec<u8> {
     blob.extend_from_slice(&range_bytes);
     blob.push(1);
     blob.extend_from_slice(&payload);
+    set_lerc2_checksum(&mut blob);
     blob
 }
 
@@ -334,5 +342,11 @@ fn synthetic_v4_min_max_blob() -> Vec<u8> {
     blob.extend_from_slice(&40.0f64.to_le_bytes());
     blob.extend_from_slice(&0i32.to_le_bytes());
     blob.extend_from_slice(&range_bytes);
+    set_lerc2_checksum(&mut blob);
     blob
+}
+
+fn set_lerc2_checksum(blob: &mut [u8]) {
+    let checksum = compute_checksum_fletcher32(&blob[14..]);
+    blob[10..14].copy_from_slice(&checksum.to_le_bytes());
 }
