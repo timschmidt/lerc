@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 
 use lerc::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-    decode_lerc2_supported_into, decode_typed_values, get_lerc2_data_ranges, get_lerc2_header_info,
-    get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
-    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
-    DataType, DecodeIntoSpec, Rle,
+    decode_lerc2_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
+    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    validate_lerc2_checksum, BitMask, BitStuffer2, DataType, DecodeIntoSpec, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -41,6 +41,8 @@ fn main() {
         "/../testData/bluemarble_256_256_3_byte.lerc2"
     ))
     .unwrap();
+    let mut blob_info_array = [0u32; 11];
+    let mut blob_range_array = [0.0f64; 3];
     let min_max_blob = synthetic_v4_min_max_blob();
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let mut one_sweep_bands_blob = one_sweep_blob.clone();
@@ -99,6 +101,16 @@ fn main() {
     });
     bench("lerc2-info-aggregate-3-band", 50_000, || {
         black_box(get_lerc_info(black_box(&lerc2_blob)).unwrap());
+    });
+    bench("lerc2-blob-info-arrays-3-band", 50_000, || {
+        black_box(
+            get_lerc2_blob_info_arrays(
+                black_box(&lerc2_blob),
+                Some(black_box(&mut blob_info_array)),
+                Some(black_box(&mut blob_range_array)),
+            )
+            .unwrap(),
+        );
     });
     bench("lerc2-data-ranges-3-band", 50_000, || {
         black_box(get_lerc2_data_ranges(black_box(&lerc2_blob)).unwrap());

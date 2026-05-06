@@ -18,6 +18,10 @@ use crate::{BitMask, BitStuffer2, Rle};
 pub const CURRENT_VERSION: i32 = 6;
 /// ASCII file key that starts every Lerc2 blob.
 pub const FILE_KEY: &[u8; 6] = b"Lerc2 ";
+/// Number of integers currently produced by the C API blob-info array.
+pub const BLOB_INFO_ARRAY_LEN: usize = 11;
+/// Number of doubles currently produced by the C API data-range summary array.
+pub const BLOB_DATA_RANGE_ARRAY_LEN: usize = 3;
 const CHECKSUM_START_OFFSET: usize = FILE_KEY.len() + 4 + 4;
 
 /// Parsed Lerc2 header fields.
@@ -888,6 +892,57 @@ pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
     }
     if info.n_uses_no_data_value > 0 {
         info.n_uses_no_data_value = info.n_bands;
+    }
+
+    Ok(info)
+}
+
+/// Fills C API-style blob info and data-range arrays for Lerc2 blobs.
+///
+/// `info_array`, when provided, is zeroed and then filled up to its length with
+/// `{ version, dataType, nDepth, nCols, nRows, nBands, nValidPixels, blobSize,
+/// nMasks, nDepth, nUsesNoDataValue }`.
+///
+/// `data_range_array`, when provided, is zeroed and then filled up to its length
+/// with `{ zMin, zMax, maxZErrorUsed }`. For multi-depth blobs with no-data
+/// sentinels, `zMin` and `zMax` are reported as `-1.0`, matching the public C
+/// API behavior.
+pub fn get_lerc2_blob_info_arrays(
+    blob: &[u8],
+    info_array: Option<&mut [u32]>,
+    data_range_array: Option<&mut [f64]>,
+) -> Result<LercInfo> {
+    let info = get_lerc_info(blob)?;
+
+    if let Some(info_array) = info_array {
+        info_array.fill(0);
+        let values = [
+            info.version as u32,
+            info.data_type as u32,
+            info.n_depth as u32,
+            info.n_cols as u32,
+            info.n_rows as u32,
+            info.n_bands as u32,
+            info.num_valid_pixel as u32,
+            info.blob_size as u32,
+            info.n_masks as u32,
+            info.n_depth as u32,
+            info.n_uses_no_data_value as u32,
+        ];
+        let len = info_array.len().min(values.len());
+        info_array[..len].copy_from_slice(&values[..len]);
+    }
+
+    if let Some(data_range_array) = data_range_array {
+        data_range_array.fill(0.0);
+        let uses_no_data = info.n_depth > 1 && info.n_uses_no_data_value > 0;
+        let values = [
+            if uses_no_data { -1.0 } else { info.z_min },
+            if uses_no_data { -1.0 } else { info.z_max },
+            info.max_z_error,
+        ];
+        let len = data_range_array.len().min(values.len());
+        data_range_array[..len].copy_from_slice(&values[..len]);
     }
 
     Ok(info)
@@ -1868,10 +1923,11 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        decode_lerc2_supported_into, get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, DecodeIntoSpec, FILE_KEY,
+        decode_lerc2_supported_into, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+        get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
+        read_lerc2_tiled_raw, validate_lerc2_checksum, DecodeIntoSpec, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -2284,6 +2340,41 @@ mod tests {
         assert_eq!(info.max_z_error, 0.5);
         assert_eq!(info.z_min, 0.0);
         assert_eq!(info.z_max, 255.0);
+    }
+
+    #[test]
+    fn fills_c_api_style_blob_info_arrays() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        let mut info_array = [123u32; BLOB_INFO_ARRAY_LEN + 2];
+        let mut range_array = [123.0f64; BLOB_DATA_RANGE_ARRAY_LEN + 2];
+        let info = get_lerc2_blob_info_arrays(&blob, Some(&mut info_array), Some(&mut range_array))
+            .unwrap();
+
+        assert_eq!(info.n_bands, 3);
+        assert_eq!(
+            &info_array[..BLOB_INFO_ARRAY_LEN],
+            &[3, 1, 1, 256, 256, 3, 43_008, blob.len() as u32, 1, 1, 0]
+        );
+        assert_eq!(&info_array[BLOB_INFO_ARRAY_LEN..], &[0, 0]);
+        assert_eq!(
+            &range_array[..BLOB_DATA_RANGE_ARRAY_LEN],
+            &[0.0, 255.0, 0.5]
+        );
+        assert_eq!(&range_array[BLOB_DATA_RANGE_ARRAY_LEN..], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn fills_partial_blob_info_arrays_and_no_data_range_sentinels() {
+        let blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let mut info_array = [123u32; 4];
+        let mut range_array = [123.0f64; 2];
+
+        let info = get_lerc2_blob_info_arrays(&blob, Some(&mut info_array), Some(&mut range_array))
+            .unwrap();
+
+        assert_eq!(info.n_uses_no_data_value, 1);
+        assert_eq!(info_array, [6, DataType::UChar as u32, 2, 3]);
+        assert_eq!(range_array, [-1.0, -1.0]);
     }
 
     #[test]
