@@ -11,7 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! Lerc2 metadata readers and supported-subset decoders.
 
 use crate::types::{DataType, EncodeSpec, LercError, Result};
-use crate::{decode_lerc1, decode_typed_values, read_lerc1_z_stats, DecodedData, CNT_Z_IMAGE_KEY};
+use crate::{decode_lerc1_bands, decode_typed_values, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -2486,13 +2486,21 @@ pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
 }
 
 fn get_lerc1_data_ranges(blob: &[u8]) -> Result<DataRanges> {
-    let (_, _, stats) = read_lerc1_z_stats(blob)?;
+    let decoded = decode_lerc1_bands(blob)?;
     Ok(DataRanges {
-        mins: vec![stats.z_min as f64],
-        maxs: vec![stats.z_max as f64],
-        n_bands: 1,
+        mins: decoded
+            .stats
+            .iter()
+            .map(|stats| stats.z_min as f64)
+            .collect(),
+        maxs: decoded
+            .stats
+            .iter()
+            .map(|stats| stats.z_max as f64)
+            .collect(),
+        n_bands: decoded.n_bands,
         n_depth: 1,
-        bytes_consumed: stats.bytes_consumed,
+        bytes_consumed: decoded.bytes_consumed,
     })
 }
 
@@ -2827,13 +2835,13 @@ fn decode_lerc1_supported_into(
     data_output: &mut [u8],
     mask_output: Option<&mut [u8]>,
 ) -> Result<DecodeIntoResult> {
-    let decoded = decode_lerc1(blob)?;
+    let decoded = decode_lerc1_bands(blob)?;
     if spec.data_type != DataType::Float
         || spec.n_depth != 1
-        || spec.n_bands != 1
+        || spec.n_bands != decoded.n_bands
         || spec.n_cols != decoded.header.n_cols as usize
         || spec.n_rows != decoded.header.n_rows as usize
-        || !(spec.n_masks == 0 || spec.n_masks == 1)
+        || !(spec.n_masks == 0 || spec.n_masks == 1 || spec.n_masks == decoded.n_bands)
     {
         return Err(LercError::WrongParam("Lerc1 decode shape/type mismatch"));
     }
@@ -2841,11 +2849,18 @@ fn decode_lerc1_supported_into(
     let data_bytes_written = DecodedData::Float(decoded.values).write_le_bytes(data_output)?;
     let mask_bytes_written = if let Some(mask_output) = mask_output {
         let byte_mask = decoded.mask_info.mask.to_byte_mask();
-        if mask_output.len() < byte_mask.len() {
+        let required_len = byte_mask
+            .len()
+            .checked_mul(spec.n_masks)
+            .ok_or(LercError::WrongParam("Lerc1 mask output size overflow"))?;
+        if mask_output.len() < required_len {
             return Err(LercError::BufferTooSmall);
         }
-        mask_output[..byte_mask.len()].copy_from_slice(&byte_mask);
-        byte_mask.len()
+        for band in 0..spec.n_masks {
+            let start = band * byte_mask.len();
+            mask_output[start..start + byte_mask.len()].copy_from_slice(&byte_mask);
+        }
+        required_len
     } else {
         0
     };
@@ -3057,21 +3072,35 @@ pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
 }
 
 fn get_lerc1_info(blob: &[u8]) -> Result<LercInfo> {
-    let (header, mask, stats) = read_lerc1_z_stats(blob)?;
+    let decoded = decode_lerc1_bands(blob)?;
+    let z_min = decoded
+        .stats
+        .iter()
+        .map(|stats| stats.z_min)
+        .fold(f32::INFINITY, f32::min);
+    let z_max = decoded
+        .stats
+        .iter()
+        .map(|stats| stats.z_max)
+        .fold(f32::NEG_INFINITY, f32::max);
     Ok(LercInfo {
         version: 0,
         n_depth: 1,
-        n_cols: header.n_cols,
-        n_rows: header.n_rows,
-        num_valid_pixel: stats.num_valid_pixels as i32,
-        n_bands: 1,
-        blob_size: stats.bytes_consumed as i32,
-        n_masks: if mask.all_valid { 0 } else { 1 },
+        n_cols: decoded.header.n_cols,
+        n_rows: decoded.header.n_rows,
+        num_valid_pixel: decoded
+            .stats
+            .first()
+            .map(|stats| stats.num_valid_pixels as i32)
+            .unwrap_or(0),
+        n_bands: decoded.n_bands as i32,
+        blob_size: decoded.bytes_consumed as i32,
+        n_masks: if decoded.mask_info.all_valid { 0 } else { 1 },
         n_uses_no_data_value: 0,
         data_type: DataType::Float,
-        z_min: stats.z_min as f64,
-        z_max: stats.z_max as f64,
-        max_z_error: header.max_z_error,
+        z_min: z_min as f64,
+        z_max: z_max as f64,
+        max_z_error: decoded.header.max_z_error,
     })
 }
 

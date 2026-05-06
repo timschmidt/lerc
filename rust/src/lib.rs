@@ -41,8 +41,9 @@ pub use data::types;
 pub use format::lerc1;
 pub use format::lerc2;
 pub use lerc1::{
-    decode_lerc1, get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats, DecodedLerc1,
-    Lerc1HeaderInfo, Lerc1MaskInfo, Lerc1PartInfo, Lerc1ZStats, CNT_Z_IMAGE_KEY,
+    decode_lerc1, decode_lerc1_bands, get_lerc1_header_info, read_lerc1_count_mask,
+    read_lerc1_z_stats, DecodedLerc1, DecodedLerc1Bands, Lerc1HeaderInfo, Lerc1MaskInfo,
+    Lerc1PartInfo, Lerc1ZStats, CNT_Z_IMAGE_KEY,
 };
 pub use lerc2::{
     compute_checksum_fletcher32, compute_lerc2_data_ranges_for_encode,

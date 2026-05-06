@@ -95,6 +95,26 @@ pub struct DecodedLerc1 {
     pub bytes_consumed: usize,
 }
 
+/// Decoded legacy Lerc1 bands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedLerc1Bands {
+    /// Parsed first-band Lerc1 header metadata.
+    pub header: Lerc1HeaderInfo,
+    /// Decoded shared valid-pixel mask metadata.
+    pub mask_info: Lerc1MaskInfo,
+    /// Decoded band-major float values.
+    ///
+    /// Invalid pixels are left as `0.0`; callers should consult
+    /// [`mask_info`](Self::mask_info) before using a pixel value.
+    pub values: Vec<f32>,
+    /// Per-band z-value statistics.
+    pub stats: Vec<Lerc1ZStats>,
+    /// Number of bands decoded.
+    pub n_bands: usize,
+    /// Number of bytes consumed through all decoded bands.
+    pub bytes_consumed: usize,
+}
+
 /// Reads and validates the legacy Lerc1 `CntZImage` header and part headers.
 ///
 /// This is a decode-free structural reader. Use [`read_lerc1_count_mask`],
@@ -102,6 +122,25 @@ pub struct DecodedLerc1 {
 /// or decoded pixel values are needed.
 pub fn get_lerc1_header_info(blob: &[u8]) -> Result<Lerc1HeaderInfo> {
     let mut reader = Reader::new(blob);
+    let (version, n_rows, n_cols, max_z_error) = read_lerc1_common_header(&mut reader)?;
+    let count_part = read_part_info(&mut reader)?;
+    reader.skip_payload(count_part.num_bytes as usize)?;
+    let z_part = read_part_info(&mut reader)?;
+    reader.skip_payload(z_part.num_bytes as usize)?;
+
+    Ok(Lerc1HeaderInfo {
+        version,
+        n_rows,
+        n_cols,
+        max_z_error,
+        data_type: DataType::Float,
+        count_part,
+        z_part,
+        blob_size: reader.pos,
+    })
+}
+
+fn read_lerc1_common_header(reader: &mut Reader<'_>) -> Result<(i32, i32, i32, f64)> {
     if reader.read_bytes(CNT_Z_IMAGE_KEY.len())? != CNT_Z_IMAGE_KEY {
         return Err(LercError::CorruptInput("missing Lerc1 CntZImage key"));
     }
@@ -119,21 +158,7 @@ pub fn get_lerc1_header_info(blob: &[u8]) -> Result<Lerc1HeaderInfo> {
         return Err(LercError::CorruptInput("invalid Lerc1 dimensions"));
     }
 
-    let count_part = read_part_info(&mut reader)?;
-    reader.skip_payload(count_part.num_bytes as usize)?;
-    let z_part = read_part_info(&mut reader)?;
-    reader.skip_payload(z_part.num_bytes as usize)?;
-
-    Ok(Lerc1HeaderInfo {
-        version,
-        n_rows,
-        n_cols,
-        max_z_error,
-        data_type: DataType::Float,
-        count_part,
-        z_part,
-        blob_size: reader.pos,
-    })
+    Ok((version, n_rows, n_cols, max_z_error))
 }
 
 /// Reads the legacy Lerc1 count part as a valid-pixel mask.
@@ -318,6 +343,107 @@ pub fn decode_lerc1(blob: &[u8]) -> Result<DecodedLerc1> {
         mask_info,
         values,
         bytes_consumed,
+    })
+}
+
+/// Decodes one or more legacy Lerc1 bands into band-major `f32` pixels.
+///
+/// Legacy multi-band Lerc1 stores the first band as a full `CntZImage` with a
+/// count/mask part and stores following bands as z-only `CntZImage` blobs that
+/// reuse the first band mask. Invalid pixels are represented in the shared mask
+/// and left as `0.0` in each returned band.
+pub fn decode_lerc1_bands(blob: &[u8]) -> Result<DecodedLerc1Bands> {
+    let first = decode_lerc1(blob)?;
+    let pixel_count = (first.header.n_cols as usize)
+        .checked_mul(first.header.n_rows as usize)
+        .ok_or(LercError::CorruptInput("Lerc1 pixel count overflow"))?;
+    let first_stats =
+        lerc1_z_stats_from_values(&first.values, &first.mask_info.mask, first.bytes_consumed)?;
+    let mut values = first.values;
+    let mut stats = vec![first_stats];
+    let mut offset = first.bytes_consumed;
+
+    while offset < blob.len() {
+        let (header, band_values, band_stats, consumed) =
+            decode_lerc1_z_only_band(&blob[offset..], &first.mask_info.mask)?;
+        if header.n_cols != first.header.n_cols
+            || header.n_rows != first.header.n_rows
+            || header.max_z_error != first.header.max_z_error
+        {
+            return Err(LercError::CorruptInput(
+                "concatenated Lerc1 header mismatch",
+            ));
+        }
+        if band_values.len() != pixel_count {
+            return Err(LercError::CorruptInput("Lerc1 band size mismatch"));
+        }
+        values.extend_from_slice(&band_values);
+        stats.push(band_stats);
+        offset += consumed;
+    }
+
+    Ok(DecodedLerc1Bands {
+        header: first.header,
+        mask_info: first.mask_info,
+        values,
+        n_bands: stats.len(),
+        stats,
+        bytes_consumed: offset,
+    })
+}
+
+fn decode_lerc1_z_only_band(
+    blob: &[u8],
+    mask: &BitMask,
+) -> Result<(Lerc1HeaderInfo, Vec<f32>, Lerc1ZStats, usize)> {
+    let info = get_lerc1_z_only_header_info(blob)?;
+    let mut values = vec![0.0f32; (info.n_cols as usize) * (info.n_rows as usize)];
+    let mut writer = ZValueWriter {
+        values: &mut values,
+    };
+    let bytes_consumed = read_lerc1_z_tiles(&info, mask, blob, &mut writer)?;
+    let stats = lerc1_z_stats_from_values(&values, mask, bytes_consumed)?;
+    Ok((info, values, stats, bytes_consumed))
+}
+
+fn lerc1_z_stats_from_values(
+    values: &[f32],
+    mask: &BitMask,
+    bytes_consumed: usize,
+) -> Result<Lerc1ZStats> {
+    if values.len() != mask.pixel_count() {
+        return Err(LercError::CorruptInput("Lerc1 value/mask size mismatch"));
+    }
+    let mut stats = ZStatsBuilder::default();
+    for (idx, value) in values.iter().copied().enumerate() {
+        if mask.is_valid(idx)? {
+            stats.add_value(value);
+        }
+    }
+    stats.finish(bytes_consumed)
+}
+
+fn get_lerc1_z_only_header_info(blob: &[u8]) -> Result<Lerc1HeaderInfo> {
+    let mut reader = Reader::new(blob);
+    let (version, n_rows, n_cols, max_z_error) = read_lerc1_common_header(&mut reader)?;
+    let z_part = read_part_info(&mut reader)?;
+    reader.skip_payload(z_part.num_bytes as usize)?;
+
+    Ok(Lerc1HeaderInfo {
+        version,
+        n_rows,
+        n_cols,
+        max_z_error,
+        data_type: DataType::Float,
+        count_part: Lerc1PartInfo {
+            num_tiles_vert: 0,
+            num_tiles_hori: 0,
+            num_bytes: 0,
+            max_value: 0.0,
+            payload_offset: reader.pos,
+        },
+        z_part,
+        blob_size: reader.pos,
     })
 }
 
@@ -586,8 +712,14 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_lerc1, get_lerc1_header_info, read_lerc1_count_mask, read_lerc1_z_stats};
-    use crate::{BitStuffer2, DataType};
+    use super::{
+        decode_lerc1, decode_lerc1_bands, get_lerc1_header_info, read_lerc1_count_mask,
+        read_lerc1_z_stats,
+    };
+    use crate::{
+        decode_lerc_supported_into, get_lerc2_data_ranges, get_lerc_info, BitStuffer2, DataType,
+        DecodeIntoSpec,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -623,6 +755,48 @@ mod tests {
         blob.extend_from_slice(&1i32.to_le_bytes());
         blob.extend_from_slice(&0i32.to_le_bytes());
         blob.extend_from_slice(&0.0f32.to_le_bytes());
+        blob
+    }
+
+    fn raw_z_tile(values: &[f32]) -> Vec<u8> {
+        let mut payload = vec![0u8];
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload
+    }
+
+    fn append_lerc1_common_header(blob: &mut Vec<u8>, n_cols: i32, n_rows: i32) {
+        blob.extend_from_slice(super::CNT_Z_IMAGE_KEY);
+        blob.extend_from_slice(&11i32.to_le_bytes());
+        blob.extend_from_slice(&8i32.to_le_bytes());
+        blob.extend_from_slice(&n_rows.to_le_bytes());
+        blob.extend_from_slice(&n_cols.to_le_bytes());
+        blob.extend_from_slice(&0.1f64.to_le_bytes());
+    }
+
+    fn append_lerc1_z_part(blob: &mut Vec<u8>, z_payload: &[u8], z_max: f32) {
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&(z_payload.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&z_max.to_le_bytes());
+        blob.extend_from_slice(z_payload);
+    }
+
+    fn synthetic_lerc1_two_band_blob() -> Vec<u8> {
+        let first_z = raw_z_tile(&[1.0, 2.0, 3.0, 4.0]);
+        let second_z = raw_z_tile(&[10.0, 20.0, 30.0, 40.0]);
+        let mut blob = Vec::new();
+
+        append_lerc1_common_header(&mut blob, 2, 2);
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        append_lerc1_z_part(&mut blob, &first_z, 4.0);
+
+        append_lerc1_common_header(&mut blob, 2, 2);
+        append_lerc1_z_part(&mut blob, &second_z, 40.0);
         blob
     }
 
@@ -733,6 +907,58 @@ mod tests {
         assert_eq!(invalid_non_zero, 0);
         assert_eq!(z_min, -27.458_635);
         assert_eq!(z_max, 5474.173);
+    }
+
+    #[test]
+    fn decodes_concatenated_lerc1_z_only_bands() {
+        let blob = synthetic_lerc1_two_band_blob();
+        let decoded = decode_lerc1_bands(&blob).unwrap();
+
+        assert_eq!(decoded.n_bands, 2);
+        assert_eq!(decoded.header.n_cols, 2);
+        assert_eq!(decoded.header.n_rows, 2);
+        assert_eq!(decoded.mask_info.mask.count_valid_bits(), 4);
+        assert_eq!(decoded.values, [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(decoded.stats[0].z_min, 1.0);
+        assert_eq!(decoded.stats[0].z_max, 4.0);
+        assert_eq!(decoded.stats[1].z_min, 10.0);
+        assert_eq!(decoded.stats[1].z_max, 40.0);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn reports_and_decodes_concatenated_lerc1_bands_through_supported_dispatch() {
+        let blob = synthetic_lerc1_two_band_blob();
+        let info = get_lerc_info(&blob).unwrap();
+        let ranges = get_lerc2_data_ranges(&blob).unwrap();
+        let spec = DecodeIntoSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let mut data = vec![0u8; spec.data_byte_len().unwrap()];
+        let mut mask = vec![0u8; spec.mask_byte_len().unwrap()];
+        let decoded = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(info.version, 0);
+        assert_eq!(info.n_bands, 2);
+        assert_eq!(info.blob_size as usize, blob.len());
+        assert_eq!(info.z_min, 1.0);
+        assert_eq!(info.z_max, 40.0);
+        assert_eq!(ranges.n_bands, 2);
+        assert_eq!(ranges.mins, [1.0, 10.0]);
+        assert_eq!(ranges.maxs, [4.0, 40.0]);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.mask_bytes_written, 4);
+        assert_eq!(mask, [1, 1, 1, 1]);
+        let expected = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(data, expected);
     }
 
     #[test]
