@@ -42,7 +42,10 @@ pub mod types;
 pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
 pub use decoded::{decode_typed_values, DecodedData};
-pub use lerc1::{get_lerc1_header_info, Lerc1HeaderInfo, Lerc1PartInfo, CNT_Z_IMAGE_KEY};
+pub use lerc1::{
+    get_lerc1_header_info, read_lerc1_count_mask, Lerc1HeaderInfo, Lerc1MaskInfo, Lerc1PartInfo,
+    CNT_Z_IMAGE_KEY,
+};
 pub use lerc2::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
     decode_lerc2_supported_into, decode_lerc2_supported_with_previous, get_lerc2_blob_info_arrays,

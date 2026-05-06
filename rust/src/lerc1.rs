@@ -11,6 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! Legacy Lerc1 metadata readers.
 
 use crate::types::{DataType, LercError, Result};
+use crate::{BitMask, Rle};
 
 /// ASCII type string that starts legacy Lerc1 `CntZImage` blobs.
 pub const CNT_Z_IMAGE_KEY: &[u8; 10] = b"CntZImage ";
@@ -54,6 +55,17 @@ pub struct Lerc1HeaderInfo {
     pub blob_size: usize,
 }
 
+/// Decoded legacy Lerc1 count mask metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lerc1MaskInfo {
+    /// Decoded valid-pixel mask.
+    pub mask: BitMask,
+    /// Number of bytes consumed through the count/mask payload.
+    pub bytes_consumed: usize,
+    /// True when every represented pixel is valid.
+    pub all_valid: bool,
+}
+
 /// Reads and validates the legacy Lerc1 `CntZImage` header and part headers.
 ///
 /// This is a decode-free metadata reader. Full Lerc1 tile decoding is still
@@ -93,6 +105,45 @@ pub fn get_lerc1_header_info(blob: &[u8]) -> Result<Lerc1HeaderInfo> {
         z_part,
         blob_size: reader.pos,
     })
+}
+
+/// Reads the legacy Lerc1 count part as a valid-pixel mask.
+///
+/// This covers the non-tiled count-part form used by the checked-in Lerc1
+/// fixture: either a constant count value or an RLE-compressed packed bit mask.
+/// Tiled Lerc1 count payloads are left for the full legacy tile decoder.
+pub fn read_lerc1_count_mask(blob: &[u8]) -> Result<(Lerc1HeaderInfo, Lerc1MaskInfo)> {
+    let info = get_lerc1_header_info(blob)?;
+    if info.count_part.num_tiles_vert != 0 || info.count_part.num_tiles_hori != 0 {
+        return Err(LercError::Unsupported("tiled Lerc1 count parts"));
+    }
+
+    let mut mask = BitMask::new(info.n_cols as usize, info.n_rows as usize)?;
+    if info.count_part.num_bytes == 0 {
+        if info.count_part.max_value > 0.0 {
+            mask.set_all_valid();
+        }
+    } else {
+        let payload_start = info.count_part.payload_offset;
+        let payload_end = payload_start
+            .checked_add(info.count_part.num_bytes as usize)
+            .ok_or(LercError::CorruptInput("Lerc1 count payload overflow"))?;
+        let payload = blob
+            .get(payload_start..payload_end)
+            .ok_or(LercError::BufferTooSmall)?;
+        Rle::decompress_into(payload, mask.bits_mut())?;
+    }
+
+    let all_valid = mask.count_valid_bits() == mask.pixel_count();
+    let bytes_consumed = info.count_part.payload_offset + info.count_part.num_bytes as usize;
+    Ok((
+        info,
+        Lerc1MaskInfo {
+            mask,
+            bytes_consumed,
+            all_valid,
+        },
+    ))
 }
 
 fn read_part_info(reader: &mut Reader<'_>) -> Result<Lerc1PartInfo> {
@@ -155,7 +206,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_lerc1_header_info;
+    use super::{get_lerc1_header_info, read_lerc1_count_mask};
     use crate::DataType;
     use std::fs;
     use std::path::PathBuf;
@@ -189,6 +240,19 @@ mod tests {
         assert_eq!(info.z_part.num_bytes, 61_880);
         assert_eq!(info.z_part.max_value, 5474.173);
         assert_eq!(info.z_part.payload_offset, 1638);
+    }
+
+    #[test]
+    fn reads_world_lerc1_count_mask() {
+        let blob = fixture("world.lerc1");
+        let (header, mask_info) = read_lerc1_count_mask(&blob).unwrap();
+
+        assert_eq!(header.n_cols, 257);
+        assert_eq!(header.n_rows, 257);
+        assert_eq!(mask_info.bytes_consumed, 1622);
+        assert_eq!(mask_info.mask.byte_len(), 8257);
+        assert_eq!(mask_info.mask.count_valid_bits(), 65_025);
+        assert!(!mask_info.all_valid);
     }
 
     #[test]
