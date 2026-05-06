@@ -43,6 +43,8 @@ fn main() {
     .unwrap();
     let mut blob_info_array = [0u32; 11];
     let mut blob_range_array = [0.0f64; 3];
+    let mut data_range_mins = [0.0f64; 3];
+    let mut data_range_maxs = [0.0f64; 3];
     let min_max_blob = synthetic_v4_min_max_blob();
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let mut one_sweep_bands_blob = one_sweep_blob.clone();
@@ -114,6 +116,18 @@ fn main() {
     });
     bench("lerc2-data-ranges-3-band", 50_000, || {
         black_box(get_lerc2_data_ranges(black_box(&lerc2_blob)).unwrap());
+    });
+    bench("ffi-get-data-ranges-3-band", 50_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_getDataRanges(
+                black_box(lerc2_blob.as_ptr()),
+                lerc2_blob.len() as u32,
+                1,
+                3,
+                black_box(data_range_mins.as_mut_ptr()),
+                black_box(data_range_maxs.as_mut_ptr()),
+            )
+        });
     });
     bench("lerc2-mask-read-first-band", 10_000, || {
         black_box(read_lerc2_mask(black_box(&lerc2_blob)).unwrap());

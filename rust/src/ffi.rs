@@ -10,7 +10,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 //! C ABI entry points backed by the safe Rust implementation.
 
-use crate::{get_lerc2_blob_info_arrays, ErrCode};
+use crate::{get_lerc2_blob_info_arrays, get_lerc2_data_ranges, ErrCode};
 use core::slice;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -44,6 +44,31 @@ pub unsafe extern "C" fn lerc_getBlobInfo(
             info_array_size,
             data_range_array_size,
         )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_getDataRanges`.
+///
+/// This function currently supports Lerc2 blobs handled by the Rust metadata
+/// parser. It writes minima and maxima in band-major, depth-minor order.
+///
+/// # Safety
+///
+/// `p_lerc_blob` must point to `blob_size` readable bytes. `p_mins` and
+/// `p_maxs` must point to writable arrays with at least `n_depth * n_bands`
+/// elements.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_getDataRanges(
+    p_lerc_blob: *const u8,
+    blob_size: u32,
+    n_depth: i32,
+    n_bands: i32,
+    p_mins: *mut f64,
+    p_maxs: *mut f64,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_get_data_ranges_impl(p_lerc_blob, blob_size, n_depth, n_bands, p_mins, p_maxs)
     }))
     .unwrap_or(ErrCode::Failed as u32)
 }
@@ -82,9 +107,50 @@ unsafe fn lerc_get_blob_info_impl(
     }
 }
 
+unsafe fn lerc_get_data_ranges_impl(
+    p_lerc_blob: *const u8,
+    blob_size: u32,
+    n_depth: i32,
+    n_bands: i32,
+    p_mins: *mut f64,
+    p_maxs: *mut f64,
+) -> u32 {
+    if p_lerc_blob.is_null()
+        || blob_size == 0
+        || p_mins.is_null()
+        || p_maxs.is_null()
+        || n_depth <= 0
+        || n_bands <= 0
+    {
+        return ErrCode::WrongParam as u32;
+    }
+
+    let capacity = match (n_depth as usize).checked_mul(n_bands as usize) {
+        Some(capacity) => capacity,
+        None => return ErrCode::BufferTooSmall as u32,
+    };
+    let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
+
+    match get_lerc2_data_ranges(blob) {
+        Ok(ranges) => {
+            if ranges.mins.len() > capacity || ranges.maxs.len() > capacity {
+                return ErrCode::BufferTooSmall as u32;
+            }
+
+            let mins = unsafe { slice::from_raw_parts_mut(p_mins, capacity) };
+            let maxs = unsafe { slice::from_raw_parts_mut(p_maxs, capacity) };
+            mins[..ranges.mins.len()].copy_from_slice(&ranges.mins);
+            maxs[..ranges.maxs.len()].copy_from_slice(&ranges.maxs);
+            ErrCode::Ok as u32
+        }
+        Err(err) => err.err_code() as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::lerc_getBlobInfo;
+    use super::lerc_getDataRanges;
     use crate::{DataType, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN};
     use std::fs;
     use std::path::PathBuf;
@@ -163,5 +229,82 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::WrongParam as u32);
+    }
+
+    #[test]
+    fn c_abi_get_data_ranges_fills_arrays() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        let mut mins = [123.0f64; 3];
+        let mut maxs = [123.0f64; 3];
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                3,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mins, [0.0, 0.0, 0.0]);
+        assert_eq!(maxs, [255.0, 255.0, 255.0]);
+    }
+
+    #[test]
+    fn c_abi_get_data_ranges_rejects_invalid_arguments() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        let mut mins = [0.0f64; 3];
+        let mut maxs = [0.0f64; 3];
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                ptr::null(),
+                blob.len() as u32,
+                1,
+                3,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                3,
+                ptr::null_mut(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                0,
+                3,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                2,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::BufferTooSmall as u32);
     }
 }
