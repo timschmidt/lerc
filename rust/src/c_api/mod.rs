@@ -760,14 +760,12 @@ unsafe fn try_encode_supported_blob(
         (spec, data, mask_bytes)
     };
 
-    if version < 4 && spec.n_bands != 1 {
-        return Ok(None);
-    }
     match encode_lerc2_auto(spec, data, max_z_err, mask_bytes, version) {
         Ok(blob) => Ok(Some(blob)),
-        Err(LercError::WrongParam("one-sweep Lerc2 encode requires version 4 or newer")) => {
+        Err(LercError::WrongParam("one-sweep Lerc2 encode requires version 2 or newer")) => {
             Ok(None)
         }
+        Err(LercError::WrongParam("pre-v4 Lerc2 encode can only store depth 1")) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -1604,10 +1602,10 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_encode_unsupported_old_version_zeroes_output_counters_and_fails() {
+    fn c_abi_encode_supports_pre_v4_one_sweep_version() {
         let data = [1u8, 2, 3, 4, 5, 6];
         let mut num_bytes = 123u32;
-        let mut out = [0u8; 64];
+        let mut out = [0u8; 128];
         let mut written = 123u32;
 
         let status = unsafe {
@@ -1625,8 +1623,8 @@ mod tests {
                 &mut num_bytes,
             )
         };
-        assert_eq!(status, ErrCode::Failed as u32);
-        assert_eq!(num_bytes, 0);
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert!(num_bytes > 0);
 
         let status = unsafe {
             lerc_encodeForVersion(
@@ -1645,8 +1643,14 @@ mod tests {
                 &mut written,
             )
         };
-        assert_eq!(status, ErrCode::Failed as u32);
-        assert_eq!(written, 0);
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(written, num_bytes);
+
+        let info = get_lerc_info(&out[..written as usize]).unwrap();
+        assert_eq!(info.version, 3);
+        assert_eq!(info.n_depth, 1);
+        assert_eq!(info.n_cols, 3);
+        assert_eq!(info.n_rows, 2);
     }
 
     #[test]

@@ -826,10 +826,11 @@ fn compute_lerc2_data_ranges_for_encode_with_mask(
 
 /// Encodes a single-band Lerc2 blob using the one-sweep payload layout.
 ///
-/// This safe fallback encoder writes version 4 and newer blobs only. It
-/// computes per-depth min/max ranges from the input bytes, writes the header,
-/// mask, range section, and uncompressed one-sweep payload, then finalizes the
-/// version 3+ checksum.
+/// This safe fallback encoder writes version 2 and newer blobs. Version 2 and
+/// 3 blobs are limited by the Lerc2 header layout to single-depth data. Version
+/// 4 and newer blobs also carry per-depth min/max ranges. The encoder computes
+/// ranges from the input bytes, writes the header, mask, optional range section,
+/// and uncompressed one-sweep payload, then finalizes the version 3+ checksum.
 pub fn encode_lerc2_one_sweep(
     spec: EncodeSpec,
     data: &[u8],
@@ -1817,9 +1818,14 @@ fn encode_lerc2_one_sweep_band(
     no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "one-sweep Lerc2 encode")?;
-    if !(4..=CURRENT_VERSION).contains(&version) {
+    if !(2..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
-            "one-sweep Lerc2 encode requires version 4 or newer",
+            "one-sweep Lerc2 encode requires version 2 or newer",
+        ));
+    }
+    if version < 4 && spec.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 encode can only store depth 1",
         ));
     }
     if no_data.is_some() && version < 6 {
@@ -1870,7 +1876,7 @@ fn encode_lerc2_one_sweep_band(
 
     let encode_mask = encode_partial_mask && mask.count_valid_bits() < spec.n_cols * spec.n_rows;
     let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
-    let ranges_len = if has_valid && header.z_min != header.z_max {
+    let ranges_len = if version >= 4 && has_valid && header.z_min != header.z_max {
         compute_lerc2_min_max_ranges_byte_len(&header)?
     } else {
         0
@@ -7905,6 +7911,33 @@ mod tests {
     }
 
     #[test]
+    fn encodes_pre_v4_one_sweep_lerc2_blob_for_supported_decode_round_trip() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 4,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1, 0, 1], 4, 2).unwrap();
+        let blob = encode_lerc2_one_sweep(spec, &data, 0.0, Some(&mask), 3).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 3);
+        assert_eq!(decoded.header.n_depth, 1);
+        assert!(decoded.ranges.is_none());
+        assert_eq!(decoded.header.max_z_error, 0.5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 0, 3, 4, 5, 6, 0, 8])
+        );
+        assert_eq!(decoded.mask, mask);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+    }
+
+    #[test]
     fn encodes_raw_tiled_lerc2_blob_for_supported_decode_round_trip() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -8329,8 +8362,23 @@ mod tests {
             LercError::WrongParam("Lerc2 encode data length mismatch")
         );
         assert_eq!(
-            encode_lerc2_one_sweep(spec, &data, 0.0, None, 3).unwrap_err(),
-            LercError::WrongParam("one-sweep Lerc2 encode requires version 4 or newer")
+            encode_lerc2_one_sweep(spec, &data, 0.0, None, 1).unwrap_err(),
+            LercError::WrongParam("one-sweep Lerc2 encode requires version 2 or newer")
+        );
+        let non_nan_data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            encode_lerc2_one_sweep(
+                EncodeSpec { n_depth: 2, ..spec },
+                &non_nan_data,
+                0.0,
+                None,
+                3
+            )
+            .unwrap_err(),
+            LercError::WrongParam("pre-v4 Lerc2 encode can only store depth 1")
         );
         assert_eq!(
             encode_lerc2_one_sweep(spec, &data, -0.01, None, 6).unwrap_err(),
