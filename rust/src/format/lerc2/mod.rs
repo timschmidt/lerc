@@ -13,6 +13,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 use crate::types::{DataType, EncodeSpec, LercError, Result};
 use crate::{decode_lerc1, decode_typed_values, read_lerc1_z_stats, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
+use std::collections::HashMap;
 
 /// Highest Lerc2 codec version recognized by this crate.
 pub const CURRENT_VERSION: i32 = 6;
@@ -2203,12 +2204,19 @@ pub fn decode_lerc2_supported_with_previous(
                 return Err(LercError::CorruptInput("invalid Lerc2 image encode mode"));
             }
             if image_mode != 0 {
-                return Err(LercError::Unsupported(
-                    "Lerc2 Huffman-backed image modes are not ported yet",
-                ));
+                if try_huffman_int(&header) {
+                    read_huffman_int_payload(&mut reader, &header, &mask_info.mask, image_mode)?
+                } else {
+                    return Err(LercError::Unsupported(
+                        "Lerc2 floating-point Huffman image modes are not ported yet",
+                    ));
+                }
+            } else {
+                read_tiled_payload(&mut reader, &header, &mask_info.mask, ranges.as_ref())?.data
             }
+        } else {
+            read_tiled_payload(&mut reader, &header, &mask_info.mask, ranges.as_ref())?.data
         }
-        read_tiled_payload(&mut reader, &header, &mask_info.mask, ranges.as_ref())?.data
     };
     let data = decode_lerc2_typed_values(&header, &mask_info.mask, &raw)?;
 
@@ -3463,6 +3471,244 @@ fn try_huffman_float(header: &HeaderInfo) -> bool {
     header.version >= 6
         && matches!(header.data_type, DataType::Float | DataType::Double)
         && header.max_z_error == 0.0
+}
+
+struct HuffmanCodeTable {
+    symbols: HashMap<(u8, u32), i32>,
+    max_len: u8,
+}
+
+fn read_huffman_int_payload(
+    reader: &mut Reader<'_>,
+    header: &HeaderInfo,
+    mask: &BitMask,
+    image_mode: u8,
+) -> Result<Vec<u8>> {
+    if !matches!(image_mode, 1 | 2) {
+        return Err(LercError::Unsupported(
+            "unsupported integer Huffman image mode",
+        ));
+    }
+    if !matches!(header.data_type, DataType::UChar | DataType::Char) {
+        return Err(LercError::Unsupported(
+            "integer Huffman decode requires byte data",
+        ));
+    }
+
+    let table = read_huffman_code_table(reader, header.version)?;
+    let payload_start = reader.pos;
+    let mut bits = HuffmanBitReader::new(&reader.bytes[payload_start..]);
+    let n_rows = header.n_rows as usize;
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+    let mut out = vec![0u8; n_rows * n_cols * n_depth];
+
+    match (header.data_type, image_mode) {
+        (DataType::UChar, 1) => {
+            for i_depth in 0..n_depth {
+                let mut prev = 0u8;
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        let pixel_idx = row * n_cols + col;
+                        let dst = pixel_idx * n_depth + i_depth;
+                        if !mask.is_valid(pixel_idx)? {
+                            continue;
+                        }
+                        let delta = table.decode_symbol(&mut bits)? as u8;
+                        let value = if col > 0 && mask.is_valid(pixel_idx - 1)? {
+                            delta.wrapping_add(prev)
+                        } else if row > 0 && mask.is_valid(pixel_idx - n_cols)? {
+                            delta.wrapping_add(out[dst - n_cols * n_depth])
+                        } else {
+                            delta.wrapping_add(prev)
+                        };
+                        out[dst] = value;
+                        prev = value;
+                    }
+                }
+            }
+        }
+        (DataType::UChar, 2) => {
+            for pixel_idx in 0..(n_rows * n_cols) {
+                if !mask.is_valid(pixel_idx)? {
+                    continue;
+                }
+                let dst = pixel_idx * n_depth;
+                for i_depth in 0..n_depth {
+                    out[dst + i_depth] = table.decode_symbol(&mut bits)? as u8;
+                }
+            }
+        }
+        (DataType::Char, 1) => {
+            for i_depth in 0..n_depth {
+                let mut prev = 0i8;
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        let pixel_idx = row * n_cols + col;
+                        let dst = pixel_idx * n_depth + i_depth;
+                        if !mask.is_valid(pixel_idx)? {
+                            continue;
+                        }
+                        let delta = (table.decode_symbol(&mut bits)? - 128) as i8;
+                        let value = if col > 0 && mask.is_valid(pixel_idx - 1)? {
+                            delta.wrapping_add(prev)
+                        } else if row > 0 && mask.is_valid(pixel_idx - n_cols)? {
+                            delta.wrapping_add(out[dst - n_cols * n_depth] as i8)
+                        } else {
+                            delta.wrapping_add(prev)
+                        };
+                        out[dst] = value as u8;
+                        prev = value;
+                    }
+                }
+            }
+        }
+        (DataType::Char, 2) => {
+            for pixel_idx in 0..(n_rows * n_cols) {
+                if !mask.is_valid(pixel_idx)? {
+                    continue;
+                }
+                let dst = pixel_idx * n_depth;
+                for i_depth in 0..n_depth {
+                    out[dst + i_depth] = (table.decode_symbol(&mut bits)? - 128) as i8 as u8;
+                }
+            }
+        }
+        _ => unreachable!("checked integer Huffman inputs above"),
+    }
+
+    let full_words = bits.bit_pos / 32;
+    let partial_words = usize::from(bits.bit_pos % 32 != 0);
+    let bytes_consumed =
+        (full_words + partial_words + 1)
+            .checked_mul(4)
+            .ok_or(LercError::CorruptInput(
+                "Huffman payload byte count overflow",
+            ))?;
+    if reader.bytes[payload_start..].len() < bytes_consumed {
+        return Err(LercError::BufferTooSmall);
+    }
+    reader.pos = payload_start + bytes_consumed;
+    Ok(out)
+}
+
+fn read_huffman_code_table(
+    reader: &mut Reader<'_>,
+    lerc2_version: i32,
+) -> Result<HuffmanCodeTable> {
+    let version = reader.read_i32_le()?;
+    let size = reader.read_i32_le()?;
+    let i0 = reader.read_i32_le()?;
+    let i1 = reader.read_i32_le()?;
+    if version < 2 || size <= 0 || size >= 65_536 || i0 >= i1 || i0 < 0 {
+        return Err(LercError::CorruptInput("invalid Huffman code table header"));
+    }
+    if huffman_index_wrap(i0, size)? >= size || huffman_index_wrap(i1 - 1, size)? >= size {
+        return Err(LercError::CorruptInput("invalid Huffman code range"));
+    }
+
+    let code_count = (i1 - i0) as usize;
+    let (lengths, consumed) =
+        BitStuffer2::decode(&reader.bytes[reader.pos..], code_count, lerc2_version)?;
+    if lengths.len() != code_count {
+        return Err(LercError::CorruptInput("Huffman code length mismatch"));
+    }
+    reader.pos += consumed;
+
+    let mut code_lengths = vec![0u8; size as usize];
+    for i in i0..i1 {
+        let len = lengths[(i - i0) as usize];
+        if len > 32 {
+            return Err(LercError::CorruptInput("invalid Huffman code length"));
+        }
+        let idx = huffman_index_wrap(i, size)? as usize;
+        code_lengths[idx] = len as u8;
+    }
+
+    let total_bits: usize = code_lengths.iter().map(|&len| len as usize).sum();
+    let code_bytes = total_bits.div_ceil(32) * 4;
+    if reader.bytes.len().saturating_sub(reader.pos) < code_bytes {
+        return Err(LercError::BufferTooSmall);
+    }
+    let mut bit_reader = HuffmanBitReader::new(&reader.bytes[reader.pos..reader.pos + code_bytes]);
+    let mut symbols = HashMap::new();
+    let mut max_len = 0u8;
+    for i in i0..i1 {
+        let idx = huffman_index_wrap(i, size)? as usize;
+        let len = code_lengths[idx];
+        if len == 0 {
+            continue;
+        }
+        let code = bit_reader.read_bits(len)?;
+        max_len = max_len.max(len);
+        if symbols.insert((len, code), idx as i32).is_some() {
+            return Err(LercError::CorruptInput("duplicate Huffman code"));
+        }
+    }
+    reader.pos += code_bytes;
+
+    if symbols.is_empty() || max_len == 0 {
+        return Err(LercError::CorruptInput("empty Huffman code table"));
+    }
+    Ok(HuffmanCodeTable { symbols, max_len })
+}
+
+fn huffman_index_wrap(i: i32, size: i32) -> Result<i32> {
+    let idx = i - if i < size { 0 } else { size };
+    if idx < 0 || idx >= size {
+        return Err(LercError::CorruptInput("invalid wrapped Huffman index"));
+    }
+    Ok(idx)
+}
+
+impl HuffmanCodeTable {
+    fn decode_symbol(&self, bits: &mut HuffmanBitReader<'_>) -> Result<i32> {
+        let mut code = 0u32;
+        for len in 1..=self.max_len {
+            code = (code << 1) | u32::from(bits.read_bit()?);
+            if let Some(&symbol) = self.symbols.get(&(len, code)) {
+                return Ok(symbol);
+            }
+        }
+        Err(LercError::CorruptInput("invalid Huffman payload code"))
+    }
+}
+
+struct HuffmanBitReader<'a> {
+    bytes: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> HuffmanBitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> Result<u8> {
+        Ok(self.read_bits(1)? as u8)
+    }
+
+    fn read_bits(&mut self, len: u8) -> Result<u32> {
+        if len == 0 || len > 32 {
+            return Err(LercError::CorruptInput("invalid Huffman bit width"));
+        }
+        let mut value = 0u32;
+        for _ in 0..len {
+            let word_offset = (self.bit_pos / 32)
+                .checked_mul(4)
+                .ok_or(LercError::CorruptInput("Huffman bit offset overflow"))?;
+            let word = self
+                .bytes
+                .get(word_offset..word_offset + 4)
+                .ok_or(LercError::BufferTooSmall)?;
+            let word = u32::from_le_bytes(word.try_into().unwrap());
+            let bit_in_word = self.bit_pos % 32;
+            let bit = (word << bit_in_word) >> 31;
+            value = (value << 1) | bit;
+            self.bit_pos += 1;
+        }
+        Ok(value)
+    }
 }
 
 fn decode_lerc2_typed_values(
@@ -6503,9 +6749,26 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_huffman_fixture_in_dispatcher() {
+    fn decodes_byte_huffman_fixture_supported_subset() {
         let blob = fixture("bluemarble_256_256_3_byte.lerc2");
-        assert!(decode_lerc2_supported(&blob).is_err());
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.bands.len(), 3);
+        for band in &decoded.bands {
+            assert_eq!(band.header.data_type, DataType::UChar);
+            assert_eq!(band.header.n_cols, 256);
+            assert_eq!(band.header.n_rows, 256);
+            assert_eq!(band.mask.count_valid_bits(), 43_008);
+            match &band.data {
+                DecodedData::UChar(values) => {
+                    assert_eq!(values.len(), 256 * 256);
+                    assert!(values.iter().any(|&value| value == 0));
+                    assert!(values.iter().any(|&value| value == 255));
+                }
+                other => panic!("expected byte decoded data, got {other:?}"),
+            }
+        }
     }
 
     #[test]

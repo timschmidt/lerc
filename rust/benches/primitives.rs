@@ -197,6 +197,8 @@ fn main() {
     let mut ffi_float_fixture_mask = vec![0; 160_000];
     let mut ffi_float_fixture_double_data = vec![0.0f64; 160_000];
     let mut ffi_float_fixture_double_mask = vec![0; 160_000];
+    let mut ffi_byte_huffman_fixture_data = vec![0u8; 256 * 256 * 3];
+    let mut ffi_byte_huffman_fixture_mask = vec![0; 256 * 256];
     let mut ffi_lerc1_data = vec![0.0f32; 257 * 257];
     let mut ffi_lerc1_mask = vec![0; 257 * 257];
     let mut ffi_lerc1_double_data = vec![0.0f64; 257 * 257];
@@ -413,6 +415,9 @@ fn main() {
     });
     bench("lerc2-supported-decode-float-fixture", 100, || {
         black_box(decode_lerc2_supported(black_box(&float_fixture_blob)).unwrap());
+    });
+    bench("lerc2-supported-decode-byte-huffman-fixture", 100, || {
+        black_box(decode_lerc2_bands_supported(black_box(&lerc2_blob)).unwrap());
     });
     bench("lerc2-supported-write-data-bytes", 100_000, || {
         black_box(
@@ -929,6 +934,22 @@ fn main() {
                 1,
                 DataType::Float as u32,
                 black_box(ffi_float_fixture_data.as_mut_ptr().cast()),
+            )
+        });
+    });
+    bench("ffi-decode-byte-huffman-fixture", 100, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decode(
+                black_box(lerc2_blob.as_ptr()),
+                lerc2_blob.len() as u32,
+                1,
+                black_box(ffi_byte_huffman_fixture_mask.as_mut_ptr()),
+                1,
+                256,
+                256,
+                3,
+                DataType::UChar as u32,
+                black_box(ffi_byte_huffman_fixture_data.as_mut_ptr().cast()),
             )
         });
     });

@@ -1295,9 +1295,10 @@ mod tests {
         lerc_getDataRanges,
     };
     use crate::{
-        compute_checksum_fletcher32, decode_lerc2_supported, encode_lerc2_uncompressed,
-        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info, DataType, DecodedData,
-        ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
+        encode_lerc2_uncompressed, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+        get_lerc_info, DataType, DecodedData, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2332,6 +2333,36 @@ mod tests {
         assert!((data[67] - 1443.2926).abs() < 0.0001);
         assert!((data[68] - 1330.419).abs() < 0.0001);
         assert!((data[435] - 181.57863).abs() < 0.0001);
+    }
+
+    #[test]
+    fn c_abi_decode_byte_huffman_fixture_writes_data_and_mask() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        let expected = decode_lerc2_bands_supported(&blob).unwrap();
+        let mut expected_data = vec![0u8; expected.data_byte_len()];
+        expected.write_data_le_bytes(&mut expected_data).unwrap();
+
+        let mut data = vec![0u8; 256 * 256 * 3];
+        let mut mask = vec![0u8; 256 * 256];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                256,
+                256,
+                3,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 43_008);
+        assert_eq!(data, expected_data);
     }
 
     #[test]
