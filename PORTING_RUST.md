@@ -28,8 +28,9 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added a safe `get_lerc2_blob_info_arrays` helper that fills C API-style blob info and quick data-range arrays from Lerc2 metadata.
 - Added the first Rust C ABI entry point, `lerc_getBlobInfo`, backed by the safe metadata array helper and guarded with a panic boundary.
 - Added the Rust C ABI entry point `lerc_getDataRanges`, backed by the safe Lerc2 data-range aggregator and guarded with a panic boundary.
+- Added the Rust C ABI entry point `lerc_decode` for the supported Lerc2 decode subset, backed by the safe decode-into layer and guarded with a panic boundary.
 - Configured the Rust crate to build `rlib`, `cdylib`, and `staticlib` outputs.
-- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, checked decoded output copying, C API-style decode-into validation, C API-style blob info arrays, the `lerc_getBlobInfo` and `lerc_getDataRanges` C ABI wrappers, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, high-level supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
+- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, checked decoded output copying, C API-style decode-into validation, C API-style blob info arrays, the `lerc_getBlobInfo`, `lerc_getDataRanges`, and `lerc_decode` C ABI wrappers, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, high-level supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -47,6 +48,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - `get_lerc2_blob_info_arrays` mirrors the truncation-tolerant output-array behavior of `lerc_getBlobInfo`, including zero-filling caller arrays and reporting `-1` quick ranges for multi-depth no-data blobs.
 - The Rust `lerc_getBlobInfo` C ABI currently supports Lerc2 metadata only. It validates null pointers and sizes like the C++ API, maps Rust errors to C status codes, and catches panics before returning `ErrCode::Failed`.
 - The Rust `lerc_getDataRanges` C ABI currently supports Lerc2 metadata only. It validates null pointers and caller capacity like the C++ API, maps Rust errors to C status codes, and catches panics before returning `ErrCode::Failed`.
+- The Rust `lerc_decode` C ABI currently supports the same non-Huffman Lerc2 subset as `decode_lerc2_supported_into`. It validates shape, data type, mask count, and raw output pointers like the C++ API, and returns `HasNoData` for regular non-4D decode when multi-depth no-data metadata is present.
 - Lerc2 previous-mask reuse is explicit in Rust via `read_lerc2_mask_with_previous`; calling `read_lerc2_mask` on a blob that omits a partial mask returns an unsupported error.
 - Public Rust APIs return `Result<T, LercError>` instead of bool/status pairs. C-compatible FFI wrappers should be added after the safe Rust codec surface is stable.
 - Public Rust documentation is docs.rs-ready under `cargo doc --no-deps`; missing public documentation is a compile error.
@@ -76,7 +78,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
    - Add floating point quantization and max error checks.
 6. Add FFI surface.
    - Continue mirroring `src/LercLib/include/Lerc_c_api.h` status codes and data type integers.
-   - Use `decode_lerc2_supported_into` as the internal boundary for `lerc_decode`-style functions.
+   - Add `lerc_decodeToDouble` and 4D decode wrappers once the no-data reporting arrays are represented safely.
+   - Add unsupported stubs or encode implementations for compute-size and encode entry points.
    - Keep panic boundaries explicit with C ABI tests.
 
 ## Verification Commands
@@ -91,9 +94,9 @@ cargo bench --bench rle_bit_stuffer
 Last run in this branch:
 
 - `cargo check`: passed with `#![deny(missing_docs)]` enabled.
-- `cargo test`: passed, 57 unit tests.
+- `cargo test`: passed, 59 unit tests.
 - `cargo doc --no-deps`: passed and generated crate documentation.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, v6 supported-subset no-data decode, and C API-style supported decode-into-buffer validation.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, Lerc2 metadata parsing, C API-style blob info array filling, Lerc2 data-range aggregation, C ABI data-range retrieval, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, v6 supported-subset no-data decode, C API-style supported decode-into-buffer validation, and C ABI decode.
 
 ## Open Risks
 

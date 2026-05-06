@@ -10,7 +10,11 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 //! C ABI entry points backed by the safe Rust implementation.
 
-use crate::{get_lerc2_blob_info_arrays, get_lerc2_data_ranges, ErrCode};
+use crate::{
+    decode_lerc2_supported_into, get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info,
+    DataType, DecodeIntoSpec, ErrCode, LercError,
+};
+use core::ffi::c_void;
 use core::slice;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -69,6 +73,47 @@ pub unsafe extern "C" fn lerc_getDataRanges(
 ) -> u32 {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_get_data_ranges_impl(p_lerc_blob, blob_size, n_depth, n_bands, p_mins, p_maxs)
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_decode` for the currently supported Lerc2 subset.
+///
+/// Decoded data is written in the caller-requested native LERC scalar type and
+/// band-major order. Valid-pixel bytes are written when `n_masks` is nonzero.
+///
+/// # Safety
+///
+/// `p_lerc_blob` must point to `blob_size` readable bytes. `p_data` must point
+/// to writable storage for `n_depth * n_cols * n_rows * n_bands` values of
+/// `data_type`. When `n_masks` is nonzero, `p_valid_bytes` must point to
+/// writable storage for `n_cols * n_rows * n_masks` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_decode(
+    p_lerc_blob: *const u8,
+    blob_size: u32,
+    n_masks: i32,
+    p_valid_bytes: *mut u8,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    data_type: u32,
+    p_data: *mut c_void,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_decode_impl(
+            p_lerc_blob,
+            blob_size,
+            n_masks,
+            p_valid_bytes,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            data_type,
+            p_data,
+        )
     }))
     .unwrap_or(ErrCode::Failed as u32)
 }
@@ -147,11 +192,99 @@ unsafe fn lerc_get_data_ranges_impl(
     }
 }
 
+unsafe fn lerc_decode_impl(
+    p_lerc_blob: *const u8,
+    blob_size: u32,
+    n_masks: i32,
+    p_valid_bytes: *mut u8,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    data_type: u32,
+    p_data: *mut c_void,
+) -> u32 {
+    if p_lerc_blob.is_null()
+        || blob_size == 0
+        || p_data.is_null()
+        || n_depth <= 0
+        || n_cols <= 0
+        || n_rows <= 0
+        || n_bands <= 0
+        || !(n_masks == 0 || n_masks == 1 || n_masks == n_bands)
+        || (n_masks > 0 && p_valid_bytes.is_null())
+    {
+        return ErrCode::WrongParam as u32;
+    }
+
+    let data_type_id = data_type;
+    let data_type = match DataType::try_from(data_type_id as i32) {
+        Ok(data_type) if data_type as u32 == data_type_id => data_type,
+        _ => return ErrCode::WrongParam as u32,
+    };
+    let spec = DecodeIntoSpec {
+        data_type,
+        n_depth: n_depth as usize,
+        n_cols: n_cols as usize,
+        n_rows: n_rows as usize,
+        n_bands: n_bands as usize,
+        n_masks: n_masks as usize,
+    };
+
+    let data_len = match decoded_data_byte_len(spec) {
+        Ok(len) => len,
+        Err(err) => return err.err_code() as u32,
+    };
+    let mask_len = match decoded_mask_byte_len(spec) {
+        Ok(len) => len,
+        Err(err) => return err.err_code() as u32,
+    };
+
+    let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
+    match get_lerc_info(blob) {
+        Ok(info) if info.n_uses_no_data_value > 0 && n_depth > 1 => {
+            return ErrCode::HasNoData as u32;
+        }
+        Ok(_) => {}
+        Err(err) => return err.err_code() as u32,
+    }
+
+    let data_output = unsafe { slice::from_raw_parts_mut(p_data.cast::<u8>(), data_len) };
+    let mut mask_output = if n_masks > 0 {
+        Some(unsafe { slice::from_raw_parts_mut(p_valid_bytes, mask_len) })
+    } else {
+        None
+    };
+
+    match decode_lerc2_supported_into(blob, spec, data_output, mask_output.as_deref_mut()) {
+        Ok(_) => ErrCode::Ok as u32,
+        Err(err) => err.err_code() as u32,
+    }
+}
+
+fn decoded_data_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
+    spec.n_bands
+        .checked_mul(spec.n_rows)
+        .and_then(|count| count.checked_mul(spec.n_cols))
+        .and_then(|count| count.checked_mul(spec.n_depth))
+        .and_then(|count| count.checked_mul(spec.data_type.size_in_bytes()))
+        .ok_or(LercError::WrongParam("decode output byte count overflow"))
+}
+
+fn decoded_mask_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
+    spec.n_masks
+        .checked_mul(spec.n_rows)
+        .and_then(|count| count.checked_mul(spec.n_cols))
+        .ok_or(LercError::WrongParam("decode mask byte count overflow"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::lerc_getBlobInfo;
-    use super::lerc_getDataRanges;
-    use crate::{DataType, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN};
+    use super::{lerc_decode, lerc_getBlobInfo, lerc_getDataRanges};
+    use crate::{
+        compute_checksum_fletcher32, DataType, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::ptr;
@@ -306,5 +439,121 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::BufferTooSmall as u32);
+    }
+
+    #[test]
+    fn c_abi_decode_writes_data_and_mask() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0u8; 6];
+        let mut mask = [0u8; 6];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(data, [7; 6]);
+        assert_eq!(mask, [1; 6]);
+    }
+
+    #[test]
+    fn c_abi_decode_rejects_invalid_arguments() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0u8; 6];
+        let mut mask = [0u8; 6];
+
+        let status = unsafe {
+            lerc_decode(
+                ptr::null(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                ptr::null_mut(),
+                1,
+                3,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                2,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                99,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+    }
+
+    fn synthetic_v4_const_blob() -> Vec<u8> {
+        let header_size = 6 + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size = header_size + 4;
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(b"Lerc2 ");
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [2, 3, 1, 6, 2, blob_size as i32, DataType::UChar as i32] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.0f64.to_le_bytes());
+        blob.extend_from_slice(&7.0f64.to_le_bytes());
+        blob.extend_from_slice(&7.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        let checksum = compute_checksum_fletcher32(&blob[14..]);
+        blob[10..14].copy_from_slice(&checksum.to_le_bytes());
+        blob
     }
 }
