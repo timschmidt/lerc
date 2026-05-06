@@ -12,9 +12,10 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 use crate::{
     decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
-    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info, BitMask, DataType,
-    DecodeIntoSpec, EncodeSpec, ErrCode, LercError,
+    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+    encode_lerc2_one_sweep_bands_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    get_lerc2_no_data_info, get_lerc_info, BitMask, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
+    LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -564,16 +565,14 @@ unsafe fn lerc_compute_compressed_size_impl(
     if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
         return ErrCode::WrongParam as u32;
     }
-    if unsafe { encode_uses_no_data(spec.n_bands, p_uses_no_data) } {
-        return ErrCode::Failed as u32;
-    }
-
     match try_encode_supported_blob(
         p_data,
         spec,
         p_valid_bytes,
         max_z_err,
         normalize_encode_version(codec_version),
+        p_uses_no_data,
+        no_data_values,
     ) {
         Ok(Some(blob)) => match u32::try_from(blob.len()) {
             Ok(len) => {
@@ -633,16 +632,14 @@ unsafe fn lerc_encode_impl(
     if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
         return ErrCode::WrongParam as u32;
     }
-    if unsafe { encode_uses_no_data(spec.n_bands, p_uses_no_data) } {
-        return ErrCode::Failed as u32;
-    }
-
     match try_encode_supported_blob(
         p_data,
         spec,
         p_valid_bytes,
         max_z_err,
         normalize_encode_version(codec_version),
+        p_uses_no_data,
+        no_data_values,
     ) {
         Ok(Some(blob)) => {
             if blob.len() > out_buffer_size as usize {
@@ -718,6 +715,8 @@ unsafe fn try_encode_supported_blob(
     p_valid_bytes: *const u8,
     max_z_err: f64,
     version: i32,
+    p_uses_no_data: Option<*const u8>,
+    no_data_values: Option<*const f64>,
 ) -> crate::Result<Option<Vec<u8>>> {
     let data = unsafe { slice::from_raw_parts(p_data.cast::<u8>(), spec.data_byte_len()?) };
     let mask_bytes = if spec.n_masks > 0 {
@@ -725,6 +724,33 @@ unsafe fn try_encode_supported_blob(
     } else {
         None
     };
+    let uses_no_data = unsafe { encode_uses_no_data_slice(spec.n_bands, p_uses_no_data) };
+    let no_data_values = if uses_no_data
+        .as_ref()
+        .is_some_and(|uses| uses.iter().any(|&v| v != 0))
+    {
+        no_data_values.map(|ptr| unsafe { slice::from_raw_parts(ptr, spec.n_bands) })
+    } else {
+        None
+    };
+
+    if let Some(uses_no_data) = uses_no_data.as_ref() {
+        if uses_no_data.iter().any(|&uses| uses != 0) {
+            if version < 6 || spec.n_depth <= 1 {
+                return Ok(None);
+            }
+            return encode_lerc2_one_sweep_bands_with_no_data(
+                spec,
+                data,
+                max_z_err,
+                mask_bytes,
+                Some(uses_no_data),
+                no_data_values,
+                version,
+            )
+            .map(Some);
+        }
+    }
 
     if spec.n_bands != 1 {
         if version < 4 {
@@ -795,17 +821,18 @@ fn validate_no_data_inputs(
     }
 }
 
-unsafe fn encode_uses_no_data(n_bands: usize, p_uses_no_data: Option<*const u8>) -> bool {
+unsafe fn encode_uses_no_data_slice(
+    n_bands: usize,
+    p_uses_no_data: Option<*const u8>,
+) -> Option<&'static [u8]> {
     let Some(ptr) = p_uses_no_data else {
-        return false;
+        return None;
     };
     if ptr.is_null() {
-        return false;
+        return None;
     }
 
-    unsafe { slice::from_raw_parts(ptr, n_bands) }
-        .iter()
-        .any(|&value| value != 0)
+    Some(unsafe { slice::from_raw_parts(ptr, n_bands) })
 }
 
 unsafe fn lerc_get_blob_info_impl(
@@ -1210,8 +1237,8 @@ mod tests {
     };
     use crate::{
         compute_checksum_fletcher32, decode_lerc2_supported, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, DataType, DecodedData, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN,
+        get_lerc2_data_ranges, get_lerc_info, DataType, DecodedData, ErrCode,
+        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1958,6 +1985,42 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
         );
+    }
+
+    #[test]
+    fn c_abi_4d_encode_supports_active_no_data_metadata() {
+        let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
+        let uses_no_data = [1u8];
+        let no_data_values = [255.0f64];
+        let mut out = [0u8; 192];
+        let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        let info = get_lerc_info(&out[..written as usize]).unwrap();
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+        assert_eq!(info.n_uses_no_data_value, 1);
     }
 
     #[test]

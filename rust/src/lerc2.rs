@@ -666,7 +666,7 @@ pub fn encode_lerc2_one_sweep(
     mask: Option<&BitMask>,
     version: i32,
 ) -> Result<Vec<u8>> {
-    encode_lerc2_one_sweep_band(spec, data, max_z_error, mask, version, 0, true)
+    encode_lerc2_one_sweep_band(spec, data, max_z_error, mask, version, 0, true, None)
 }
 
 fn encode_lerc2_one_sweep_band(
@@ -677,6 +677,7 @@ fn encode_lerc2_one_sweep_band(
     version: i32,
     n_blobs_more: i32,
     encode_partial_mask: bool,
+    no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "one-sweep Lerc2 encode")?;
     if max_z_error < 0.0 {
@@ -685,6 +686,16 @@ fn encode_lerc2_one_sweep_band(
     if !(4..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
             "one-sweep Lerc2 encode requires version 4 or newer",
+        ));
+    }
+    if no_data.is_some() && version < 6 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires version 6 or newer",
+        ));
+    }
+    if no_data.is_some() && spec.n_depth <= 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
 
@@ -709,7 +720,7 @@ fn encode_lerc2_one_sweep_band(
         micro_block_size: 8,
         blob_size: 1,
         n_blobs_more,
-        b_pass_no_data_values: 0,
+        b_pass_no_data_values: u8::from(no_data.is_some()),
         b_is_int: u8::from(data_values_are_integer(spec.data_type, data)?),
         b_reserved_3: 0,
         b_reserved_4: 0,
@@ -717,8 +728,8 @@ fn encode_lerc2_one_sweep_band(
         max_z_error,
         z_min: if has_valid { z_min } else { 0.0 },
         z_max: if has_valid { z_max } else { 0.0 },
-        no_data_val: 0.0,
-        no_data_val_orig: 0.0,
+        no_data_val: no_data.map(|values| values.0).unwrap_or(0.0),
+        no_data_val_orig: no_data.map(|values| values.1).unwrap_or(0.0),
         header_size,
     };
 
@@ -770,6 +781,25 @@ pub fn encode_lerc2_one_sweep_bands(
     masks: Option<&[u8]>,
     version: i32,
 ) -> Result<Vec<u8>> {
+    encode_lerc2_one_sweep_bands_with_no_data(spec, data, max_z_error, masks, None, None, version)
+}
+
+/// Encodes band-major data as concatenated one-sweep Lerc2 blobs with no-data metadata.
+///
+/// This helper carries version 6+ no-data metadata for bands whose
+/// `uses_no_data` entry is nonzero. The source data is expected to already
+/// contain the per-band no-data sentinel value wherever no-data should be
+/// preserved; this does not yet implement the C++ encoder's sentinel
+/// replacement heuristics.
+pub fn encode_lerc2_one_sweep_bands_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "one-sweep Lerc2 band encode")?;
     if max_z_error < 0.0 {
         return Err(LercError::WrongParam("max_z_error must be nonnegative"));
@@ -779,6 +809,7 @@ pub fn encode_lerc2_one_sweep_bands(
             "one-sweep Lerc2 encode requires version 4 or newer",
         ));
     }
+    validate_encode_no_data_inputs(spec, uses_no_data, no_data_values, version)?;
 
     let band_spec = EncodeSpec {
         n_bands: 1,
@@ -834,6 +865,11 @@ pub fn encode_lerc2_one_sweep_bands(
         } else {
             0
         };
+        let no_data = uses_no_data
+            .and_then(|uses| uses.get(band).copied())
+            .filter(|&uses| uses != 0)
+            .and_then(|_| no_data_values.and_then(|values| values.get(band).copied()))
+            .map(|value| (value, value));
 
         let band_blob = encode_lerc2_one_sweep_band(
             band_spec,
@@ -843,6 +879,7 @@ pub fn encode_lerc2_one_sweep_bands(
             version,
             n_blobs_more,
             encode_mask,
+            no_data,
         )?;
         blob.extend_from_slice(&band_blob);
         previous_mask = mask;
@@ -1968,6 +2005,45 @@ fn validate_encode_bands_inputs(
     Ok(())
 }
 
+fn validate_encode_no_data_inputs(
+    spec: EncodeSpec,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<()> {
+    let Some(uses_no_data) = uses_no_data else {
+        return Ok(());
+    };
+    if uses_no_data.len() != spec.n_bands {
+        return Err(LercError::WrongParam(
+            "Lerc2 encode no-data use count does not match band count",
+        ));
+    }
+    if uses_no_data.iter().all(|&uses| uses == 0) {
+        return Ok(());
+    }
+    if version < 6 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires version 6 or newer",
+        ));
+    }
+    if spec.n_depth <= 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires depth greater than 1",
+        ));
+    }
+    let no_data_values = no_data_values.ok_or(LercError::WrongParam(
+        "Lerc2 encode no-data values are required",
+    ))?;
+    if no_data_values.len() != spec.n_bands {
+        return Err(LercError::WrongParam(
+            "Lerc2 encode no-data value count does not match band count",
+        ));
+    }
+
+    Ok(())
+}
+
 fn effective_encode_mask(spec: EncodeSpec, mask: Option<&BitMask>) -> Result<BitMask> {
     if let Some(mask) = mask {
         return Ok(mask.clone());
@@ -2959,7 +3035,8 @@ mod tests {
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
         decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
         decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
-        encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, finalize_lerc2_checksum,
+        encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        encode_lerc2_one_sweep_bands_with_no_data, finalize_lerc2_checksum,
         get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
         get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
@@ -4108,6 +4185,42 @@ mod tests {
         assert_eq!(
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 20, 0, 0, 50, 60])
+        );
+    }
+
+    #[test]
+    fn encodes_one_sweep_lerc2_bands_with_no_data_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
+        let blob = encode_lerc2_one_sweep_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[255.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        let no_data = get_lerc2_no_data_info(&blob, 1).unwrap();
+
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 255.0);
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+        assert_eq!(no_data.uses_no_data, [1]);
+        assert_eq!(no_data.no_data_values, [255.0]);
+        assert_eq!(
+            get_lerc2_data_ranges(&blob).unwrap_err(),
+            LercError::HasNoData
         );
     }
 
