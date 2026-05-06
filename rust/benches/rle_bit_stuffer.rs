@@ -91,6 +91,10 @@ fn main() {
     let mut ffi_float_fixture_mask = vec![0; 160_000];
     let mut ffi_float_fixture_double_data = vec![0.0f64; 160_000];
     let mut ffi_float_fixture_double_mask = vec![0; 160_000];
+    let mut ffi_lerc1_data = vec![0.0f32; 257 * 257];
+    let mut ffi_lerc1_mask = vec![0; 257 * 257];
+    let mut ffi_lerc1_double_data = vec![0.0f64; 257 * 257];
+    let mut ffi_lerc1_double_mask = vec![0; 257 * 257];
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
@@ -149,6 +153,37 @@ fn main() {
     });
     bench("lerc1-decode-float-values", 1_000, || {
         black_box(decode_lerc1(black_box(&lerc1_blob)).unwrap());
+    });
+    bench("ffi-decode-lerc1", 1_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decode(
+                black_box(lerc1_blob.as_ptr()),
+                lerc1_blob.len() as u32,
+                1,
+                black_box(ffi_lerc1_mask.as_mut_ptr()),
+                1,
+                257,
+                257,
+                1,
+                DataType::Float as u32,
+                black_box(ffi_lerc1_data.as_mut_ptr().cast()),
+            )
+        });
+    });
+    bench("ffi-decode-to-double-lerc1", 1_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decodeToDouble(
+                black_box(lerc1_blob.as_ptr()),
+                lerc1_blob.len() as u32,
+                1,
+                black_box(ffi_lerc1_double_mask.as_mut_ptr()),
+                1,
+                257,
+                257,
+                1,
+                black_box(ffi_lerc1_double_data.as_mut_ptr()),
+            )
+        });
     });
     bench("lerc1-info", 1_000, || {
         black_box(get_lerc_info(black_box(&lerc1_blob)).unwrap());

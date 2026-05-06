@@ -11,9 +11,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! C ABI entry points backed by the safe Rust implementation.
 
 use crate::{
-    decode_lerc2_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, DataType, DecodeIntoSpec, ErrCode,
-    LercError,
+    decode_lerc1, decode_lerc2_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, DataType, DecodeIntoSpec,
+    DecodedData, ErrCode, LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -351,7 +351,7 @@ pub unsafe extern "C" fn lerc_getDataRanges(
     .unwrap_or(ErrCode::Failed as u32)
 }
 
-/// C ABI equivalent of `lerc_decode` for the currently supported Lerc2 subset.
+/// C ABI equivalent of `lerc_decode` for the currently supported decode subset.
 ///
 /// Decoded data is written in the caller-requested native LERC scalar type and
 /// band-major order. Valid-pixel bytes are written when `n_masks` is nonzero.
@@ -392,7 +392,7 @@ pub unsafe extern "C" fn lerc_decode(
     .unwrap_or(ErrCode::Failed as u32)
 }
 
-/// C ABI equivalent of `lerc_decodeToDouble` for the supported Lerc2 subset.
+/// C ABI equivalent of `lerc_decodeToDouble` for the supported decode subset.
 ///
 /// Decoded values are converted to 64-bit floating point values in band-major
 /// order. Valid-pixel bytes are written when `n_masks` is nonzero.
@@ -431,7 +431,7 @@ pub unsafe extern "C" fn lerc_decodeToDouble(
     .unwrap_or(ErrCode::Failed as u32)
 }
 
-/// C ABI equivalent of `lerc_decode_4D` for the supported Lerc2 subset.
+/// C ABI equivalent of `lerc_decode_4D` for the supported decode subset.
 ///
 /// This is equivalent to [`lerc_decode`] but can report version 6+ no-data
 /// metadata through `p_uses_no_data` and `no_data_values`.
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn lerc_decode_4D(
     .unwrap_or(ErrCode::Failed as u32)
 }
 
-/// C ABI equivalent of `lerc_decodeToDouble_4D` for the supported Lerc2 subset.
+/// C ABI equivalent of `lerc_decodeToDouble_4D` for the supported decode subset.
 ///
 /// This is equivalent to [`lerc_decodeToDouble`] but can report version 6+
 /// no-data metadata through `p_uses_no_data` and `no_data_values`.
@@ -771,13 +771,13 @@ unsafe fn lerc_decode_impl(
     };
 
     let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
-    match get_lerc_info(blob) {
+    let info = match get_lerc_info(blob) {
         Ok(info) if info.n_uses_no_data_value > 0 && n_depth > 1 => {
             return ErrCode::HasNoData as u32;
         }
-        Ok(_) => {}
+        Ok(info) => info,
         Err(err) => return err.err_code() as u32,
-    }
+    };
 
     let data_output = unsafe { slice::from_raw_parts_mut(p_data.cast::<u8>(), data_len) };
     let mut mask_output = if n_masks > 0 {
@@ -786,7 +786,12 @@ unsafe fn lerc_decode_impl(
         None
     };
 
-    match decode_lerc2_supported_into(blob, spec, data_output, mask_output.as_deref_mut()) {
+    let result = if info.version == 0 {
+        decode_lerc1_into(blob, spec, data_output, mask_output.as_deref_mut())
+    } else {
+        decode_lerc2_supported_into(blob, spec, data_output, mask_output.as_deref_mut()).map(|_| ())
+    };
+    match result {
         Ok(_) => ErrCode::Ok as u32,
         Err(err) => err.err_code() as u32,
     }
@@ -858,11 +863,15 @@ unsafe fn lerc_decode_4d_impl(
     } else {
         None
     };
-    let status =
-        match decode_lerc2_supported_into(blob, spec, data_output, mask_output.as_deref_mut()) {
-            Ok(_) => ErrCode::Ok as u32,
-            Err(err) => err.err_code() as u32,
-        };
+    let result = if info.version == 0 {
+        decode_lerc1_into(blob, spec, data_output, mask_output.as_deref_mut())
+    } else {
+        decode_lerc2_supported_into(blob, spec, data_output, mask_output.as_deref_mut()).map(|_| ())
+    };
+    let status = match result {
+        Ok(_) => ErrCode::Ok as u32,
+        Err(err) => err.err_code() as u32,
+    };
     if status != ErrCode::Ok as u32 {
         return status;
     }
@@ -940,15 +949,16 @@ unsafe fn lerc_decode_to_double_impl(
     } else {
         None
     };
-    let decoded =
-        match decode_lerc2_supported_into(blob, spec, &mut native_data, mask_output.as_deref_mut())
-        {
-            Ok(_) => match decode_typed_values(info.data_type, &native_data) {
-                Ok(decoded) => decoded,
-                Err(err) => return err.err_code() as u32,
-            },
-            Err(err) => return err.err_code() as u32,
-        };
+    let decoded = match decode_native_into_typed(
+        blob,
+        spec,
+        info.version,
+        &mut native_data,
+        mask_output.as_deref_mut(),
+    ) {
+        Ok(decoded) => decoded,
+        Err(err) => return err.err_code() as u32,
+    };
 
     let output = unsafe { slice::from_raw_parts_mut(p_data, value_count) };
     match decoded.write_f64_values(output) {
@@ -1022,15 +1032,16 @@ unsafe fn lerc_decode_to_double_4d_impl(
     } else {
         None
     };
-    let decoded =
-        match decode_lerc2_supported_into(blob, spec, &mut native_data, mask_output.as_deref_mut())
-        {
-            Ok(_) => match decode_typed_values(info.data_type, &native_data) {
-                Ok(decoded) => decoded,
-                Err(err) => return err.err_code() as u32,
-            },
-            Err(err) => return err.err_code() as u32,
-        };
+    let decoded = match decode_native_into_typed(
+        blob,
+        spec,
+        info.version,
+        &mut native_data,
+        mask_output.as_deref_mut(),
+    ) {
+        Ok(decoded) => decoded,
+        Err(err) => return err.err_code() as u32,
+    };
     let output = unsafe { slice::from_raw_parts_mut(p_data, value_count) };
     if let Err(err) = decoded.write_f64_values(output) {
         return err.err_code() as u32;
@@ -1071,6 +1082,50 @@ fn decoded_mask_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
         .checked_mul(spec.n_rows)
         .and_then(|count| count.checked_mul(spec.n_cols))
         .ok_or(LercError::WrongParam("decode mask byte count overflow"))
+}
+
+fn decode_native_into_typed(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    version: i32,
+    data_output: &mut [u8],
+    mask_output: Option<&mut [u8]>,
+) -> crate::Result<DecodedData> {
+    if version == 0 {
+        decode_lerc1_into(blob, spec, data_output, mask_output)?;
+    } else {
+        decode_lerc2_supported_into(blob, spec, data_output, mask_output)?;
+    }
+    decode_typed_values(spec.data_type, data_output)
+}
+
+fn decode_lerc1_into(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data_output: &mut [u8],
+    mask_output: Option<&mut [u8]>,
+) -> crate::Result<()> {
+    let decoded = decode_lerc1(blob)?;
+    if spec.data_type != DataType::Float
+        || spec.n_depth != 1
+        || spec.n_bands != 1
+        || spec.n_cols != decoded.header.n_cols as usize
+        || spec.n_rows != decoded.header.n_rows as usize
+        || !(spec.n_masks == 0 || spec.n_masks == 1)
+    {
+        return Err(LercError::WrongParam("Lerc1 decode shape/type mismatch"));
+    }
+
+    DecodedData::Float(decoded.values).write_le_bytes(data_output)?;
+    if let Some(mask_output) = mask_output {
+        let byte_mask = decoded.mask_info.mask.to_byte_mask();
+        if mask_output.len() < byte_mask.len() {
+            return Err(LercError::BufferTooSmall);
+        }
+        mask_output[..byte_mask.len()].copy_from_slice(&byte_mask);
+    }
+
+    Ok(())
 }
 
 fn write_no_data_info(
@@ -1123,6 +1178,30 @@ mod tests {
         path.push("testData");
         path.push(name);
         fs::read(path).unwrap()
+    }
+
+    fn min_max_valid_f32(values: &[f32], mask: &[u8]) -> (f32, f32) {
+        let mut z_min = f32::INFINITY;
+        let mut z_max = f32::NEG_INFINITY;
+        for (&value, &valid) in values.iter().zip(mask.iter()) {
+            if valid != 0 {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            }
+        }
+        (z_min, z_max)
+    }
+
+    fn min_max_valid_f64(values: &[f64], mask: &[u8]) -> (f64, f64) {
+        let mut z_min = f64::INFINITY;
+        let mut z_max = f64::NEG_INFINITY;
+        for (&value, &valid) in values.iter().zip(mask.iter()) {
+            if valid != 0 {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            }
+        }
+        (z_min, z_max)
     }
 
     #[test]
@@ -1827,6 +1906,36 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_decode_legacy_lerc1_writes_data_and_mask() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![123.0f32; 257 * 257];
+        let mut mask = vec![123u8; 257 * 257];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                257,
+                257,
+                1,
+                DataType::Float as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[257 * 257 - 1], 0.0);
+        let (z_min, z_max) = min_max_valid_f32(&data, &mask);
+        assert_eq!(z_min, -27.458_635);
+        assert_eq!(z_max, 5474.173);
+    }
+
+    #[test]
     fn c_abi_decode_to_double_float_fixture_writes_data_and_mask() {
         let blob = fixture("california_400_400_1_float.lerc2");
         let mut data = vec![0.0f64; 160_000];
@@ -1853,6 +1962,69 @@ mod tests {
         assert!((data[67] - 1443.2926).abs() < 0.0001);
         assert!((data[68] - 1330.419).abs() < 0.0001);
         assert!((data[435] - 181.57863).abs() < 0.0001);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_legacy_lerc1_writes_data_and_mask() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![123.0f64; 257 * 257];
+        let mut mask = vec![123u8; 257 * 257];
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                257,
+                257,
+                1,
+                data.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[257 * 257 - 1], 0.0);
+        let (z_min, z_max) = min_max_valid_f64(&data, &mask);
+        assert_eq!(z_min, -27.458_635_330_200_195);
+        assert_eq!(z_max, 5474.172_851_562_5);
+    }
+
+    #[test]
+    fn c_abi_decode_4d_legacy_lerc1_writes_data_and_mask() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![123.0f32; 257 * 257];
+        let mut mask = vec![123u8; 257 * 257];
+        let mut uses_no_data = [123u8; 1];
+        let mut no_data_values = [123.0f64; 1];
+
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                257,
+                257,
+                1,
+                DataType::Float as u32,
+                data.as_mut_ptr().cast(),
+                uses_no_data.as_mut_ptr(),
+                no_data_values.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+        let (z_min, z_max) = min_max_valid_f32(&data, &mask);
+        assert_eq!(z_min, -27.458_635);
+        assert_eq!(z_max, 5474.173);
+        assert_eq!(uses_no_data, [123]);
+        assert_eq!(no_data_values, [123.0]);
     }
 
     #[test]
@@ -1950,6 +2122,39 @@ mod tests {
             data,
             [1.0, 255.0, 2.0, 3.0, 255.0, 4.0, 5.0, 6.0, 7.0, 255.0, 8.0, 9.0]
         );
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_4d_legacy_lerc1_writes_data_and_mask() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![123.0f64; 257 * 257];
+        let mut mask = vec![123u8; 257 * 257];
+        let mut uses_no_data = [123u8; 1];
+        let mut no_data_values = [123.0f64; 1];
+
+        let status = unsafe {
+            lerc_decodeToDouble_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                257,
+                257,
+                1,
+                data.as_mut_ptr(),
+                uses_no_data.as_mut_ptr(),
+                no_data_values.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+        let (z_min, z_max) = min_max_valid_f64(&data, &mask);
+        assert_eq!(z_min, -27.458_635_330_200_195);
+        assert_eq!(z_max, 5474.172_851_562_5);
+        assert_eq!(uses_no_data, [123]);
+        assert_eq!(no_data_values, [123.0]);
     }
 
     #[test]
