@@ -11,7 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! C ABI entry points backed by the safe Rust implementation.
 
 use crate::{
-    decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_uncompressed,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
     encode_lerc2_uncompressed_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
     get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
     LercError,
@@ -759,7 +759,7 @@ unsafe fn try_encode_supported_blob(
     if version < 4 && spec.n_bands != 1 {
         return Ok(None);
     }
-    match encode_lerc2_uncompressed(spec, data, max_z_err, mask_bytes, version) {
+    match encode_lerc2_auto(spec, data, max_z_err, mask_bytes, version) {
         Ok(blob) => Ok(Some(blob)),
         Err(LercError::WrongParam("one-sweep Lerc2 encode requires version 4 or newer")) => {
             Ok(None)
@@ -1296,9 +1296,8 @@ mod tests {
     };
     use crate::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        encode_lerc2_uncompressed, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-        get_lerc_info, DataType, DecodedData, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN,
+        encode_lerc2_auto, get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info,
+        DataType, DecodedData, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1771,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_encode_matches_safe_uncompressed_selector() {
+    fn c_abi_encode_matches_safe_auto_selector() {
         let data = [1u8, 2, 99, 99, 3, 9, 5, 6, 7, 8, 0, 0];
         let valid = [1, 0, 1, 1, 1, 0];
         let mut out = [0u8; 160];
@@ -1794,7 +1793,7 @@ mod tests {
                 &mut written,
             )
         };
-        let expected = encode_lerc2_uncompressed(
+        let expected = encode_lerc2_auto(
             crate::EncodeSpec {
                 data_type: DataType::UChar,
                 n_depth: 2,
@@ -1812,6 +1811,65 @@ mod tests {
 
         assert_eq!(status, ErrCode::Ok as u32);
         assert_eq!(&out[..written as usize], expected.as_slice());
+    }
+
+    #[test]
+    fn c_abi_encode_selects_byte_huffman_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 64,
+            n_rows: 64,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data: Vec<u8> = (0..(spec.n_cols * spec.n_rows))
+            .map(|idx| (idx % 64) as u8)
+            .collect();
+        let uncompressed = crate::encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                64,
+                64,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                64,
+                64,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        assert!((written as usize) < uncompressed.len());
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.data, DecodedData::UChar(data));
     }
 
     #[test]

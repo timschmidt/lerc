@@ -849,6 +849,53 @@ pub fn encode_lerc2_uncompressed_with_no_data(
     }
 }
 
+/// Encodes Lerc2 data using the currently ported size-based safe selector.
+///
+/// The selector keeps [`encode_lerc2_uncompressed`] as the baseline and, for
+/// single-band `UChar`/`Char` data with `max_z_error == 0.5`, also tries
+/// [`encode_lerc2_byte_huffman`]. The smaller valid blob is returned. Optional
+/// no-data metadata still uses [`encode_lerc2_uncompressed_with_no_data`]
+/// because byte Huffman no-data preprocessing is not ported yet.
+pub fn encode_lerc2_auto(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    let baseline = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
+    if spec.n_bands != 1
+        || !matches!(spec.data_type, DataType::UChar | DataType::Char)
+        || max_z_error != 0.5
+        || version < 4
+    {
+        return Ok(baseline);
+    }
+
+    let mask = match masks {
+        Some(mask_bytes) => Some(BitMask::from_byte_mask(
+            &mask_bytes[..spec.mask_byte_len()?],
+            spec.n_cols,
+            spec.n_rows,
+        )?),
+        None => None,
+    };
+    match encode_lerc2_byte_huffman(spec, data, mask.as_ref(), version) {
+        Ok(huffman) if huffman.len() < baseline.len() => Ok(huffman),
+        Ok(_) => Ok(baseline),
+        Err(LercError::WrongParam("constant byte input should use Lerc2 constant encode")) => {
+            Ok(baseline)
+        }
+        Err(LercError::WrongParam("constant byte ranges should use Lerc2 constant encode")) => {
+            Ok(baseline)
+        }
+        Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => {
+            Ok(baseline)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Encodes a single-band Lerc2 blob using one-sweep payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
@@ -4746,9 +4793,10 @@ mod tests {
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
         compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
         decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        encode_lerc2_byte_huffman, encode_lerc2_constant, encode_lerc2_one_sweep,
-        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
-        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+        encode_lerc2_auto, encode_lerc2_byte_huffman, encode_lerc2_constant,
+        encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
+        encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
         encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
         get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
@@ -5919,6 +5967,59 @@ mod tests {
         assert_eq!(
             encode_lerc2_byte_huffman(byte_spec, &[1, 2, 3, 4, 5, 6], None, 3).unwrap_err(),
             LercError::WrongParam("byte Huffman Lerc2 encode requires version 4 or newer")
+        );
+    }
+
+    #[test]
+    fn auto_encode_selects_byte_huffman_when_smaller() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 64,
+            n_rows: 64,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data: Vec<u8> = (0..(spec.n_cols * spec.n_rows))
+            .map(|idx| (idx % 64) as u8)
+            .collect();
+
+        let auto = encode_lerc2_auto(spec, &data, 0.5, None, 6).unwrap();
+        let uncompressed = encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+        let decoded = decode_lerc2_supported(&auto).unwrap();
+
+        assert!(auto.len() < uncompressed.len());
+        assert_eq!(decoded.data, DecodedData::UChar(data));
+        assert_eq!(decoded.bytes_consumed, auto.len());
+    }
+
+    #[test]
+    fn auto_encode_keeps_uncompressed_for_constant_or_nonbyte_data() {
+        let byte_spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 4,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let constant = [7u8; 8];
+        assert_eq!(
+            encode_lerc2_auto(byte_spec, &constant, 0.5, None, 6).unwrap(),
+            encode_lerc2_uncompressed(byte_spec, &constant, 0.5, None, 6).unwrap()
+        );
+
+        let float_spec = EncodeSpec {
+            data_type: DataType::Float,
+            ..byte_spec
+        };
+        let mut float_data = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] {
+            float_data.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(
+            encode_lerc2_auto(float_spec, &float_data, 0.0, None, 6).unwrap(),
+            encode_lerc2_uncompressed(float_spec, &float_data, 0.0, None, 6).unwrap()
         );
     }
 

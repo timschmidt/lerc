@@ -6,14 +6,15 @@ use lerc::{
     compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
     compute_lerc2_tiled_raw_byte_len, decode_lerc1, decode_lerc2_bands_supported,
     decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_byte_huffman,
-    encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-    encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
-    encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-    encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
-    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
-    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_auto,
+    encode_lerc2_byte_huffman, encode_lerc2_constant, encode_lerc2_one_sweep,
+    encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw,
+    encode_lerc2_tiled_raw_bands, encode_lerc2_tiled_raw_bands_with_no_data,
+    encode_lerc2_tiled_raw_with_no_data, encode_lerc2_uncompressed,
+    encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum, get_lerc1_header_info,
+    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+    get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
+    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
     write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
     BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
@@ -197,6 +198,7 @@ fn main() {
         huffman_encode_spec.n_rows,
     )
     .unwrap();
+    let huffman_encode_mask_bytes = huffman_encode_mask.to_byte_mask();
     let ffi_constant_encode_mask = [1u8, 0, 1, 1, 1, 1];
     let mut ffi_constant_encode_size = 0u32;
     let mut ffi_constant_encode_out = [0u8; 128];
@@ -659,6 +661,18 @@ fn main() {
                 huffman_encode_spec,
                 black_box(&huffman_encode_data),
                 Some(black_box(&huffman_encode_mask)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-auto-byte-huffman-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_auto(
+                huffman_encode_spec,
+                black_box(&huffman_encode_data),
+                0.5,
+                Some(black_box(&huffman_encode_mask_bytes)),
                 6,
             )
             .unwrap(),
