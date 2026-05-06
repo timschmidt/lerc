@@ -3259,6 +3259,12 @@ fn normalize_lerc2_max_z_error_for_encode(
     max_z_error: f64,
 ) -> Result<f64> {
     if max_z_error >= 0.0 {
+        if max_z_error > 0.0 && is_floating_point_data_type(spec.data_type) {
+            return Ok(
+                try_raise_lerc2_float_max_z_error(spec, data, mask, max_z_error)?
+                    .unwrap_or(max_z_error),
+            );
+        }
         return Ok(max_z_error);
     }
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
@@ -3268,6 +3274,113 @@ fn normalize_lerc2_max_z_error_for_encode(
 
 fn is_integer_data_type(data_type: DataType) -> bool {
     (data_type as i32) < (DataType::Float as i32)
+}
+
+fn is_floating_point_data_type(data_type: DataType) -> bool {
+    matches!(data_type, DataType::Float | DataType::Double)
+}
+
+#[allow(dead_code)]
+fn try_raise_lerc2_float_max_z_error(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: &BitMask,
+    max_z_error: f64,
+) -> Result<Option<f64>> {
+    if !is_floating_point_data_type(spec.data_type)
+        || max_z_error <= 0.0
+        || mask.count_valid_bits() == 0
+    {
+        return Ok(None);
+    }
+
+    let candidates = [
+        (0.5, 1.0),
+        (0.25, 2.0),
+        (0.05, 10.0),
+        (0.025, 20.0),
+        (0.005, 100.0),
+        (0.0025, 200.0),
+        (0.0005, 1000.0),
+        (0.00025, 2000.0),
+        (0.00005, 10000.0),
+    ];
+    let mut z_err = Vec::new();
+    let mut z_fac = Vec::new();
+    let mut round_err = Vec::new();
+    for (err, fac) in candidates {
+        if err > max_z_error {
+            z_err.push(err);
+            z_fac.push(fac);
+            round_err.push(0.0f64);
+        }
+    }
+    if z_err.is_empty() {
+        return Ok(None);
+    }
+
+    let value_size = spec.data_type.size_in_bytes();
+    for row in 0..spec.n_rows {
+        let candidate_count = z_err.len();
+        for col in 0..spec.n_cols {
+            let pixel_idx = row * spec.n_cols + col;
+            if !mask.is_valid(pixel_idx)? {
+                continue;
+            }
+            for depth in 0..spec.n_depth {
+                let offset = (pixel_idx * spec.n_depth + depth) * value_size;
+                let value =
+                    read_value_from_bytes(spec.data_type, &data[offset..offset + value_size]);
+                if value.is_nan() {
+                    return Err(LercError::WrongParam("Lerc2 encode input contains NaN"));
+                }
+                for candidate in 0..candidate_count {
+                    let scaled = value * z_fac[candidate];
+                    if scaled.fract() == 0.0 {
+                        break;
+                    }
+                    let delta = ((scaled + 0.5).floor() - scaled).abs();
+                    round_err[candidate] = round_err[candidate].max(delta);
+                }
+            }
+        }
+
+        if !prune_lerc2_float_error_candidates(&mut round_err, &mut z_err, &mut z_fac, max_z_error)
+        {
+            return Ok(None);
+        }
+    }
+
+    for idx in 0..z_err.len() {
+        if round_err[idx] / z_fac[idx] <= max_z_error / 2.0 {
+            return Ok(Some(z_err[idx]));
+        }
+    }
+    Ok(None)
+}
+
+fn prune_lerc2_float_error_candidates(
+    round_err: &mut Vec<f64>,
+    z_err: &mut Vec<f64>,
+    z_fac: &mut Vec<f64>,
+    max_z_error: f64,
+) -> bool {
+    if z_err.is_empty()
+        || round_err.len() != z_err.len()
+        || z_fac.len() != z_err.len()
+        || max_z_error <= 0.0
+    {
+        return false;
+    }
+
+    for idx in (0..z_err.len()).rev() {
+        if round_err[idx] / z_fac[idx] > max_z_error / 2.0 {
+            round_err.remove(idx);
+            z_err.remove(idx);
+            z_fac.remove(idx);
+        }
+    }
+    !z_err.is_empty()
 }
 
 #[allow(dead_code)]
@@ -5738,10 +5851,11 @@ mod tests {
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes,
-        try_lerc2_bit_plane_max_z_error, validate_lerc2_checksum, write_huffman_code_table,
-        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
-        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter,
-        MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        try_lerc2_bit_plane_max_z_error, try_raise_lerc2_float_max_z_error,
+        validate_lerc2_checksum, write_huffman_code_table, write_lerc2_header, write_lerc2_mask,
+        write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec,
+        FpPredictor, HeaderInfo, HuffmanBitWriter, MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -8164,6 +8278,37 @@ mod tests {
             encode_lerc2_tiled_raw(small_spec, &[1, 2, 3, 4], -0.2, None, 6, 2).unwrap();
         let small_header = get_lerc2_header_info(&small_blob).unwrap().header;
         assert_eq!(small_header.max_z_error, 0.5);
+    }
+
+    #[test]
+    fn float_positive_max_z_error_uses_cpp_raise_heuristic() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 4,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1.0f32, 1.5, 2.0, 2.5, -3.0, -2.5, 0.0, 4.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut mask = BitMask::new(spec.n_cols, spec.n_rows).unwrap();
+        mask.set_all_valid();
+
+        assert_eq!(
+            try_raise_lerc2_float_max_z_error(spec, &data, &mask, 0.1).unwrap(),
+            Some(0.25)
+        );
+
+        let blob = encode_lerc2_one_sweep(spec, &data, 0.1, None, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        assert_eq!(decoded.header.max_z_error, 0.25);
+        assert_eq!(
+            decoded.data,
+            DecodedData::Float(vec![1.0, 1.5, 2.0, 2.5, -3.0, -2.5, 0.0, 4.5])
+        );
     }
 
     #[test]
