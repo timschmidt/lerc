@@ -849,13 +849,73 @@ pub fn encode_lerc2_uncompressed_with_no_data(
     }
 }
 
+/// Encodes Lerc2 data with optional no-data metadata using the ported size selector.
+///
+/// This is the no-data-aware variant of [`encode_lerc2_auto`]. It keeps
+/// [`encode_lerc2_uncompressed_with_no_data`] as the baseline and, for version
+/// 6+ `UChar`/`Char` data with `max_z_error == 0.5`, also tries byte Huffman
+/// after applying the same no-data mask filtering and internal-sentinel remap
+/// as the uncompressed no-data helpers. The smaller valid blob is returned.
+pub fn encode_lerc2_auto_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    let has_active_no_data = uses_no_data
+        .as_ref()
+        .is_some_and(|uses| uses.iter().any(|&uses| uses != 0));
+    if !has_active_no_data {
+        return encode_lerc2_auto(spec, data, max_z_error, masks, version);
+    }
+
+    let baseline = encode_lerc2_uncompressed_with_no_data(
+        spec,
+        data,
+        max_z_error,
+        masks,
+        uses_no_data,
+        no_data_values,
+        version,
+    )?;
+    if !matches!(spec.data_type, DataType::UChar | DataType::Char)
+        || max_z_error != 0.5
+        || version < 6
+    {
+        return Ok(baseline);
+    }
+
+    match encode_lerc2_byte_huffman_bands_with_no_data(
+        spec,
+        data,
+        masks,
+        uses_no_data,
+        no_data_values,
+        version,
+    ) {
+        Ok(huffman) if huffman.len() < baseline.len() => Ok(huffman),
+        Ok(_) => Ok(baseline),
+        Err(LercError::WrongParam("constant byte input should use Lerc2 constant encode")) => {
+            Ok(baseline)
+        }
+        Err(LercError::WrongParam("constant byte ranges should use Lerc2 constant encode")) => {
+            Ok(baseline)
+        }
+        Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => {
+            Ok(baseline)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Encodes Lerc2 data using the currently ported size-based safe selector.
 ///
 /// The selector keeps [`encode_lerc2_uncompressed`] as the baseline and, for
-/// single-band `UChar`/`Char` data with `max_z_error == 0.5`, also tries
-/// [`encode_lerc2_byte_huffman`]. The smaller valid blob is returned. Optional
-/// no-data metadata still uses [`encode_lerc2_uncompressed_with_no_data`]
-/// because byte Huffman no-data preprocessing is not ported yet.
+/// `UChar`/`Char` data with `max_z_error == 0.5`, also tries byte Huffman.
+/// The smaller valid blob is returned.
 pub fn encode_lerc2_auto(
     spec: EncodeSpec,
     data: &[u8],
@@ -925,6 +985,36 @@ pub fn encode_lerc2_byte_huffman_bands(
     masks: Option<&[u8]>,
     version: i32,
 ) -> Result<Vec<u8>> {
+    encode_lerc2_byte_huffman_bands_impl(spec, data, masks, None, None, version)
+}
+
+/// Encodes band-major byte data as byte-Huffman Lerc2 blobs with no-data metadata.
+///
+/// This version 6+ helper carries no-data metadata for bands whose
+/// `uses_no_data` entry is nonzero. The source data is expected to already
+/// contain the per-band no-data sentinel value wherever no-data should be
+/// represented. Pixels whose every depth equals the sentinel are marked invalid;
+/// mixed-depth sentinel samples are remapped to an internal sentinel when needed
+/// and restored to the original sentinel during decode.
+pub fn encode_lerc2_byte_huffman_bands_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    encode_lerc2_byte_huffman_bands_impl(spec, data, masks, uses_no_data, no_data_values, version)
+}
+
+fn encode_lerc2_byte_huffman_bands_impl(
+    spec: EncodeSpec,
+    data: &[u8],
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "byte Huffman Lerc2 band encode")?;
     if !(4..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
@@ -936,6 +1026,7 @@ pub fn encode_lerc2_byte_huffman_bands(
             "byte Huffman Lerc2 encode requires Char or UChar data",
         ));
     }
+    validate_encode_no_data_inputs(spec, uses_no_data, no_data_values, version)?;
 
     let band_spec = EncodeSpec {
         n_bands: 1,
@@ -974,6 +1065,35 @@ pub fn encode_lerc2_byte_huffman_bands(
             }
             None => None,
         };
+        let no_data = uses_no_data
+            .and_then(|uses| uses.get(band).copied())
+            .filter(|&uses| uses != 0)
+            .and_then(|_| no_data_values.and_then(|values| values.get(band).copied()))
+            .map(|value| (value, value));
+        let band_data = &data[data_start..data_start + band_data_len];
+        let prepared = if let Some((_, no_data_orig)) = no_data {
+            Some(prepare_no_data_band_for_encode(
+                band_spec,
+                band_data,
+                mask.as_ref(),
+                no_data_orig,
+                0.5,
+            )?)
+        } else {
+            None
+        };
+        let prepared_data = prepared
+            .as_ref()
+            .map(|prepared| prepared.data.as_slice())
+            .unwrap_or(band_data);
+        let prepared_mask = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.mask.as_ref())
+            .or(mask.as_ref());
+        let prepared_no_data = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.no_data)
+            .or(no_data);
         let n_blobs_more = if version >= 6 {
             i32::try_from(spec.n_bands - 1 - band)
                 .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
@@ -982,10 +1102,10 @@ pub fn encode_lerc2_byte_huffman_bands(
         };
         let encode_mask = if band == 0 {
             true
-        } else if spec.n_masks == 1 {
+        } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (mask.as_ref(), &previous_mask) {
+            match (prepared_mask, &previous_mask) {
                 (Some(mask), Some(previous)) => mask != previous,
                 (Some(_), None) => true,
                 _ => false,
@@ -993,17 +1113,18 @@ pub fn encode_lerc2_byte_huffman_bands(
         };
         let band_blob = encode_lerc2_byte_huffman_band(
             EncodeSpec {
-                n_masks: usize::from(mask.is_some()),
+                n_masks: usize::from(prepared_mask.is_some()),
                 ..band_spec
             },
-            &data[data_start..data_start + band_data_len],
-            mask.as_ref(),
+            prepared_data,
+            prepared_mask,
             version,
             n_blobs_more,
             encode_mask,
+            prepared_no_data,
         )?;
         blob.extend_from_slice(&band_blob);
-        previous_mask = mask;
+        previous_mask = prepared_mask.cloned();
     }
 
     Ok(blob)
@@ -1144,7 +1265,48 @@ pub fn encode_lerc2_byte_huffman(
     mask: Option<&BitMask>,
     version: i32,
 ) -> Result<Vec<u8>> {
-    encode_lerc2_byte_huffman_band(spec, data, mask, version, 0, true)
+    encode_lerc2_byte_huffman_band(spec, data, mask, version, 0, true, None)
+}
+
+/// Encodes a single-band byte Lerc2 blob using Huffman payloads with no-data metadata.
+///
+/// This version 6+ helper expects `data` to already contain `no_data_value`
+/// wherever no-data should be represented. Pixels whose every depth equals the
+/// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
+/// internal sentinel when needed and restored during decode.
+pub fn encode_lerc2_byte_huffman_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    no_data_value: f64,
+    version: i32,
+) -> Result<Vec<u8>> {
+    validate_single_band_encode_inputs(spec, data, mask, "byte Huffman Lerc2 no-data encode")?;
+    if version < 6 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires version 6 or newer",
+        ));
+    }
+    if spec.n_depth <= 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires depth greater than 1",
+        ));
+    }
+    let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, 0.5)?;
+    let prepared_data = prepared.data.as_slice();
+    let prepared_mask = prepared.mask.as_ref().or(mask);
+    encode_lerc2_byte_huffman_band(
+        EncodeSpec {
+            n_masks: usize::from(prepared_mask.is_some()),
+            ..spec
+        },
+        prepared_data,
+        prepared_mask,
+        version,
+        0,
+        true,
+        prepared.no_data.or(Some((no_data_value, no_data_value))),
+    )
 }
 
 fn encode_lerc2_byte_huffman_band(
@@ -1154,6 +1316,7 @@ fn encode_lerc2_byte_huffman_band(
     version: i32,
     n_blobs_more: i32,
     encode_partial_mask: bool,
+    no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "byte Huffman Lerc2 encode")?;
     if !(4..=CURRENT_VERSION).contains(&version) {
@@ -1164,6 +1327,16 @@ fn encode_lerc2_byte_huffman_band(
     if !matches!(spec.data_type, DataType::UChar | DataType::Char) {
         return Err(LercError::WrongParam(
             "byte Huffman Lerc2 encode requires Char or UChar data",
+        ));
+    }
+    if no_data.is_some() && version < 6 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires version 6 or newer",
+        ));
+    }
+    if no_data.is_some() && spec.n_depth <= 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
 
@@ -1204,7 +1377,7 @@ fn encode_lerc2_byte_huffman_band(
         micro_block_size: 8,
         blob_size: 1,
         n_blobs_more,
-        b_pass_no_data_values: 0,
+        b_pass_no_data_values: u8::from(no_data.is_some()),
         b_is_int: 1,
         b_reserved_3: 0,
         b_reserved_4: 0,
@@ -1212,8 +1385,8 @@ fn encode_lerc2_byte_huffman_band(
         max_z_error: 0.5,
         z_min,
         z_max,
-        no_data_val: 0.0,
-        no_data_val_orig: 0.0,
+        no_data_val: no_data.map(|values| values.0).unwrap_or(0.0),
+        no_data_val_orig: no_data.map(|values| values.1).unwrap_or(0.0),
         header_size,
     };
 
@@ -4906,10 +5079,11 @@ mod tests {
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
         compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
         decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        encode_lerc2_auto, encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
-        encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
-        encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+        encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
+        encode_lerc2_byte_huffman_bands, encode_lerc2_byte_huffman_bands_with_no_data,
+        encode_lerc2_byte_huffman_with_no_data, encode_lerc2_constant, encode_lerc2_one_sweep,
+        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
+        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
         encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
         get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
@@ -6051,6 +6225,134 @@ mod tests {
         assert_eq!(decoded.header.data_type, DataType::Char);
         assert_eq!(decoded.mask.count_valid_bits(), spec.n_cols * spec.n_rows);
         assert_eq!(decoded.data, DecodedData::Char(expected));
+    }
+
+    #[test]
+    fn encodes_byte_huffman_lerc2_with_no_data_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 64,
+            n_rows: 32,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth);
+        let mut expected = Vec::with_capacity(n_pixels * spec.n_depth);
+        for pixel in 0..n_pixels {
+            if pixel % 17 == 0 {
+                data.extend_from_slice(&[255, 255]);
+                expected.extend_from_slice(&[0, 0]);
+            } else if pixel % 19 == 0 {
+                data.extend_from_slice(&[7, 255]);
+                expected.extend_from_slice(&[7, 255]);
+            } else {
+                let value = (pixel % 16) as u8;
+                data.extend_from_slice(&[value, value.wrapping_add(3)]);
+                expected.extend_from_slice(&[value, value.wrapping_add(3)]);
+            }
+        }
+
+        let baseline = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[255.0]),
+            6,
+        )
+        .unwrap();
+        let explicit = encode_lerc2_byte_huffman_with_no_data(spec, &data, None, 255.0, 6).unwrap();
+        let auto =
+            encode_lerc2_auto_with_no_data(spec, &data, 0.5, None, Some(&[1]), Some(&[255.0]), 6)
+                .unwrap();
+        let decoded = decode_lerc2_supported(&auto).unwrap();
+
+        assert!(explicit.len() < baseline.len());
+        assert_eq!(auto, explicit);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(
+            decoded.header.num_valid_pixel as usize,
+            n_pixels - (n_pixels + 16) / 17
+        );
+        assert_eq!(decoded.data, DecodedData::UChar(expected));
+    }
+
+    #[test]
+    fn encodes_byte_huffman_lerc2_bands_with_no_data_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 64,
+            n_rows: 16,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let band_len = spec.n_cols * spec.n_rows * spec.n_depth;
+        let mut data = Vec::with_capacity(band_len * spec.n_bands);
+        let mut expected = Vec::with_capacity(band_len * spec.n_bands);
+        for band in 0..spec.n_bands {
+            for pixel in 0..(spec.n_cols * spec.n_rows) {
+                if band == 0 && pixel % 23 == 0 {
+                    data.extend_from_slice(&[255, 255]);
+                    expected.extend_from_slice(&[0, 0]);
+                } else {
+                    let value = ((band * 31 + pixel) % 32) as u8;
+                    data.extend_from_slice(&[value, value.wrapping_add(5)]);
+                    expected.extend_from_slice(&[value, value.wrapping_add(5)]);
+                }
+            }
+        }
+
+        let baseline = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1, 0]),
+            Some(&[255.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let blob = encode_lerc2_byte_huffman_bands_with_no_data(
+            spec,
+            &data,
+            None,
+            Some(&[1, 0]),
+            Some(&[255.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let auto = encode_lerc2_auto_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1, 0]),
+            Some(&[255.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_bands_supported(&auto).unwrap();
+        let no_data = get_lerc2_no_data_info(&auto, 2).unwrap();
+
+        assert!(blob.len() < baseline.len());
+        assert_eq!(auto, blob);
+        assert_eq!(no_data.uses_no_data, [1, 0]);
+        assert_eq!(no_data.no_data_values, [255.0, 0.0]);
+        assert!(decoded.bands[0].header.has_no_data_values());
+        assert!(!decoded.bands[1].header.has_no_data_values());
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(expected[..band_len].to_vec())
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(expected[band_len..].to_vec())
+        );
     }
 
     #[test]

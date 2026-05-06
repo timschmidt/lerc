@@ -12,7 +12,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 use crate::{
     decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
-    encode_lerc2_uncompressed_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    encode_lerc2_auto_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
     get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
     LercError,
 };
@@ -22,8 +22,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// C ABI equivalent of `lerc_computeCompressedSize`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
-/// metadata is available through the 4D entry points.
+/// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
+/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
+/// through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -65,8 +66,9 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
 
 /// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
-/// metadata is available through the 4D entry points.
+/// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
+/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
+/// through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -107,8 +109,9 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
 
 /// C ABI equivalent of `lerc_encode`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
-/// metadata is available through the 4D entry points.
+/// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
+/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
+/// through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -154,8 +157,9 @@ pub unsafe extern "C" fn lerc_encode(
 
 /// C ABI equivalent of `lerc_encodeForVersion`.
 ///
-/// Inputs are encoded by the Rust constant or one-sweep Lerc2 paths. No-data
-/// metadata is available through the 4D entry points.
+/// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
+/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
+/// through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -732,7 +736,7 @@ unsafe fn try_encode_supported_blob(
             if version < 6 || spec.n_depth <= 1 {
                 return Ok(None);
             }
-            return encode_lerc2_uncompressed_with_no_data(
+            return encode_lerc2_auto_with_no_data(
                 spec,
                 data,
                 max_z_err,
@@ -1937,6 +1941,90 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(data[band_len..].to_vec())
         );
+    }
+
+    #[test]
+    fn c_abi_4d_encode_selects_byte_huffman_with_no_data_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 64,
+            n_rows: 32,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth);
+        let mut expected = Vec::with_capacity(n_pixels * spec.n_depth);
+        for pixel in 0..n_pixels {
+            if pixel % 17 == 0 {
+                data.extend_from_slice(&[255, 255]);
+                expected.extend_from_slice(&[0, 0]);
+            } else {
+                let value = (pixel % 16) as u8;
+                data.extend_from_slice(&[value, value.wrapping_add(3)]);
+                expected.extend_from_slice(&[value, value.wrapping_add(3)]);
+            }
+        }
+        let uses_no_data = [1u8];
+        let no_data_values = [255.0f64];
+        let uncompressed = crate::encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                spec.n_bands as i32,
+                0,
+                ptr::null(),
+                0.5,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                spec.n_bands as i32,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        assert!((written as usize) < uncompressed.len());
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(decoded.data, DecodedData::UChar(expected));
     }
 
     #[test]
