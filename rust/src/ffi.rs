@@ -11,10 +11,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! C ABI entry points backed by the safe Rust implementation.
 
 use crate::{
-    decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
-    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-    encode_lerc2_one_sweep_bands_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_no_data_info, get_lerc_info, BitMask, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_uncompressed,
+    encode_lerc2_uncompressed_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
     LercError,
 };
 use core::ffi::c_void;
@@ -733,7 +732,7 @@ unsafe fn try_encode_supported_blob(
             if version < 6 || spec.n_depth <= 1 {
                 return Ok(None);
             }
-            return encode_lerc2_one_sweep_bands_with_no_data(
+            return encode_lerc2_uncompressed_with_no_data(
                 spec,
                 data,
                 max_z_err,
@@ -746,62 +745,15 @@ unsafe fn try_encode_supported_blob(
         }
     }
 
-    if spec.n_bands != 1 {
-        if version < 4 {
-            return Ok(None);
-        }
-        return encode_lerc2_one_sweep_bands(spec, data, max_z_err, mask_bytes, version).map(Some);
+    if version < 4 && spec.n_bands != 1 {
+        return Ok(None);
     }
-
-    let mask = if let Some(mask_bytes) = mask_bytes {
-        Some(BitMask::from_byte_mask(
-            mask_bytes,
-            spec.n_cols,
-            spec.n_rows,
-        )?)
-    } else {
-        None
-    };
-
-    let value = match constant_value_as_f64(spec.data_type, data)? {
-        Some(value) => value,
-        None => {
-            if version < 4 {
-                return Ok(None);
-            }
-            return encode_lerc2_one_sweep(spec, data, max_z_err, mask.as_ref(), version).map(Some);
+    match encode_lerc2_uncompressed(spec, data, max_z_err, mask_bytes, version) {
+        Ok(blob) => Ok(Some(blob)),
+        Err(LercError::WrongParam("one-sweep Lerc2 encode requires version 4 or newer")) => {
+            Ok(None)
         }
-    };
-
-    encode_lerc2_constant(spec, value, max_z_err, mask.as_ref(), version).map(Some)
-}
-
-fn constant_value_as_f64(data_type: DataType, data: &[u8]) -> crate::Result<Option<f64>> {
-    let value_size = data_type.size_in_bytes();
-    if data.len() < value_size || data.len() % value_size != 0 {
-        return Err(LercError::WrongParam(
-            "encode data byte length does not match type",
-        ));
-    }
-    let first = scalar_value_as_f64(data_type, &data[..value_size]);
-    for chunk in data[value_size..].chunks_exact(value_size) {
-        if chunk != &data[..value_size] {
-            return Ok(None);
-        }
-    }
-    Ok(Some(first))
-}
-
-fn scalar_value_as_f64(data_type: DataType, bytes: &[u8]) -> f64 {
-    match data_type {
-        DataType::Char => i8::from_le_bytes(bytes[..1].try_into().unwrap()) as f64,
-        DataType::UChar => bytes[0] as f64,
-        DataType::Short => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as f64,
-        DataType::UShort => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as f64,
-        DataType::Int => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
-        DataType::UInt => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
-        DataType::Float => f32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
-        DataType::Double => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        Err(err) => Err(err),
     }
 }
 
@@ -1230,9 +1182,9 @@ mod tests {
         lerc_getDataRanges,
     };
     use crate::{
-        compute_checksum_fletcher32, decode_lerc2_supported, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc_info, DataType, DecodedData, ErrCode,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        compute_checksum_fletcher32, decode_lerc2_supported, encode_lerc2_uncompressed,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info, DataType, DecodedData,
+        ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1702,6 +1654,50 @@ mod tests {
             decoded.data,
             DecodedData::UChar(vec![1, 2, 0, 0, 3, 9, 5, 6, 7, 8, 0, 0])
         );
+    }
+
+    #[test]
+    fn c_abi_encode_matches_safe_uncompressed_selector() {
+        let data = [1u8, 2, 99, 99, 3, 9, 5, 6, 7, 8, 0, 0];
+        let valid = [1, 0, 1, 1, 1, 0];
+        let mut out = [0u8; 160];
+        let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                1,
+                valid.as_ptr(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+        let expected = encode_lerc2_uncompressed(
+            crate::EncodeSpec {
+                data_type: DataType::UChar,
+                n_depth: 2,
+                n_cols: 3,
+                n_rows: 2,
+                n_bands: 1,
+                n_masks: 1,
+            },
+            &data,
+            0.5,
+            Some(&valid),
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(&out[..written as usize], expected.as_slice());
     }
 
     #[test]
