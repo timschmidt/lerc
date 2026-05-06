@@ -733,7 +733,7 @@ unsafe fn try_encode_supported_blob(
 
     if let Some(uses_no_data) = uses_no_data.as_ref() {
         if uses_no_data.iter().any(|&uses| uses != 0) {
-            if version < 6 || spec.n_depth <= 1 {
+            if version < 6 {
                 return Ok(None);
             }
             return encode_lerc2_auto_with_no_data(
@@ -1625,6 +1625,7 @@ mod tests {
         };
         assert_eq!(status, ErrCode::Ok as u32);
         assert!(num_bytes > 0);
+        let expected_num_bytes = num_bytes;
 
         let status = unsafe {
             lerc_encodeForVersion(
@@ -1644,7 +1645,7 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::Ok as u32);
-        assert_eq!(written, num_bytes);
+        assert_eq!(written, expected_num_bytes);
 
         let info = get_lerc_info(&out[..written as usize]).unwrap();
         assert_eq!(info.version, 3);
@@ -2032,6 +2033,62 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_4d_encode_supports_single_depth_no_data_as_mask() {
+        let data = [1u8, 255, 3, 4, 5, 255, 7, 8];
+        let uses_no_data = [1u8];
+        let no_data_values = [255.0f64];
+        let mut computed_size = 0u32;
+        let mut out = [0u8; 256];
+        let mut written = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                4,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                4,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert!(!decoded.header.has_no_data_values());
+        assert_eq!(decoded.mask.to_byte_mask(), [1, 0, 1, 1, 1, 0, 1, 1]);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 0, 3, 4, 5, 0, 7, 8])
+        );
+    }
+
+    #[test]
     fn c_abi_encode_supports_one_sweep_multi_band_input() {
         let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
         let valid = [1u8, 0, 1, 1, 1, 0];
@@ -2244,20 +2301,20 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_4d_encode_stubs_validate_no_data_pointers() {
-        let data = [1u8, 2, 3, 4, 5, 6];
+    fn c_abi_4d_encode_validates_no_data_pointers() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let uses_no_data = [1u8];
         let no_uses_no_data = [0u8];
         let no_data_values = [255.0f64];
         let mut num_bytes = 123u32;
-        let mut out = [0u8; 64];
+        let mut out = [0u8; 256];
         let mut written = 123u32;
 
         let status = unsafe {
             lerc_computeCompressedSize_4D(
                 data.as_ptr().cast(),
                 DataType::UChar as u32,
-                1,
+                2,
                 3,
                 2,
                 1,
@@ -2269,15 +2326,16 @@ mod tests {
                 no_data_values.as_ptr(),
             )
         };
-        assert_eq!(status, ErrCode::Failed as u32);
-        assert_eq!(num_bytes, 0);
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert!(num_bytes > 0);
+        let expected_num_bytes = num_bytes;
 
         num_bytes = 123;
         let status = unsafe {
             lerc_computeCompressedSize_4D(
                 data.as_ptr().cast(),
                 DataType::UChar as u32,
-                1,
+                2,
                 3,
                 2,
                 1,
@@ -2296,7 +2354,7 @@ mod tests {
             lerc_encode_4D(
                 data.as_ptr().cast(),
                 DataType::UChar as u32,
-                1,
+                2,
                 3,
                 2,
                 1,
@@ -2310,8 +2368,8 @@ mod tests {
                 no_data_values.as_ptr(),
             )
         };
-        assert_eq!(status, ErrCode::Failed as u32);
-        assert_eq!(written, 0);
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(written, expected_num_bytes);
 
         let status = unsafe {
             lerc_computeCompressedSize_4D(

@@ -882,9 +882,11 @@ pub fn encode_lerc2_uncompressed(
 ///
 /// When `uses_no_data` is absent or contains only zero values, this delegates to
 /// [`encode_lerc2_uncompressed`] and may still choose the constant path. When
-/// any band is flagged as using no-data, this writes version 6+ no-data
-/// metadata through the one-sweep encoder. Source data is expected to already
-/// contain the per-band no-data sentinel wherever no-data should be represented.
+/// any band is flagged as using no-data, this applies the C++ no-data filtering
+/// path through the one-sweep encoder. Single-depth inputs encode all-sentinel
+/// pixels through the mask only; multi-depth mixed valid/sentinel pixels use
+/// version 6+ no-data metadata. Source data is expected to already contain the
+/// per-band no-data sentinel wherever no-data should be represented.
 pub fn encode_lerc2_uncompressed_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1225,7 +1227,7 @@ fn encode_lerc2_byte_huffman_bands_impl(
         let prepared_no_data = prepared
             .as_ref()
             .and_then(|prepared| prepared.no_data)
-            .or(no_data);
+            .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
         let n_blobs_more = if version >= 6 {
             i32::try_from(spec.n_bands - 1 - band)
                 .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
@@ -1267,7 +1269,8 @@ fn encode_lerc2_byte_huffman_bands_impl(
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
-/// internal sentinel when needed and restored during decode.
+/// internal sentinel when needed and restored during decode. Single-depth inputs
+/// use mask filtering only and do not write no-data metadata.
 pub fn encode_lerc2_one_sweep_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1281,11 +1284,6 @@ pub fn encode_lerc2_one_sweep_with_no_data(
     if version < 6 {
         return Err(LercError::WrongParam(
             "Lerc2 no-data encode requires version 6 or newer",
-        ));
-    }
-    if spec.n_depth <= 1 {
-        return Err(LercError::WrongParam(
-            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
@@ -1302,7 +1300,11 @@ pub fn encode_lerc2_one_sweep_with_no_data(
         version,
         0,
         true,
-        prepared.no_data.or(Some((no_data_value, no_data_value))),
+        if spec.n_depth > 1 {
+            prepared.no_data.or(Some((no_data_value, no_data_value)))
+        } else {
+            None
+        },
     )
 }
 
@@ -1339,7 +1341,8 @@ pub fn encode_lerc2_tiled_raw(
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
-/// internal sentinel when needed and restored during decode.
+/// internal sentinel when needed and restored during decode. Single-depth inputs
+/// use mask filtering only and do not write no-data metadata.
 pub fn encode_lerc2_tiled_raw_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1354,11 +1357,6 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
     if version < 6 {
         return Err(LercError::WrongParam(
             "Lerc2 no-data encode requires version 6 or newer",
-        ));
-    }
-    if spec.n_depth <= 1 {
-        return Err(LercError::WrongParam(
-            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
@@ -1376,7 +1374,11 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
         micro_block_size,
         0,
         true,
-        prepared.no_data.or(Some((no_data_value, no_data_value))),
+        if spec.n_depth > 1 {
+            prepared.no_data.or(Some((no_data_value, no_data_value)))
+        } else {
+            None
+        },
     )
 }
 
@@ -1401,7 +1403,8 @@ pub fn encode_lerc2_byte_huffman(
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
-/// internal sentinel when needed and restored during decode.
+/// internal sentinel when needed and restored during decode. Single-depth inputs
+/// use mask filtering only and do not write no-data metadata.
 pub fn encode_lerc2_byte_huffman_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1413,11 +1416,6 @@ pub fn encode_lerc2_byte_huffman_with_no_data(
     if version < 6 {
         return Err(LercError::WrongParam(
             "Lerc2 no-data encode requires version 6 or newer",
-        ));
-    }
-    if spec.n_depth <= 1 {
-        return Err(LercError::WrongParam(
-            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, 0.5)?;
@@ -1433,7 +1431,11 @@ pub fn encode_lerc2_byte_huffman_with_no_data(
         version,
         0,
         true,
-        prepared.no_data.or(Some((no_data_value, no_data_value))),
+        if spec.n_depth > 1 {
+            prepared.no_data.or(Some((no_data_value, no_data_value)))
+        } else {
+            None
+        },
     )
 }
 
@@ -1804,7 +1806,7 @@ pub fn encode_lerc2_tiled_raw_bands_with_no_data(
         let prepared_no_data = prepared
             .as_ref()
             .and_then(|prepared| prepared.no_data)
-            .or(no_data);
+            .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
         let encode_mask = if band == 0 {
             true
         } else if spec.n_masks == 1 && prepared.is_none() {
@@ -2059,7 +2061,7 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
         let prepared_no_data = prepared
             .as_ref()
             .and_then(|prepared| prepared.no_data)
-            .or(no_data);
+            .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
         let encode_mask = if band == 0 {
             true
         } else if spec.n_masks == 1 && prepared.is_none() {
@@ -3449,11 +3451,6 @@ fn validate_encode_no_data_inputs(
     if version < 6 {
         return Err(LercError::WrongParam(
             "Lerc2 no-data encode requires version 6 or newer",
-        ));
-    }
-    if spec.n_depth <= 1 {
-        return Err(LercError::WrongParam(
-            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
     let no_data_values = no_data_values.ok_or(LercError::WrongParam(
@@ -7816,6 +7813,42 @@ mod tests {
         assert_eq!(
             decoded.bands[1].data,
             DecodedData::UChar(expected[band_len..].to_vec())
+        );
+    }
+
+    #[test]
+    fn encodes_single_depth_no_data_as_mask_without_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 4,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let values = [1u16, 999, 3, 4, 5, 999, 7, 8];
+        let data = values
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let blob = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&[1]),
+            Some(&[999.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert!(!decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.num_valid_pixel, 6);
+        assert_eq!(decoded.mask.to_byte_mask(), [1, 0, 1, 1, 1, 0, 1, 1]);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UShort(vec![1, 0, 3, 4, 5, 0, 7, 8])
         );
     }
 
