@@ -6,9 +6,9 @@ use lerc::{
     compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
     compute_lerc2_tiled_raw_byte_len, decode_lerc1, decode_lerc2_bands_supported,
     decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_constant,
-    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data,
-    encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_byte_huffman,
+    encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+    encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
     encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
     encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
     get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
@@ -172,6 +172,31 @@ fn main() {
     let mut ffi_decode_double_4d_uses_no_data = vec![0; 1];
     let mut ffi_decode_double_4d_no_data_values = vec![0.0f64; 1];
     let ffi_constant_encode_data = [7u8; 12];
+    let huffman_encode_spec = EncodeSpec {
+        data_type: DataType::UChar,
+        n_depth: 2,
+        n_cols: 8,
+        n_rows: 4,
+        n_bands: 1,
+        n_masks: 1,
+    };
+    let huffman_encode_data: Vec<u8> = (0..(huffman_encode_spec.n_cols
+        * huffman_encode_spec.n_rows))
+        .flat_map(|idx| {
+            [
+                (idx * 5) as u8,
+                (200usize.wrapping_sub(idx * 2) & 0xff) as u8,
+            ]
+        })
+        .collect();
+    let huffman_encode_mask = BitMask::from_byte_mask(
+        &(0..(huffman_encode_spec.n_cols * huffman_encode_spec.n_rows))
+            .map(|idx| u8::from(idx % 7 != 0 && idx % 11 != 0))
+            .collect::<Vec<_>>(),
+        huffman_encode_spec.n_cols,
+        huffman_encode_spec.n_rows,
+    )
+    .unwrap();
     let ffi_constant_encode_mask = [1u8, 0, 1, 1, 1, 1];
     let mut ffi_constant_encode_size = 0u32;
     let mut ffi_constant_encode_out = [0u8; 128];
@@ -624,6 +649,17 @@ fn main() {
                 Some(black_box(&encode_mask)),
                 6,
                 2,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-byte-huffman-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_byte_huffman(
+                huffman_encode_spec,
+                black_box(&huffman_encode_data),
+                Some(black_box(&huffman_encode_mask)),
+                6,
             )
             .unwrap(),
         );

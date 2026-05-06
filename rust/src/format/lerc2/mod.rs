@@ -13,6 +13,8 @@ http://www.apache.org/licenses/LICENSE-2.0
 use crate::types::{DataType, EncodeSpec, LercError, Result};
 use crate::{decode_lerc1, decode_typed_values, read_lerc1_z_stats, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
 /// Highest Lerc2 codec version recognized by this crate.
@@ -967,6 +969,117 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
         true,
         prepared.no_data.or(Some((no_data_value, no_data_value))),
     )
+}
+
+/// Encodes a single-band byte Lerc2 blob using integer Huffman payloads.
+///
+/// This ports the lossless byte Huffman image modes used by the C++ encoder for
+/// `UChar` and `Char` data with `max_z_error == 0.5`. Version 4 and newer may
+/// choose either regular Huffman or delta Huffman, matching the C++ mode
+/// selection rule of using the smaller candidate. Constant inputs should use
+/// [`encode_lerc2_constant`] instead.
+pub fn encode_lerc2_byte_huffman(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    encode_lerc2_byte_huffman_band(spec, data, mask, version, 0, true)
+}
+
+fn encode_lerc2_byte_huffman_band(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    version: i32,
+    n_blobs_more: i32,
+    encode_partial_mask: bool,
+) -> Result<Vec<u8>> {
+    validate_single_band_encode_inputs(spec, data, mask, "byte Huffman Lerc2 encode")?;
+    if !(4..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam(
+            "byte Huffman Lerc2 encode requires version 4 or newer",
+        ));
+    }
+    if !matches!(spec.data_type, DataType::UChar | DataType::Char) {
+        return Err(LercError::WrongParam(
+            "byte Huffman Lerc2 encode requires Char or UChar data",
+        ));
+    }
+
+    let mask = effective_encode_mask(spec, mask)?;
+    let num_valid_pixel = mask.count_valid_bits();
+    if num_valid_pixel == 0 {
+        return Err(LercError::WrongParam(
+            "byte Huffman Lerc2 encode requires valid pixels",
+        ));
+    }
+    if constant_value_for_uncompressed_encode(spec.data_type, data)?.is_some() {
+        return Err(LercError::WrongParam(
+            "constant byte input should use Lerc2 constant encode",
+        ));
+    }
+
+    let ranges = compute_lerc2_data_ranges_for_encode_with_mask(spec, data, &mask)?;
+    if ranges.min_max_equal {
+        return Err(LercError::WrongParam(
+            "constant byte ranges should use Lerc2 constant encode",
+        ));
+    }
+
+    let z_min = ranges.mins.iter().copied().fold(f64::INFINITY, f64::min);
+    let z_max = ranges
+        .maxs
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let header_size = compute_lerc2_header_byte_len(version)?;
+    let mut header = HeaderInfo {
+        version,
+        checksum: 0,
+        n_rows: spec.n_rows as i32,
+        n_cols: spec.n_cols as i32,
+        n_depth: spec.n_depth as i32,
+        num_valid_pixel: num_valid_pixel as i32,
+        micro_block_size: 8,
+        blob_size: 1,
+        n_blobs_more,
+        b_pass_no_data_values: 0,
+        b_is_int: 1,
+        b_reserved_3: 0,
+        b_reserved_4: 0,
+        data_type: spec.data_type,
+        max_z_error: 0.5,
+        z_min,
+        z_max,
+        no_data_val: 0.0,
+        no_data_val_orig: 0.0,
+        header_size,
+    };
+
+    let payload = encode_huffman_int_payload(&header, &mask, data)?;
+    let encode_mask = encode_partial_mask && mask.count_valid_bits() < spec.n_cols * spec.n_rows;
+    let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
+    let ranges_len = compute_lerc2_min_max_ranges_byte_len(&header)?;
+    header.blob_size = header
+        .header_size
+        .checked_add(mask_len)
+        .and_then(|len| len.checked_add(ranges_len))
+        .and_then(|len| len.checked_add(payload.len()))
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or(LercError::WrongParam(
+            "Lerc2 byte Huffman blob size overflow",
+        ))?;
+
+    let mut blob = vec![0; header.blob_size as usize];
+    let mut offset = write_lerc2_header(&header, &mut blob)?;
+    offset += write_lerc2_mask(&header, Some(&mask), encode_mask, &mut blob[offset..])?;
+    offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
+    blob[offset..offset + payload.len()].copy_from_slice(&payload);
+    offset += payload.len();
+    debug_assert_eq!(offset, blob.len());
+    finalize_lerc2_checksum(&mut blob)?;
+    Ok(blob)
 }
 
 fn encode_lerc2_tiled_raw_band(
@@ -3478,6 +3591,446 @@ struct HuffmanCodeTable {
     max_len: u8,
 }
 
+#[derive(Debug, Clone)]
+struct HuffmanEncodeTable {
+    codes: Vec<(u8, u32)>,
+}
+
+#[derive(Debug)]
+struct HuffmanCandidate {
+    image_mode: u8,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct HuffmanHeapEntry {
+    weight: usize,
+    min_symbol: usize,
+    node_idx: usize,
+}
+
+impl Ord for HuffmanHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .weight
+            .cmp(&self.weight)
+            .then_with(|| other.min_symbol.cmp(&self.min_symbol))
+            .then_with(|| other.node_idx.cmp(&self.node_idx))
+    }
+}
+
+impl PartialOrd for HuffmanHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanLengthNode {
+    left: Option<usize>,
+    right: Option<usize>,
+    symbol: Option<usize>,
+}
+
+fn encode_huffman_int_payload(header: &HeaderInfo, mask: &BitMask, data: &[u8]) -> Result<Vec<u8>> {
+    let (histo, delta_histo) = compute_huffman_int_histograms(header, mask, data)?;
+    let regular = huffman_candidate(header, mask, data, 2, &histo)?;
+    let delta = huffman_candidate(header, mask, data, 1, &delta_histo)?;
+    let selected = match (regular, delta) {
+        (Some(regular), Some(delta)) => {
+            if regular.payload.len() <= delta.payload.len() {
+                regular
+            } else {
+                delta
+            }
+        }
+        (Some(regular), None) => regular,
+        (None, Some(delta)) => delta,
+        (None, None) => {
+            return Err(LercError::WrongParam(
+                "byte Huffman encode requires at least two symbols",
+            ));
+        }
+    };
+
+    let mut out = Vec::with_capacity(2 + selected.payload.len());
+    out.push(0);
+    out.push(selected.image_mode);
+    out.extend_from_slice(&selected.payload);
+    Ok(out)
+}
+
+fn huffman_candidate(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &[u8],
+    image_mode: u8,
+    histo: &[usize; 256],
+) -> Result<Option<HuffmanCandidate>> {
+    let Some(table) = compute_huffman_encode_table(histo)? else {
+        return Ok(None);
+    };
+    let mut payload = Vec::new();
+    write_huffman_code_table(&table, header.version, &mut payload)?;
+    write_huffman_int_data_bits(header, mask, data, image_mode, &table, &mut payload)?;
+    Ok(Some(HuffmanCandidate {
+        image_mode,
+        payload,
+    }))
+}
+
+fn compute_huffman_int_histograms(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &[u8],
+) -> Result<([usize; 256], [usize; 256])> {
+    if !matches!(header.data_type, DataType::UChar | DataType::Char) {
+        return Err(LercError::WrongParam(
+            "integer Huffman histograms require byte data",
+        ));
+    }
+    let n_rows = header.n_rows as usize;
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+    let mut histo = [0usize; 256];
+    let mut delta_histo = [0usize; 256];
+
+    match header.data_type {
+        DataType::UChar => {
+            for i_depth in 0..n_depth {
+                let mut prev = 0u8;
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        let pixel_idx = row * n_cols + col;
+                        if !mask.is_valid(pixel_idx)? {
+                            continue;
+                        }
+                        let src = pixel_idx * n_depth + i_depth;
+                        let value = data[src];
+                        let base = if col > 0 && mask.is_valid(pixel_idx - 1)? {
+                            prev
+                        } else if row > 0 && mask.is_valid(pixel_idx - n_cols)? {
+                            data[(pixel_idx - n_cols) * n_depth + i_depth]
+                        } else {
+                            prev
+                        };
+                        histo[value as usize] += 1;
+                        delta_histo[value.wrapping_sub(base) as usize] += 1;
+                        prev = value;
+                    }
+                }
+            }
+        }
+        DataType::Char => {
+            for i_depth in 0..n_depth {
+                let mut prev = 0i8;
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        let pixel_idx = row * n_cols + col;
+                        if !mask.is_valid(pixel_idx)? {
+                            continue;
+                        }
+                        let src = pixel_idx * n_depth + i_depth;
+                        let value = data[src] as i8;
+                        let base = if col > 0 && mask.is_valid(pixel_idx - 1)? {
+                            prev
+                        } else if row > 0 && mask.is_valid(pixel_idx - n_cols)? {
+                            data[(pixel_idx - n_cols) * n_depth + i_depth] as i8
+                        } else {
+                            prev
+                        };
+                        histo[(i16::from(value) + 128) as usize] += 1;
+                        delta_histo[(i16::from(value.wrapping_sub(base)) + 128) as usize] += 1;
+                        prev = value;
+                    }
+                }
+            }
+        }
+        _ => unreachable!("checked byte data type above"),
+    }
+
+    Ok((histo, delta_histo))
+}
+
+fn compute_huffman_encode_table(histo: &[usize; 256]) -> Result<Option<HuffmanEncodeTable>> {
+    let mut heap = BinaryHeap::new();
+    let mut nodes = Vec::new();
+    for (symbol, &count) in histo.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let node_idx = nodes.len();
+        nodes.push(HuffmanLengthNode {
+            left: None,
+            right: None,
+            symbol: Some(symbol),
+        });
+        heap.push(HuffmanHeapEntry {
+            weight: count,
+            min_symbol: symbol,
+            node_idx,
+        });
+    }
+
+    if heap.len() < 2 {
+        return Ok(None);
+    }
+
+    while heap.len() > 1 {
+        let first = heap.pop().unwrap();
+        let second = heap.pop().unwrap();
+        let node_idx = nodes.len();
+        nodes.push(HuffmanLengthNode {
+            left: Some(first.node_idx),
+            right: Some(second.node_idx),
+            symbol: None,
+        });
+        heap.push(HuffmanHeapEntry {
+            weight: first
+                .weight
+                .checked_add(second.weight)
+                .ok_or(LercError::WrongParam("Huffman histogram weight overflow"))?,
+            min_symbol: first.min_symbol.min(second.min_symbol),
+            node_idx,
+        });
+    }
+
+    let root = heap.pop().unwrap().node_idx;
+    let mut lengths = vec![0u8; 256];
+    fill_huffman_lengths(&nodes, root, 0, &mut lengths)?;
+    Ok(Some(canonical_huffman_table(&lengths)))
+}
+
+fn fill_huffman_lengths(
+    nodes: &[HuffmanLengthNode],
+    node_idx: usize,
+    depth: u8,
+    lengths: &mut [u8],
+) -> Result<()> {
+    let node = &nodes[node_idx];
+    if let Some(symbol) = node.symbol {
+        if depth == 0 || depth > 32 {
+            return Err(LercError::WrongParam("invalid Huffman code length"));
+        }
+        lengths[symbol] = depth;
+        return Ok(());
+    }
+    if depth == 32 {
+        return Err(LercError::WrongParam("Huffman code length exceeds 32 bits"));
+    }
+    fill_huffman_lengths(nodes, node.left.unwrap(), depth + 1, lengths)?;
+    fill_huffman_lengths(nodes, node.right.unwrap(), depth + 1, lengths)?;
+    Ok(())
+}
+
+fn canonical_huffman_table(lengths: &[u8]) -> HuffmanEncodeTable {
+    let table_size = lengths.len();
+    let mut symbols: Vec<(u8, usize)> = lengths
+        .iter()
+        .enumerate()
+        .filter_map(|(symbol, &len)| (len > 0).then_some((len, symbol)))
+        .collect();
+    symbols.sort_unstable();
+    let mut codes = vec![(0u8, 0u32); table_size];
+    let mut code = 0u32;
+    let mut previous_len = 0u8;
+    for (len, symbol) in symbols {
+        code <<= len - previous_len;
+        codes[symbol] = (len, code);
+        previous_len = len;
+        code += 1;
+    }
+
+    HuffmanEncodeTable { codes }
+}
+
+fn write_huffman_code_table(
+    table: &HuffmanEncodeTable,
+    lerc2_version: i32,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let (i0, i1, _max_len) = huffman_code_range(&table.codes)?;
+    out.extend_from_slice(&4i32.to_le_bytes());
+    out.extend_from_slice(&(table.codes.len() as i32).to_le_bytes());
+    out.extend_from_slice(&i0.to_le_bytes());
+    out.extend_from_slice(&i1.to_le_bytes());
+
+    let lengths: Vec<u32> = (i0..i1)
+        .map(|i| {
+            let idx = huffman_index_wrap(i, table.codes.len() as i32).unwrap() as usize;
+            table.codes[idx].0 as u32
+        })
+        .collect();
+    out.extend_from_slice(&BitStuffer2::encode_simple(&lengths, lerc2_version)?);
+
+    let mut bits = HuffmanBitWriter::new();
+    for i in i0..i1 {
+        let idx = huffman_index_wrap(i, table.codes.len() as i32)? as usize;
+        let (len, code) = table.codes[idx];
+        if len > 0 {
+            bits.push_bits(code, len)?;
+        }
+    }
+    out.extend_from_slice(&bits.finish(false));
+    Ok(())
+}
+
+fn huffman_code_range(codes: &[(u8, u32)]) -> Result<(i32, i32, u8)> {
+    let size = codes.len();
+    let first = codes
+        .iter()
+        .position(|&(len, _)| len > 0)
+        .ok_or(LercError::WrongParam("empty Huffman code table"))?;
+    let last = codes
+        .iter()
+        .rposition(|&(len, _)| len > 0)
+        .ok_or(LercError::WrongParam("empty Huffman code table"))?
+        + 1;
+
+    let mut i0 = first;
+    let mut i1 = last;
+    let mut best_zero_start = 0usize;
+    let mut best_zero_len = 0usize;
+    let mut pos = 0usize;
+    while pos < size {
+        while pos < size && codes[pos].0 > 0 {
+            pos += 1;
+        }
+        let zero_start = pos;
+        while pos < size && codes[pos].0 == 0 {
+            pos += 1;
+        }
+        let zero_len = pos - zero_start;
+        if zero_len > best_zero_len {
+            best_zero_start = zero_start;
+            best_zero_len = zero_len;
+        }
+    }
+    if size - best_zero_len < i1 - i0 {
+        i0 = best_zero_start + best_zero_len;
+        i1 = best_zero_start + size;
+    }
+
+    let mut max_len = 0u8;
+    for i in i0..i1 {
+        let idx = huffman_index_wrap(i as i32, size as i32)? as usize;
+        max_len = max_len.max(codes[idx].0);
+    }
+    if max_len == 0 || max_len > 32 {
+        return Err(LercError::WrongParam("invalid Huffman code range"));
+    }
+    Ok((i0 as i32, i1 as i32, max_len))
+}
+
+fn write_huffman_int_data_bits(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &[u8],
+    image_mode: u8,
+    table: &HuffmanEncodeTable,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let n_rows = header.n_rows as usize;
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+    let mut bits = HuffmanBitWriter::new();
+
+    match (header.data_type, image_mode) {
+        (DataType::UChar, 1) => {
+            for i_depth in 0..n_depth {
+                let mut prev = 0u8;
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        let pixel_idx = row * n_cols + col;
+                        if !mask.is_valid(pixel_idx)? {
+                            continue;
+                        }
+                        let src = pixel_idx * n_depth + i_depth;
+                        let value = data[src];
+                        let base = if col > 0 && mask.is_valid(pixel_idx - 1)? {
+                            prev
+                        } else if row > 0 && mask.is_valid(pixel_idx - n_cols)? {
+                            data[(pixel_idx - n_cols) * n_depth + i_depth]
+                        } else {
+                            prev
+                        };
+                        write_huffman_symbol(&mut bits, table, value.wrapping_sub(base) as usize)?;
+                        prev = value;
+                    }
+                }
+            }
+        }
+        (DataType::UChar, 2) => {
+            for pixel_idx in 0..(n_rows * n_cols) {
+                if !mask.is_valid(pixel_idx)? {
+                    continue;
+                }
+                let src = pixel_idx * n_depth;
+                for i_depth in 0..n_depth {
+                    write_huffman_symbol(&mut bits, table, data[src + i_depth] as usize)?;
+                }
+            }
+        }
+        (DataType::Char, 1) => {
+            for i_depth in 0..n_depth {
+                let mut prev = 0i8;
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        let pixel_idx = row * n_cols + col;
+                        if !mask.is_valid(pixel_idx)? {
+                            continue;
+                        }
+                        let src = pixel_idx * n_depth + i_depth;
+                        let value = data[src] as i8;
+                        let base = if col > 0 && mask.is_valid(pixel_idx - 1)? {
+                            prev
+                        } else if row > 0 && mask.is_valid(pixel_idx - n_cols)? {
+                            data[(pixel_idx - n_cols) * n_depth + i_depth] as i8
+                        } else {
+                            prev
+                        };
+                        let symbol = (i16::from(value.wrapping_sub(base)) + 128) as usize;
+                        write_huffman_symbol(&mut bits, table, symbol)?;
+                        prev = value;
+                    }
+                }
+            }
+        }
+        (DataType::Char, 2) => {
+            for pixel_idx in 0..(n_rows * n_cols) {
+                if !mask.is_valid(pixel_idx)? {
+                    continue;
+                }
+                let src = pixel_idx * n_depth;
+                for i_depth in 0..n_depth {
+                    let symbol = (i16::from(data[src + i_depth] as i8) + 128) as usize;
+                    write_huffman_symbol(&mut bits, table, symbol)?;
+                }
+            }
+        }
+        _ => {
+            return Err(LercError::WrongParam(
+                "unsupported integer Huffman encode mode",
+            ));
+        }
+    }
+
+    out.extend_from_slice(&bits.finish(true));
+    Ok(())
+}
+
+fn write_huffman_symbol(
+    bits: &mut HuffmanBitWriter,
+    table: &HuffmanEncodeTable,
+    symbol: usize,
+) -> Result<()> {
+    let (len, code) = table.codes[symbol];
+    if len == 0 {
+        return Err(LercError::WrongParam("missing Huffman symbol code"));
+    }
+    bits.push_bits(code, len)
+}
+
 fn read_huffman_int_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
@@ -3677,6 +4230,66 @@ impl HuffmanCodeTable {
 struct HuffmanBitReader<'a> {
     bytes: &'a [u8],
     bit_pos: usize,
+}
+
+struct HuffmanBitWriter {
+    words: Vec<u32>,
+    bit_pos: usize,
+}
+
+impl HuffmanBitWriter {
+    fn new() -> Self {
+        Self {
+            words: Vec::new(),
+            bit_pos: 0,
+        }
+    }
+
+    fn push_bits(&mut self, value: u32, len: u8) -> Result<()> {
+        if len == 0 || len > 32 {
+            return Err(LercError::WrongParam("invalid Huffman bit width"));
+        }
+        let value = if len == 32 {
+            value
+        } else {
+            value & ((1u32 << len) - 1)
+        };
+        let word_idx = self.bit_pos / 32;
+        let bit_in_word = self.bit_pos % 32;
+        if self.words.len() <= word_idx {
+            self.words.resize(word_idx + 1, 0);
+        }
+
+        if 32 - bit_in_word >= len as usize {
+            self.words[word_idx] |= value << (32 - bit_in_word - len as usize);
+            self.bit_pos += len as usize;
+        } else {
+            let first_len = 32 - bit_in_word;
+            let second_len = len as usize - first_len;
+            self.words[word_idx] |= value >> second_len;
+            let next_idx = word_idx + 1;
+            if self.words.len() <= next_idx {
+                self.words.resize(next_idx + 1, 0);
+            }
+            self.words[next_idx] |= value << (32 - second_len);
+            self.bit_pos += len as usize;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, add_lookahead_word: bool) -> Vec<u8> {
+        let used_words = self.bit_pos.div_ceil(32);
+        self.words.truncate(used_words);
+        if add_lookahead_word {
+            self.words.push(0);
+        }
+
+        let mut out = Vec::with_capacity(self.words.len() * 4);
+        for word in self.words {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
 }
 
 impl<'a> HuffmanBitReader<'a> {
@@ -4133,9 +4746,9 @@ mod tests {
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
         compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
         decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
-        encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+        encode_lerc2_byte_huffman, encode_lerc2_constant, encode_lerc2_one_sweep,
+        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
+        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
         encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
         get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
@@ -5212,6 +5825,101 @@ mod tests {
         assert_eq!(ranges.mins, [1.0, 2.0]);
         assert_eq!(ranges.maxs, [7.0, 9.0]);
         assert!(!ranges.min_max_equal);
+    }
+
+    #[test]
+    fn encodes_byte_huffman_lerc2_for_supported_decode_round_trip() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 8,
+            n_rows: 4,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = Vec::new();
+        for row in 0..spec.n_rows {
+            for col in 0..spec.n_cols {
+                data.push((row * 3 + col * 5) as u8);
+                data.push((200usize.wrapping_sub(row * 7 + col * 2) & 0xff) as u8);
+            }
+        }
+        let mask_bytes: Vec<u8> = (0..(spec.n_cols * spec.n_rows))
+            .map(|idx| u8::from(idx % 7 != 0 && idx % 11 != 0))
+            .collect();
+        let mask = BitMask::from_byte_mask(&mask_bytes, spec.n_cols, spec.n_rows).unwrap();
+
+        let blob = encode_lerc2_byte_huffman(spec, &data, Some(&mask), 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 6);
+        assert_eq!(decoded.mask, mask);
+        let mut expected = data.clone();
+        for (pixel_idx, valid) in mask_bytes.iter().enumerate() {
+            if *valid == 0 {
+                expected[pixel_idx * 2] = 0;
+                expected[pixel_idx * 2 + 1] = 0;
+            }
+        }
+        assert_eq!(decoded.data, DecodedData::UChar(expected));
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(
+            validate_lerc2_checksum(&blob).unwrap().blob_size as usize,
+            blob.len()
+        );
+    }
+
+    #[test]
+    fn encodes_signed_byte_huffman_lerc2_round_trip() {
+        let spec = EncodeSpec {
+            data_type: DataType::Char,
+            n_depth: 1,
+            n_cols: 8,
+            n_rows: 4,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data: Vec<u8> = (0..(spec.n_cols * spec.n_rows))
+            .map(|idx| (((idx as i16 * 9) % 127) - 63) as i8 as u8)
+            .collect();
+
+        let blob = encode_lerc2_byte_huffman(spec, &data, None, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        let expected: Vec<i8> = data.iter().map(|&value| value as i8).collect();
+        assert_eq!(decoded.header.data_type, DataType::Char);
+        assert_eq!(decoded.mask.count_valid_bits(), spec.n_cols * spec.n_rows);
+        assert_eq!(decoded.data, DecodedData::Char(expected));
+    }
+
+    #[test]
+    fn rejects_invalid_byte_huffman_encode_inputs() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0];
+        assert_eq!(
+            encode_lerc2_byte_huffman(spec, &data, None, 6).unwrap_err(),
+            LercError::WrongParam("byte Huffman Lerc2 encode requires Char or UChar data")
+        );
+
+        let byte_spec = EncodeSpec {
+            data_type: DataType::UChar,
+            ..spec
+        };
+        assert_eq!(
+            encode_lerc2_byte_huffman(byte_spec, &[7; 6], None, 6).unwrap_err(),
+            LercError::WrongParam("constant byte input should use Lerc2 constant encode")
+        );
+        assert_eq!(
+            encode_lerc2_byte_huffman(byte_spec, &[1, 2, 3, 4, 5, 6], None, 3).unwrap_err(),
+            LercError::WrongParam("byte Huffman Lerc2 encode requires version 4 or newer")
+        );
     }
 
     #[test]
