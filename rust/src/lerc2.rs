@@ -592,6 +592,92 @@ pub fn write_lerc2_one_sweep(
     Ok(writer.pos)
 }
 
+/// Computes the serialized byte count for a raw tiled payload section.
+///
+/// The returned size includes the one-byte tiled-payload flag, one raw-tile
+/// flag per tile and depth, and one scalar value for each valid pixel in each
+/// depth plane.
+pub fn compute_lerc2_tiled_raw_byte_len(header: &HeaderInfo, mask: &BitMask) -> Result<usize> {
+    validate_lerc2_tiled_raw_for_write(header, mask, None)?;
+
+    let n_depth = header.n_depth as usize;
+    let value_size = header.data_type.size_in_bytes();
+    let mb_size = header.micro_block_size as usize;
+    let tiles_vert = (header.n_rows as usize).div_ceil(mb_size);
+    let tiles_hori = (header.n_cols as usize).div_ceil(mb_size);
+    let tile_flag_count = tiles_vert
+        .checked_mul(tiles_hori)
+        .and_then(|count| count.checked_mul(n_depth))
+        .ok_or(LercError::WrongParam(
+            "Lerc2 raw tiled flag byte count overflow",
+        ))?;
+    let data_len = (header.num_valid_pixel as usize)
+        .checked_mul(n_depth)
+        .and_then(|count| count.checked_mul(value_size))
+        .ok_or(LercError::WrongParam(
+            "Lerc2 raw tiled payload byte count overflow",
+        ))?;
+
+    1usize
+        .checked_add(tile_flag_count)
+        .and_then(|len| len.checked_add(data_len))
+        .ok_or(LercError::WrongParam(
+            "Lerc2 raw tiled payload byte count overflow",
+        ))
+}
+
+/// Writes a raw tiled Lerc2 payload section.
+///
+/// `data` must contain the full image in row-major little-endian scalar bytes,
+/// including values for invalid pixels. Only valid pixels are copied into each
+/// tile payload.
+pub fn write_lerc2_tiled_raw(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &[u8],
+    output: &mut [u8],
+) -> Result<usize> {
+    validate_lerc2_tiled_raw_for_write(header, mask, Some(data))?;
+    let byte_len = compute_lerc2_tiled_raw_byte_len(header, mask)?;
+    if output.len() < byte_len {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let n_cols = header.n_cols as usize;
+    let n_rows = header.n_rows as usize;
+    let n_depth = header.n_depth as usize;
+    let value_size = header.data_type.size_in_bytes();
+    let mb_size = header.micro_block_size as usize;
+    let tiles_vert = n_rows.div_ceil(mb_size);
+    let tiles_hori = n_cols.div_ceil(mb_size);
+    let mut writer = Writer::new(output);
+
+    writer.write_bytes(&[0])?;
+    for i_tile in 0..tiles_vert {
+        let i0 = i_tile * mb_size;
+        let i1 = (i0 + mb_size).min(n_rows);
+        for j_tile in 0..tiles_hori {
+            let j0 = j_tile * mb_size;
+            let j1 = (j0 + mb_size).min(n_cols);
+            let raw_flag = raw_tile_flag(header.version, j0);
+            for depth in 0..n_depth {
+                writer.write_bytes(&[raw_flag])?;
+                for row in i0..i1 {
+                    for col in j0..j1 {
+                        let pixel_idx = row * n_cols + col;
+                        if mask.is_valid(pixel_idx)? {
+                            let offset = (pixel_idx * n_depth + depth) * value_size;
+                            writer.write_bytes(&data[offset..offset + value_size])?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(writer.pos)
+}
+
 /// Computes per-depth min/max ranges from full image bytes for Lerc2 encoding.
 ///
 /// `data` must contain one single-band image in row-major little-endian scalar
@@ -1951,6 +2037,58 @@ fn validate_lerc2_one_sweep_for_write(
     Ok(())
 }
 
+fn validate_lerc2_tiled_raw_for_write(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: Option<&[u8]>,
+) -> Result<()> {
+    if header.num_valid_pixel < 0 {
+        return Err(LercError::WrongParam("invalid Lerc2 valid pixel count"));
+    }
+    if header.n_depth <= 0 || header.n_cols <= 0 || header.n_rows <= 0 {
+        return Err(LercError::WrongParam(
+            "Lerc2 raw tiled dimensions must be positive",
+        ));
+    }
+    if header.micro_block_size <= 0 || header.micro_block_size > 32 {
+        return Err(LercError::WrongParam(
+            "Lerc2 raw tiled micro block size must be 1 through 32",
+        ));
+    }
+    if mask.cols() != header.n_cols as usize || mask.rows() != header.n_rows as usize {
+        return Err(LercError::WrongParam(
+            "Lerc2 raw tiled mask dimensions do not match header",
+        ));
+    }
+    if mask.count_valid_bits() != header.num_valid_pixel as usize {
+        return Err(LercError::WrongParam(
+            "Lerc2 raw tiled mask valid count does not match header",
+        ));
+    }
+
+    if let Some(data) = data {
+        let expected_len = (header.n_cols as usize)
+            .checked_mul(header.n_rows as usize)
+            .and_then(|count| count.checked_mul(header.n_depth as usize))
+            .and_then(|count| count.checked_mul(header.data_type.size_in_bytes()))
+            .ok_or(LercError::WrongParam(
+                "Lerc2 raw tiled data byte count overflow",
+            ))?;
+        if data.len() != expected_len {
+            return Err(LercError::WrongParam(
+                "Lerc2 raw tiled data length does not match header",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn raw_tile_flag(version: i32, j0: usize) -> u8 {
+    let pattern = if version >= 5 { 14 } else { 15 };
+    (((j0 >> 3) as u8) & pattern) << 2
+}
+
 fn validate_single_band_encode_inputs(
     spec: EncodeSpec,
     data: &[u8],
@@ -3238,17 +3376,17 @@ mod tests {
         compute_checksum_fletcher32, compute_lerc2_data_ranges_for_encode,
         compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
         compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-        decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-        decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_constant,
-        encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
+        decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
+        encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
         encode_lerc2_one_sweep_bands_with_no_data, finalize_lerc2_checksum,
         get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
         get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
-        write_lerc2_one_sweep, DecodeIntoSpec, HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec, HeaderInfo, MinMaxRanges,
+        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -3355,6 +3493,40 @@ mod tests {
         assert_eq!(written_mask, mask_len);
         assert_eq!(written_ranges, ranges_len);
         assert_eq!(written_payload, payload_len);
+        blob
+    }
+
+    fn blob_with_written_tiled_raw(
+        header: &mut HeaderInfo,
+        mask: &BitMask,
+        ranges: &MinMaxRanges,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let header_len = compute_lerc2_header_byte_len(header.version).unwrap();
+        let mask_len = compute_lerc2_mask_byte_len(header, Some(mask), true).unwrap();
+        let ranges_len = compute_lerc2_min_max_ranges_byte_len(header).unwrap();
+        let payload_len = compute_lerc2_tiled_raw_byte_len(header, mask).unwrap();
+        header.blob_size = (header_len + mask_len + ranges_len + payload_len) as i32;
+
+        let mut blob = vec![0; header.blob_size as usize];
+        let written_header = write_lerc2_header(header, &mut blob).unwrap();
+        let written_mask =
+            write_lerc2_mask(header, Some(mask), true, &mut blob[written_header..]).unwrap();
+        let written_ranges =
+            write_lerc2_min_max_ranges(header, ranges, &mut blob[written_header + written_mask..])
+                .unwrap();
+        let written_payload = write_lerc2_tiled_raw(
+            header,
+            mask,
+            data,
+            &mut blob[written_header + written_mask + written_ranges..],
+        )
+        .unwrap();
+        assert_eq!(written_header, header_len);
+        assert_eq!(written_mask, mask_len);
+        assert_eq!(written_ranges, ranges_len);
+        assert_eq!(written_payload, payload_len);
+        finalize_lerc2_checksum(&mut blob).unwrap();
         blob
     }
 
@@ -4680,6 +4852,90 @@ mod tests {
         assert_eq!(
             write_lerc2_one_sweep(&header, &mask, &data[..10], &mut [0; 16]).unwrap_err(),
             LercError::WrongParam("Lerc2 one-sweep data length does not match header")
+        );
+    }
+
+    #[test]
+    fn writes_lerc2_tiled_raw_payload_for_supported_decode_round_trip() {
+        let valid = [1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1];
+        let mask = BitMask::from_byte_mask(&valid, 5, 3).unwrap();
+        let mut header = HeaderInfo {
+            version: 4,
+            checksum: 0,
+            n_rows: 3,
+            n_cols: 5,
+            n_depth: 2,
+            num_valid_pixel: mask.count_valid_bits() as i32,
+            micro_block_size: 2,
+            blob_size: 0,
+            n_blobs_more: 0,
+            b_pass_no_data_values: 0,
+            b_is_int: 1,
+            b_reserved_3: 0,
+            b_reserved_4: 0,
+            data_type: DataType::UChar,
+            max_z_error: 0.0,
+            z_min: 0.0,
+            z_max: 29.0,
+            no_data_val: 0.0,
+            no_data_val_orig: 0.0,
+            header_size: compute_lerc2_header_byte_len(4).unwrap(),
+        };
+        let ranges = MinMaxRanges {
+            mins: vec![0.0, 1.0],
+            maxs: vec![28.0, 29.0],
+            bytes_consumed: 0,
+            min_max_equal: false,
+        };
+        let data: Vec<u8> = (0..30).collect();
+
+        assert_eq!(
+            compute_lerc2_tiled_raw_byte_len(&header, &mask).unwrap(),
+            37
+        );
+        let blob = blob_with_written_tiled_raw(&mut header, &mask, &ranges, &data);
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.mask, mask);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![
+                0, 1, 0, 0, 4, 5, 6, 7, 8, 9, 0, 0, 12, 13, 14, 15, 16, 17, 18, 19, 0, 0, 22, 23,
+                24, 25, 26, 27, 28, 29
+            ])
+        );
+        assert_eq!(decoded.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn rejects_invalid_lerc2_tiled_raw_write_inputs() {
+        let mut header = header_for_write(4);
+        header.data_type = DataType::UChar;
+        header.n_depth = 2;
+        header.micro_block_size = 2;
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        header.num_valid_pixel = mask.count_valid_bits() as i32;
+        let data = [1, 2, 9, 9, 3, 4, 5, 6, 7, 8, 9, 9];
+
+        assert_eq!(
+            write_lerc2_tiled_raw(&header, &mask, &data, &mut [0; 12]).unwrap_err(),
+            LercError::BufferTooSmall
+        );
+
+        let wrong_dims = BitMask::from_byte_mask(&[1, 1, 1, 1], 2, 2).unwrap();
+        assert_eq!(
+            write_lerc2_tiled_raw(&header, &wrong_dims, &data, &mut [0; 32]).unwrap_err(),
+            LercError::WrongParam("Lerc2 raw tiled mask dimensions do not match header")
+        );
+        assert_eq!(
+            write_lerc2_tiled_raw(&header, &mask, &data[..10], &mut [0; 32]).unwrap_err(),
+            LercError::WrongParam("Lerc2 raw tiled data length does not match header")
+        );
+
+        header.micro_block_size = 0;
+        assert_eq!(
+            compute_lerc2_tiled_raw_byte_len(&header, &mask).unwrap_err(),
+            LercError::WrongParam("Lerc2 raw tiled micro block size must be 1 through 32")
         );
     }
 
