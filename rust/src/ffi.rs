@@ -19,6 +19,277 @@ use core::ffi::c_void;
 use core::slice;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+/// C ABI equivalent of `lerc_computeCompressedSize`.
+///
+/// Encoding is not ported yet. Valid calls currently zero `num_bytes` and
+/// return [`ErrCode::Failed`].
+///
+/// # Safety
+///
+/// `p_data` must point to readable scalar data for the requested shape. When
+/// `n_masks` is nonzero, `p_valid_bytes` must point to `n_cols * n_rows *
+/// n_masks` readable bytes. `num_bytes` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_computeCompressedSize(
+    p_data: *const c_void,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    num_bytes: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_compute_compressed_size_impl(
+            p_data,
+            -1,
+            data_type,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            n_masks,
+            p_valid_bytes,
+            max_z_err,
+            num_bytes,
+            None,
+            None,
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
+///
+/// Encoding is not ported yet. Valid calls currently zero `num_bytes` and
+/// return [`ErrCode::Failed`].
+///
+/// # Safety
+///
+/// The pointer requirements match [`lerc_computeCompressedSize`].
+#[no_mangle]
+pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
+    p_data: *const c_void,
+    codec_version: i32,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    num_bytes: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_compute_compressed_size_impl(
+            p_data,
+            codec_version,
+            data_type,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            n_masks,
+            p_valid_bytes,
+            max_z_err,
+            num_bytes,
+            None,
+            None,
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_encode`.
+///
+/// Encoding is not ported yet. Valid calls currently zero `n_bytes_written`
+/// and return [`ErrCode::Failed`].
+///
+/// # Safety
+///
+/// `p_data` and optional `p_valid_bytes` must be readable for the requested
+/// shape. `p_out_buffer` must point to `out_buffer_size` writable bytes.
+/// `n_bytes_written` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_encode(
+    p_data: *const c_void,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    p_out_buffer: *mut u8,
+    out_buffer_size: u32,
+    n_bytes_written: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_encode_impl(
+            p_data,
+            -1,
+            data_type,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            n_masks,
+            p_valid_bytes,
+            max_z_err,
+            p_out_buffer,
+            out_buffer_size,
+            n_bytes_written,
+            None,
+            None,
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_encodeForVersion`.
+///
+/// Encoding is not ported yet. Valid calls currently zero `n_bytes_written`
+/// and return [`ErrCode::Failed`].
+///
+/// # Safety
+///
+/// The pointer requirements match [`lerc_encode`].
+#[no_mangle]
+pub unsafe extern "C" fn lerc_encodeForVersion(
+    p_data: *const c_void,
+    codec_version: i32,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    p_out_buffer: *mut u8,
+    out_buffer_size: u32,
+    n_bytes_written: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_encode_impl(
+            p_data,
+            codec_version,
+            data_type,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            n_masks,
+            p_valid_bytes,
+            max_z_err,
+            p_out_buffer,
+            out_buffer_size,
+            n_bytes_written,
+            None,
+            None,
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_computeCompressedSize_4D`.
+///
+/// Encoding is not ported yet. Valid calls currently zero `num_bytes` and
+/// return [`ErrCode::Failed`].
+///
+/// # Safety
+///
+/// The pointer requirements match [`lerc_computeCompressedSize`]. When
+/// `p_uses_no_data` is non-null, `no_data_values` must point to at least
+/// `n_bands` readable values.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_computeCompressedSize_4D(
+    p_data: *const c_void,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    num_bytes: *mut u32,
+    p_uses_no_data: *const u8,
+    no_data_values: *const f64,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_compute_compressed_size_impl(
+            p_data,
+            -1,
+            data_type,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            n_masks,
+            p_valid_bytes,
+            max_z_err,
+            num_bytes,
+            Some(p_uses_no_data),
+            Some(no_data_values),
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_encode_4D`.
+///
+/// Encoding is not ported yet. Valid calls currently zero `n_bytes_written`
+/// and return [`ErrCode::Failed`].
+///
+/// # Safety
+///
+/// The pointer requirements match [`lerc_encode`]. When `p_uses_no_data` is
+/// non-null, `no_data_values` must point to at least `n_bands` readable values.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_encode_4D(
+    p_data: *const c_void,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    p_out_buffer: *mut u8,
+    out_buffer_size: u32,
+    n_bytes_written: *mut u32,
+    p_uses_no_data: *const u8,
+    no_data_values: *const f64,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_encode_impl(
+            p_data,
+            -1,
+            data_type,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
+            n_masks,
+            p_valid_bytes,
+            max_z_err,
+            p_out_buffer,
+            out_buffer_size,
+            n_bytes_written,
+            Some(p_uses_no_data),
+            Some(no_data_values),
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
 /// C ABI equivalent of `lerc_getBlobInfo`.
 ///
 /// This function currently supports Lerc2 blobs handled by the Rust metadata
@@ -243,6 +514,136 @@ pub unsafe extern "C" fn lerc_decodeToDouble_4D(
         )
     }))
     .unwrap_or(ErrCode::Failed as u32)
+}
+
+unsafe fn lerc_compute_compressed_size_impl(
+    p_data: *const c_void,
+    _codec_version: i32,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    num_bytes: *mut u32,
+    p_uses_no_data: Option<*const u8>,
+    no_data_values: Option<*const f64>,
+) -> u32 {
+    if num_bytes.is_null() {
+        return ErrCode::WrongParam as u32;
+    }
+    unsafe {
+        *num_bytes = 0;
+    }
+
+    match validate_encode_shape(
+        p_data,
+        data_type,
+        n_depth,
+        n_cols,
+        n_rows,
+        n_bands,
+        n_masks,
+        p_valid_bytes,
+        max_z_err,
+    ) {
+        Ok(()) => {}
+        Err(err) => return err as u32,
+    }
+    if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
+        return ErrCode::WrongParam as u32;
+    }
+
+    ErrCode::Failed as u32
+}
+
+unsafe fn lerc_encode_impl(
+    p_data: *const c_void,
+    _codec_version: i32,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+    p_out_buffer: *mut u8,
+    out_buffer_size: u32,
+    n_bytes_written: *mut u32,
+    p_uses_no_data: Option<*const u8>,
+    no_data_values: Option<*const f64>,
+) -> u32 {
+    if n_bytes_written.is_null() {
+        return ErrCode::WrongParam as u32;
+    }
+    unsafe {
+        *n_bytes_written = 0;
+    }
+
+    match validate_encode_shape(
+        p_data,
+        data_type,
+        n_depth,
+        n_cols,
+        n_rows,
+        n_bands,
+        n_masks,
+        p_valid_bytes,
+        max_z_err,
+    ) {
+        Ok(()) => {}
+        Err(err) => return err as u32,
+    }
+    if p_out_buffer.is_null() || out_buffer_size == 0 {
+        return ErrCode::WrongParam as u32;
+    }
+    if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
+        return ErrCode::WrongParam as u32;
+    }
+
+    ErrCode::Failed as u32
+}
+
+fn validate_encode_shape(
+    p_data: *const c_void,
+    data_type: u32,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    n_masks: i32,
+    p_valid_bytes: *const u8,
+    max_z_err: f64,
+) -> core::result::Result<(), ErrCode> {
+    if p_data.is_null()
+        || DataType::try_from(data_type as i32)
+            .map(|parsed| parsed as u32 != data_type)
+            .unwrap_or(true)
+        || n_depth <= 0
+        || n_cols <= 0
+        || n_rows <= 0
+        || n_bands <= 0
+        || max_z_err < 0.0
+        || !(n_masks == 0 || n_masks == 1 || n_masks == n_bands)
+        || (n_masks > 0 && p_valid_bytes.is_null())
+    {
+        return Err(ErrCode::WrongParam);
+    }
+
+    Ok(())
+}
+
+fn validate_no_data_inputs(
+    p_uses_no_data: Option<*const u8>,
+    no_data_values: Option<*const f64>,
+) -> bool {
+    match (p_uses_no_data, no_data_values) {
+        (Some(ptr), Some(values)) => ptr.is_null() || !values.is_null(),
+        _ => true,
+    }
 }
 
 unsafe fn lerc_get_blob_info_impl(
@@ -701,7 +1102,9 @@ fn write_no_data_info(
 #[cfg(test)]
 mod tests {
     use super::{
-        lerc_decode, lerc_decodeToDouble, lerc_decodeToDouble_4D, lerc_decode_4D, lerc_getBlobInfo,
+        lerc_computeCompressedSize, lerc_computeCompressedSizeForVersion,
+        lerc_computeCompressedSize_4D, lerc_decode, lerc_decodeToDouble, lerc_decodeToDouble_4D,
+        lerc_decode_4D, lerc_encode, lerc_encodeForVersion, lerc_encode_4D, lerc_getBlobInfo,
         lerc_getDataRanges,
     };
     use crate::{
@@ -862,6 +1265,239 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::BufferTooSmall as u32);
+    }
+
+    #[test]
+    fn c_abi_encode_stubs_zero_output_counters_and_fail() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let mut num_bytes = 123u32;
+        let mut out = [0u8; 64];
+        let mut written = 123u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSize(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(num_bytes, 0);
+
+        num_bytes = 123;
+        let status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(num_bytes, 0);
+
+        let status = unsafe {
+            lerc_encode(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(written, 0);
+
+        written = 123;
+        let status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn c_abi_encode_stubs_reject_invalid_arguments() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let valid = [1u8; 6];
+        let mut num_bytes = 123u32;
+        let out = [0u8; 64];
+        let mut written = 123u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSize(
+                ptr::null(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+        assert_eq!(num_bytes, 0);
+
+        num_bytes = 123;
+        let status = unsafe {
+            lerc_computeCompressedSize(
+                data.as_ptr().cast(),
+                99,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+        assert_eq!(num_bytes, 0);
+
+        let status = unsafe {
+            lerc_computeCompressedSize(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                1,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_encode(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                1,
+                valid.as_ptr(),
+                0.0,
+                ptr::null_mut(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn c_abi_4d_encode_stubs_validate_no_data_pointers() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let uses_no_data = [1u8];
+        let no_data_values = [255.0f64];
+        let mut num_bytes = 123u32;
+        let mut out = [0u8; 64];
+        let mut written = 123u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(num_bytes, 0);
+
+        num_bytes = 123;
+        let status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut num_bytes,
+                uses_no_data.as_ptr(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+        assert_eq!(num_bytes, 0);
+
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(written, 0);
     }
 
     #[test]
