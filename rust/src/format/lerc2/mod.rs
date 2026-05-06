@@ -2365,6 +2365,32 @@ pub fn read_lerc2_tiled_payload_with_previous(
         ));
     }
 
+    if try_huffman_int(&header) || try_huffman_float(&header) {
+        let payload_start = reader.pos;
+        let image_mode = reader.read_bytes(1)?[0];
+        let valid_image_mode = image_mode <= 3
+            && (image_mode <= 2 || header.version >= 6)
+            && (image_mode <= 1 || header.version >= 4);
+        if valid_image_mode && image_mode != 0 {
+            reader.pos = payload_start;
+            if let Ok(data) = read_tiled_payload(&mut reader, &header, &mask.mask, ranges.as_ref())
+            {
+                return Ok((header, mask, data));
+            }
+            return Err(LercError::Unsupported(
+                "Lerc2 blob is not encoded with tiled payloads",
+            ));
+        }
+        if valid_image_mode {
+            match read_tiled_payload(&mut reader, &header, &mask.mask, ranges.as_ref()) {
+                Ok(data) => return Ok((header, mask, data)),
+                Err(_) => reader.pos = payload_start,
+            }
+        } else {
+            reader.pos = payload_start;
+        }
+    }
+
     let data = read_tiled_payload(&mut reader, &header, &mask.mask, ranges.as_ref())?;
     Ok((header, mask, data))
 }
@@ -6699,14 +6725,23 @@ mod tests {
         let data = [1u8, 2, 3, 4];
         let blob = encode_lerc2_tiled_raw(spec, &data, 0.5, None, 6, 2).unwrap();
         let decoded = decode_lerc2_supported(&blob).unwrap();
+        let (_, _, tiled) = read_lerc2_tiled_raw(&blob).unwrap();
         let (header, _, _) = read_lerc2_min_max_ranges(&blob).unwrap();
         let payload_offset = header.header_size
             + compute_lerc2_mask_byte_len(&header, None, false).unwrap()
             + compute_lerc2_min_max_ranges_byte_len(&header).unwrap();
+        let mut huffman_mode_blob = blob.clone();
+        huffman_mode_blob[payload_offset + 1] = 1;
 
         assert_eq!(decoded.data, DecodedData::UChar(data.to_vec()));
+        assert_eq!(tiled.data, data);
+        assert_eq!(tiled.bytes_consumed, blob.len());
         assert_eq!(decoded.bytes_consumed, blob.len());
         assert_eq!(&blob[payload_offset..payload_offset + 2], &[0, 0]);
+        assert_eq!(
+            read_lerc2_tiled_raw(&huffman_mode_blob).unwrap_err(),
+            LercError::Unsupported("Lerc2 blob is not encoded with tiled payloads")
+        );
     }
 
     #[test]
