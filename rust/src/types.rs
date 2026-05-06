@@ -66,3 +66,21 @@ impl fmt::Display for LercError {
 impl std::error::Error for LercError {}
 
 pub type Result<T> = core::result::Result<T, LercError>;
+
+impl TryFrom<i32> for DataType {
+    type Error = LercError;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Char),
+            1 => Ok(Self::UChar),
+            2 => Ok(Self::Short),
+            3 => Ok(Self::UShort),
+            4 => Ok(Self::Int),
+            5 => Ok(Self::UInt),
+            6 => Ok(Self::Float),
+            7 => Ok(Self::Double),
+            _ => Err(LercError::CorruptInput("invalid Lerc data type")),
+        }
+    }
+}

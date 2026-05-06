@@ -22,10 +22,12 @@ limitations under the License.
 
 pub mod bit_mask;
 pub mod bit_stuffer;
+pub mod lerc2;
 pub mod rle;
 pub mod types;
 
 pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
+pub use lerc2::{get_lerc2_header_info, get_lerc_info, HeaderInfo, LercInfo};
 pub use rle::Rle;
 pub use types::{DataType, ErrCode, LercError, Result};
