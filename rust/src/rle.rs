@@ -8,16 +8,20 @@ You may obtain a copy of the License at
 http://www.apache.org/licenses/LICENSE-2.0
 */
 
+//! Run-length encoder used by LERC mask sections.
+
 use crate::types::{LercError, Result};
 
 const MIN_NUM_EVEN: usize = 5;
 const EOF_COUNT: i16 = i16::MIN;
 const MAX_COUNT: usize = i16::MAX as usize;
 
+/// C++-compatible LERC byte run-length codec.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Rle;
 
 impl Rle {
+    /// Computes the compressed byte count for `input`.
     pub fn compute_num_bytes(input: &[u8]) -> usize {
         if input.is_empty() {
             return 0;
@@ -83,6 +87,7 @@ impl Rle {
         sum + 2
     }
 
+    /// Compresses bytes using the LERC RLE stream format.
     pub fn compress(input: &[u8]) -> Result<Vec<u8>> {
         if input.is_empty() {
             return Err(LercError::WrongParam("input must not be empty"));
@@ -160,6 +165,7 @@ impl Rle {
         Ok(out)
     }
 
+    /// Decompresses a LERC RLE stream into a newly allocated buffer.
     pub fn decompress(encoded: &[u8]) -> Result<Vec<u8>> {
         let output_len = Self::decompressed_len(encoded)?;
         let mut out = vec![0; output_len];
@@ -167,6 +173,7 @@ impl Rle {
         Ok(out)
     }
 
+    /// Computes the decompressed byte count without producing output.
     pub fn decompressed_len(encoded: &[u8]) -> Result<usize> {
         if encoded.len() < 2 {
             return Err(LercError::BufferTooSmall);
@@ -197,6 +204,7 @@ impl Rle {
         Ok(sum)
     }
 
+    /// Decompresses a LERC RLE stream into `out`.
     pub fn decompress_into(encoded: &[u8], out: &mut [u8]) -> Result<()> {
         if encoded.len() < 2 {
             return Err(LercError::BufferTooSmall);

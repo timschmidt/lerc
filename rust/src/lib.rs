@@ -14,17 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Rust port of LERC.
+#![deny(missing_docs)]
+
+//! Native Rust port of selected LERC codec components.
 //!
 //! This crate currently contains safe Rust ports of low-level codec primitives.
 //! The full LERC image encoder/decoder will be layered on these modules as the
 //! port progresses.
 
+/// Packed valid-pixel mask helpers.
 pub mod bit_mask;
+/// Lerc2 bit-stuffing helpers.
 pub mod bit_stuffer;
+/// Typed decoded data containers and conversion helpers.
 pub mod decoded;
+/// Lerc2 metadata and supported-subset decode helpers.
 pub mod lerc2;
+/// LERC run-length encoding helpers.
 pub mod rle;
+/// Shared data types and errors.
 pub mod types;
 
 pub use bit_mask::BitMask;

@@ -8,8 +8,11 @@ You may obtain a copy of the License at
 http://www.apache.org/licenses/LICENSE-2.0
 */
 
+//! Packed bit-mask representation used by Lerc2.
+
 use crate::types::{LercError, Result};
 
+/// Valid-pixel mask using the same MSB-first packed bit order as C++ LERC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitMask {
     cols: usize,
@@ -18,6 +21,7 @@ pub struct BitMask {
 }
 
 impl BitMask {
+    /// Creates an all-invalid mask with the given dimensions.
     pub fn new(cols: usize, rows: usize) -> Result<Self> {
         if cols == 0 || rows == 0 {
             return Err(LercError::WrongParam(
@@ -35,6 +39,9 @@ impl BitMask {
         })
     }
 
+    /// Converts a byte mask to a packed bit mask.
+    ///
+    /// Nonzero input bytes are treated as valid pixels.
     pub fn from_byte_mask(bytes: &[u8], cols: usize, rows: usize) -> Result<Self> {
         let pixels = cols
             .checked_mul(rows)
@@ -55,69 +62,84 @@ impl BitMask {
         Ok(mask)
     }
 
+    /// Returns the number of columns.
     pub fn cols(&self) -> usize {
         self.cols
     }
 
+    /// Returns the number of rows.
     pub fn rows(&self) -> usize {
         self.rows
     }
 
+    /// Returns the number of pixels represented by this mask.
     pub fn pixel_count(&self) -> usize {
         self.cols * self.rows
     }
 
+    /// Returns the length of the packed bit buffer in bytes.
     pub fn byte_len(&self) -> usize {
         self.bits.len()
     }
 
+    /// Returns the packed mask bytes.
     pub fn bits(&self) -> &[u8] {
         &self.bits
     }
 
+    /// Returns the packed mask bytes mutably.
     pub fn bits_mut(&mut self) -> &mut [u8] {
         &mut self.bits
     }
 
+    /// Marks every pixel valid.
     pub fn set_all_valid(&mut self) {
         self.bits.fill(0xff);
     }
 
+    /// Marks every pixel invalid.
     pub fn set_all_invalid(&mut self) {
         self.bits.fill(0);
     }
 
+    /// Returns whether the linear pixel index is valid.
     pub fn is_valid(&self, idx: usize) -> Result<bool> {
         self.check_idx(idx)?;
         Ok((self.bits[idx >> 3] & Self::bit(idx)) != 0)
     }
 
+    /// Returns whether the pixel at `(row, col)` is valid.
     pub fn is_valid_at(&self, row: usize, col: usize) -> Result<bool> {
         self.index(row, col).and_then(|idx| self.is_valid(idx))
     }
 
+    /// Marks the linear pixel index valid.
     pub fn set_valid(&mut self, idx: usize) -> Result<()> {
         self.check_idx(idx)?;
         self.bits[idx >> 3] |= Self::bit(idx);
         Ok(())
     }
 
+    /// Marks the pixel at `(row, col)` valid.
     pub fn set_valid_at(&mut self, row: usize, col: usize) -> Result<()> {
         let idx = self.index(row, col)?;
         self.set_valid(idx)
     }
 
+    /// Marks the linear pixel index invalid.
     pub fn set_invalid(&mut self, idx: usize) -> Result<()> {
         self.check_idx(idx)?;
         self.bits[idx >> 3] &= !Self::bit(idx);
         Ok(())
     }
 
+    /// Marks the pixel at `(row, col)` invalid.
     pub fn set_invalid_at(&mut self, row: usize, col: usize) -> Result<()> {
         let idx = self.index(row, col)?;
         self.set_invalid(idx)
     }
 
+    /// Counts valid pixels, excluding padding bits in the final byte.
     pub fn count_valid_bits(&self) -> usize {
         let mut sum: usize = self
             .bits
@@ -132,6 +154,7 @@ impl BitMask {
         sum
     }
 
+    /// Converts this mask to one byte per pixel, using `1` for valid and `0` for invalid.
     pub fn to_byte_mask(&self) -> Vec<u8> {
         let mut bytes = vec![0; self.pixel_count()];
         for (idx, out) in bytes.iter_mut().enumerate() {
@@ -142,6 +165,7 @@ impl BitMask {
         bytes
     }
 
+    /// Returns the MSB-first bit mask for a linear pixel index.
     pub fn bit(idx: usize) -> u8 {
         0x80 >> (idx & 7)
     }

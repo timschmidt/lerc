@@ -8,21 +8,33 @@ You may obtain a copy of the License at
 http://www.apache.org/licenses/LICENSE-2.0
 */
 
+//! Typed decoded data containers.
+
 use crate::types::{DataType, LercError, Result};
 
+/// Decoded pixel values in a concrete native LERC type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedData {
+    /// Signed 8-bit integer values.
     Char(Vec<i8>),
+    /// Unsigned 8-bit integer values.
     UChar(Vec<u8>),
+    /// Signed 16-bit integer values.
     Short(Vec<i16>),
+    /// Unsigned 16-bit integer values.
     UShort(Vec<u16>),
+    /// Signed 32-bit integer values.
     Int(Vec<i32>),
+    /// Unsigned 32-bit integer values.
     UInt(Vec<u32>),
+    /// 32-bit floating point values.
     Float(Vec<f32>),
+    /// 64-bit floating point values.
     Double(Vec<f64>),
 }
 
 impl DecodedData {
+    /// Returns the LERC scalar type held by this value.
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Char(_) => DataType::Char,
@@ -36,6 +48,7 @@ impl DecodedData {
         }
     }
 
+    /// Returns the number of scalar values.
     pub fn len(&self) -> usize {
         match self {
             Self::Char(values) => values.len(),
@@ -49,14 +62,17 @@ impl DecodedData {
         }
     }
 
+    /// Returns true when there are no scalar values.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns the little-endian byte length of the scalar values.
     pub fn byte_len(&self) -> usize {
         self.len() * self.data_type().size_in_bytes()
     }
 
+    /// Writes the scalar values to `output` as little-endian bytes.
     pub fn write_le_bytes(&self, output: &mut [u8]) -> Result<usize> {
         let byte_len = self.byte_len();
         if output.len() < byte_len {
@@ -94,6 +110,7 @@ fn write_native_values<T, const N: usize>(
     }
 }
 
+/// Converts little-endian bytes into typed decoded values.
 pub fn decode_typed_values(data_type: DataType, bytes: &[u8]) -> Result<DecodedData> {
     let value_size = data_type.size_in_bytes();
     if bytes.len() % value_size != 0 {

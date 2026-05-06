@@ -8,18 +8,23 @@ You may obtain a copy of the License at
 http://www.apache.org/licenses/LICENSE-2.0
 */
 
+//! Lerc2 bit-stuffed integer stream codec.
+
 use crate::types::{LercError, Result};
 
+/// Encoder and decoder for the Lerc2 v2.3+ `BitStuffer2` stream format.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BitStuffer2;
 
 impl BitStuffer2 {
+    /// Computes the byte count for simple bit-stuffed data.
     pub fn compute_num_bytes_needed_simple(num_elem: u32, max_elem: u32) -> u32 {
         let num_bits = num_bits(max_elem);
         1 + num_bytes_uint(num_elem) as u32
             + (((num_elem as u64 * num_bits as u64 + 7) >> 3) as u32)
     }
 
+    /// Computes the byte count for LUT bit-stuffed data and whether LUT wins.
     pub fn compute_num_bytes_needed_lut(sorted_data: &[(u32, u32)]) -> Result<(u32, bool)> {
         if sorted_data.is_empty() {
             return Err(LercError::WrongParam("sorted_data must not be empty"));
@@ -48,6 +53,7 @@ impl BitStuffer2 {
         Ok((simple_bytes.min(lut_bytes), lut_bytes < simple_bytes))
     }
 
+    /// Encodes quantized values with simple bit stuffing.
     pub fn encode_simple(data: &[u32], lerc2_version: i32) -> Result<Vec<u8>> {
         if data.is_empty() {
             return Err(LercError::WrongParam("data must not be empty"));
@@ -86,6 +92,7 @@ impl BitStuffer2 {
         Ok(out)
     }
 
+    /// Encodes sorted `(value, original_index)` pairs with LUT bit stuffing.
     pub fn encode_lut(sorted_data: &[(u32, u32)], lerc2_version: i32) -> Result<Vec<u8>> {
         if sorted_data.is_empty() {
             return Err(LercError::WrongParam("sorted_data must not be empty"));
@@ -145,6 +152,9 @@ impl BitStuffer2 {
         Ok(out)
     }
 
+    /// Decodes a simple or LUT bit-stuffed stream.
+    ///
+    /// Returns the decoded values and the number of bytes consumed from `encoded`.
     pub fn decode(
         encoded: &[u8],
         max_element_count: usize,

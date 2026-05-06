@@ -8,128 +8,198 @@ You may obtain a copy of the License at
 http://www.apache.org/licenses/LICENSE-2.0
 */
 
+//! Lerc2 metadata readers and supported-subset decoders.
+
 use crate::types::{DataType, LercError, Result};
 use crate::{decode_typed_values, DecodedData};
 use crate::{BitMask, BitStuffer2, Rle};
 
+/// Highest Lerc2 codec version recognized by this crate.
 pub const CURRENT_VERSION: i32 = 6;
+/// ASCII file key that starts every Lerc2 blob.
 pub const FILE_KEY: &[u8; 6] = b"Lerc2 ";
 const CHECKSUM_START_OFFSET: usize = FILE_KEY.len() + 4 + 4;
 
+/// Parsed Lerc2 header fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeaderInfo {
+    /// Lerc2 format version.
     pub version: i32,
+    /// Stored Fletcher32 checksum for version 3 and newer blobs.
     pub checksum: u32,
+    /// Number of rows.
     pub n_rows: i32,
+    /// Number of columns.
     pub n_cols: i32,
+    /// Number of values per pixel.
     pub n_depth: i32,
+    /// Number of valid pixels in the 2D mask.
     pub num_valid_pixel: i32,
+    /// Micro block size used for tiled payloads.
     pub micro_block_size: i32,
+    /// Size in bytes of this Lerc2 blob.
     pub blob_size: i32,
+    /// Number of following blobs for version 6+ concatenated streams.
     pub n_blobs_more: i32,
+    /// Nonzero when version 6+ no-data sentinels are carried.
     pub b_pass_no_data_values: u8,
+    /// Version 6+ flag indicating all input values were integer-valued.
     pub b_is_int: u8,
+    /// Reserved version 6+ header byte.
     pub b_reserved_3: u8,
+    /// Reserved version 6+ header byte.
     pub b_reserved_4: u8,
+    /// Scalar data type of encoded values.
     pub data_type: DataType,
+    /// Maximum permitted z error stored in the blob.
     pub max_z_error: f64,
+    /// Global minimum encoded value.
     pub z_min: f64,
+    /// Global maximum encoded value.
     pub z_max: f64,
+    /// Temporary no-data value used inside version 6+ blobs.
     pub no_data_val: f64,
+    /// Original no-data value restored on decode for version 6+ blobs.
     pub no_data_val_orig: f64,
+    /// Header size in bytes.
     pub header_size: usize,
 }
 
 impl HeaderInfo {
+    /// Returns true if this header carries version 6+ no-data values.
     pub fn has_no_data_values(&self) -> bool {
         self.b_pass_no_data_values != 0
     }
 }
 
+/// Header probe result with mask-presence information.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeaderProbe {
+    /// Parsed header.
     pub header: HeaderInfo,
+    /// True when the blob has an explicit mask section.
     pub has_mask: bool,
 }
 
+/// Decoded mask section and read position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaskInfo {
+    /// Decoded valid-pixel mask.
     pub mask: BitMask,
+    /// Encoded mask byte count from the blob.
     pub num_bytes_mask: i32,
+    /// Number of bytes consumed through the mask section.
     pub bytes_consumed: usize,
 }
 
+/// Per-depth min/max ranges for version 4+ Lerc2 blobs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MinMaxRanges {
+    /// Minimum value per depth slice.
     pub mins: Vec<f64>,
+    /// Maximum value per depth slice.
     pub maxs: Vec<f64>,
+    /// Number of bytes consumed through the range section.
     pub bytes_consumed: usize,
+    /// True when every min value equals its corresponding max value.
     pub min_max_equal: bool,
 }
 
+/// Raw bytes decoded from a one-sweep Lerc2 payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataOneSweep {
+    /// Full image data as little-endian bytes, including zeroed invalid pixels.
     pub data: Vec<u8>,
+    /// Number of bytes consumed through the payload.
     pub bytes_consumed: usize,
 }
 
 impl DataOneSweep {
+    /// Converts the raw bytes to typed decoded values.
     pub fn decode_typed(&self, data_type: DataType) -> Result<DecodedData> {
         decode_typed_values(data_type, &self.data)
     }
 }
 
+/// Raw bytes decoded from a tiled Lerc2 payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TiledData {
+    /// Full image data as little-endian bytes, including zeroed invalid pixels.
     pub data: Vec<u8>,
+    /// Number of bytes consumed through the payload.
     pub bytes_consumed: usize,
 }
 
 impl TiledData {
+    /// Converts the raw bytes to typed decoded values.
     pub fn decode_typed(&self, data_type: DataType) -> Result<DecodedData> {
         decode_typed_values(data_type, &self.data)
     }
 }
 
+/// Aggregated Lerc2 blob information matching the public C API shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LercInfo {
+    /// Lerc2 format version of the first blob.
     pub version: i32,
+    /// Number of values per pixel.
     pub n_depth: i32,
+    /// Number of columns.
     pub n_cols: i32,
+    /// Number of rows.
     pub n_rows: i32,
+    /// Number of valid pixels in the first band.
     pub num_valid_pixel: i32,
+    /// Number of concatenated bands.
     pub n_bands: i32,
+    /// Combined blob size in bytes.
     pub blob_size: i32,
+    /// Number of masks required by the public C API.
     pub n_masks: i32,
+    /// Number of bands reported as using no-data values.
     pub n_uses_no_data_value: i32,
+    /// Scalar data type.
     pub data_type: DataType,
+    /// Global minimum across bands.
     pub z_min: f64,
+    /// Global maximum across bands.
     pub z_max: f64,
+    /// Maximum z error across bands.
     pub max_z_error: f64,
 }
 
+/// Supported-subset single-band Lerc2 decode result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedLerc2 {
+    /// Parsed header for the decoded blob.
     pub header: HeaderInfo,
+    /// Decoded valid-pixel mask.
     pub mask: BitMask,
+    /// Per-depth ranges when present in the blob.
     pub ranges: Option<MinMaxRanges>,
+    /// Typed decoded values.
     pub data: DecodedData,
+    /// Number of bytes consumed by this blob.
     pub bytes_consumed: usize,
 }
 
 impl DecodedLerc2 {
+    /// Returns the number of bytes needed to write decoded data values.
     pub fn data_byte_len(&self) -> usize {
         self.data.byte_len()
     }
 
+    /// Writes decoded data values as little-endian bytes into `output`.
     pub fn write_data_le_bytes(&self, output: &mut [u8]) -> Result<usize> {
         self.data.write_le_bytes(output)
     }
 
+    /// Returns the number of bytes needed to write the byte mask.
     pub fn mask_byte_len(&self) -> usize {
         (self.header.n_cols as usize) * (self.header.n_rows as usize)
     }
 
+    /// Writes the decoded mask as one byte per pixel.
     pub fn write_mask_bytes(&self, output: &mut [u8]) -> Result<usize> {
         let byte_len = self.mask_byte_len();
         if output.len() < byte_len {
@@ -140,17 +210,22 @@ impl DecodedLerc2 {
     }
 }
 
+/// Supported-subset multi-band Lerc2 decode result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedLerc2Bands {
+    /// Decoded bands in blob order.
     pub bands: Vec<DecodedLerc2>,
+    /// Total number of bytes consumed by all decoded bands.
     pub bytes_consumed: usize,
 }
 
 impl DecodedLerc2Bands {
+    /// Returns the total number of bytes needed to write all decoded bands.
     pub fn data_byte_len(&self) -> usize {
         self.bands.iter().map(DecodedLerc2::data_byte_len).sum()
     }
 
+    /// Writes all decoded bands as band-major little-endian bytes.
     pub fn write_data_le_bytes(&self, output: &mut [u8]) -> Result<usize> {
         let byte_len = self.data_byte_len();
         if output.len() < byte_len {
@@ -164,10 +239,12 @@ impl DecodedLerc2Bands {
         Ok(offset)
     }
 
+    /// Returns the total number of bytes needed to write all byte masks.
     pub fn mask_byte_len(&self) -> usize {
         self.bands.iter().map(DecodedLerc2::mask_byte_len).sum()
     }
 
+    /// Writes all decoded masks as band-major byte masks.
     pub fn write_mask_bytes(&self, output: &mut [u8]) -> Result<usize> {
         let byte_len = self.mask_byte_len();
         if output.len() < byte_len {
@@ -182,32 +259,50 @@ impl DecodedLerc2Bands {
     }
 }
 
+/// Aggregated min/max ranges for Lerc2 bands.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataRanges {
+    /// Minimum values in band-major, depth-minor order.
     pub mins: Vec<f64>,
+    /// Maximum values in band-major, depth-minor order.
     pub maxs: Vec<f64>,
+    /// Number of bands represented.
     pub n_bands: usize,
+    /// Number of values per pixel.
     pub n_depth: usize,
+    /// Total number of bytes consumed while reading ranges.
     pub bytes_consumed: usize,
 }
 
+/// Caller-provided output shape for supported decode-into operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeIntoSpec {
+    /// Expected decoded scalar data type.
     pub data_type: DataType,
+    /// Expected values per pixel.
     pub n_depth: usize,
+    /// Expected column count.
     pub n_cols: usize,
+    /// Expected row count.
     pub n_rows: usize,
+    /// Number of bands to decode.
     pub n_bands: usize,
+    /// Number of byte masks requested: 0, 1, or `n_bands`.
     pub n_masks: usize,
 }
 
+/// Byte counts produced by a supported decode-into operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeIntoResult {
+    /// Total bytes consumed from the input blob.
     pub bytes_consumed: usize,
+    /// Bytes written to the decoded data output buffer.
     pub data_bytes_written: usize,
+    /// Bytes written to the decoded mask output buffer.
     pub mask_bytes_written: usize,
 }
 
+/// Reads the Lerc2 header and reports whether an explicit mask follows it.
 pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     let mut reader = Reader::new(blob);
     let header = read_header(&mut reader)?;
@@ -218,10 +313,12 @@ pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     })
 }
 
+/// Reads and decodes the Lerc2 mask section.
 pub fn read_lerc2_mask(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo)> {
     read_lerc2_mask_with_previous(blob, None)
 }
 
+/// Reads and decodes the Lerc2 mask section, allowing omitted masks to reuse `previous_mask`.
 pub fn read_lerc2_mask_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -232,6 +329,7 @@ pub fn read_lerc2_mask_with_previous(
     Ok((header, mask))
 }
 
+/// Computes the Fletcher32 checksum used by Lerc2 version 3 and newer.
 pub fn compute_checksum_fletcher32(bytes: &[u8]) -> u32 {
     let mut sum1 = 0xffffu32;
     let mut sum2 = 0xffffu32;
@@ -264,6 +362,7 @@ pub fn compute_checksum_fletcher32(bytes: &[u8]) -> u32 {
     (sum2 << 16) | sum1
 }
 
+/// Validates the stored Lerc2 checksum and returns the parsed header.
 pub fn validate_lerc2_checksum(blob: &[u8]) -> Result<HeaderInfo> {
     let probe = get_lerc2_header_info(blob)?;
     let header = probe.header;
@@ -287,10 +386,12 @@ pub fn validate_lerc2_checksum(blob: &[u8]) -> Result<HeaderInfo> {
     Ok(header)
 }
 
+/// Reads the version 4+ min/max range section.
 pub fn read_lerc2_min_max_ranges(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, MinMaxRanges)> {
     read_lerc2_min_max_ranges_with_previous(blob, None)
 }
 
+/// Reads the min/max range section, allowing omitted masks to reuse `previous_mask`.
 pub fn read_lerc2_min_max_ranges_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -326,6 +427,7 @@ pub fn read_lerc2_min_max_ranges_with_previous(
     Ok((header, mask, ranges))
 }
 
+/// Aggregates data ranges across one or more concatenated Lerc2 bands.
 pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
     let mut offset = 0usize;
     let mut previous_mask: Option<BitMask> = None;
@@ -375,10 +477,12 @@ pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
     })
 }
 
+/// Reads a one-sweep raw Lerc2 payload.
 pub fn read_lerc2_data_one_sweep(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, DataOneSweep)> {
     read_lerc2_data_one_sweep_with_previous(blob, None)
 }
 
+/// Reads a one-sweep payload, allowing omitted masks to reuse `previous_mask`.
 pub fn read_lerc2_data_one_sweep_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -413,14 +517,21 @@ pub fn read_lerc2_data_one_sweep_with_previous(
     Ok((header, mask, data))
 }
 
+/// Reads a supported tiled Lerc2 payload.
+///
+/// This currently delegates to [`read_lerc2_tiled_payload`].
 pub fn read_lerc2_tiled_raw(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
     read_lerc2_tiled_raw_with_previous(blob, None)
 }
 
+/// Reads a supported tiled Lerc2 payload.
 pub fn read_lerc2_tiled_payload(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, TiledData)> {
     read_lerc2_tiled_payload_with_previous(blob, None)
 }
 
+/// Reads a supported tiled payload, allowing omitted masks to reuse `previous_mask`.
+///
+/// This currently delegates to [`read_lerc2_tiled_payload_with_previous`].
 pub fn read_lerc2_tiled_raw_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -428,6 +539,7 @@ pub fn read_lerc2_tiled_raw_with_previous(
     read_lerc2_tiled_payload_with_previous(blob, previous_mask)
 }
 
+/// Reads a supported tiled payload, allowing omitted masks to reuse `previous_mask`.
 pub fn read_lerc2_tiled_payload_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -465,10 +577,12 @@ pub fn read_lerc2_tiled_payload_with_previous(
     Ok((header, mask, data))
 }
 
+/// Decodes a single Lerc2 blob using the currently supported non-Huffman subset.
 pub fn decode_lerc2_supported(blob: &[u8]) -> Result<DecodedLerc2> {
     decode_lerc2_supported_with_previous(blob, None)
 }
 
+/// Decodes concatenated Lerc2 blobs using the currently supported subset.
 pub fn decode_lerc2_bands_supported(blob: &[u8]) -> Result<DecodedLerc2Bands> {
     let mut bands = Vec::new();
     let mut offset = 0usize;
@@ -513,6 +627,10 @@ pub fn decode_lerc2_bands_supported(blob: &[u8]) -> Result<DecodedLerc2Bands> {
     })
 }
 
+/// Decodes supported Lerc2 data directly into caller-provided byte buffers.
+///
+/// Data is written in band-major order as little-endian scalar bytes. Masks are
+/// written as one byte per pixel when requested by [`DecodeIntoSpec::n_masks`].
 pub fn decode_lerc2_supported_into(
     blob: &[u8],
     spec: DecodeIntoSpec,
@@ -592,6 +710,7 @@ pub fn decode_lerc2_supported_into(
     })
 }
 
+/// Decodes one Lerc2 blob, allowing omitted masks to reuse `previous_mask`.
 pub fn decode_lerc2_supported_with_previous(
     blob: &[u8],
     previous_mask: Option<&BitMask>,
@@ -685,6 +804,7 @@ pub fn decode_lerc2_supported_with_previous(
     })
 }
 
+/// Aggregates public Lerc2 metadata across concatenated blobs.
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
     let first = get_lerc2_header_info(blob)?;
     let mut info = LercInfo {

@@ -24,6 +24,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added Lerc2 data-range aggregation matching the C++ `lerc_getDataRanges` path for Lerc2 blobs, including `HasNoData` reporting for multi-depth no-data ranges.
 - Added checked output-copy helpers for decoded typed values, supported single-band decode results, and supported multi-band decode results. These write little-endian data bytes and byte masks into caller-provided buffers for later C ABI use.
 - Added a safe `decode_lerc2_supported_into` layer that validates requested output type, dimensions, band count, and mask count before writing decoded data and byte masks into caller-provided buffers.
+- Added rustdoc comments across the public Rust API and enabled crate-level `#![deny(missing_docs)]` so documentation completeness is enforced at compile time.
 - Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, checked decoded output copying, C API-style decode-into validation, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, high-level supported decode dispatch, multi-band supported decode dispatch with previous-mask reuse, v6 no-data remapping, data-range aggregation, `HasNoData` range reporting, unsupported Huffman dispatch, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
@@ -41,6 +42,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - `decode_lerc2_supported_into` is a safe Rust internal equivalent of the output-buffer validation needed by `lerc_decode`: it requires `n_masks` to be 0, 1, or `n_bands`, rejects insufficient mask requests for blobs with masks, and returns `WrongParam` for shape/type mismatches.
 - Lerc2 previous-mask reuse is explicit in Rust via `read_lerc2_mask_with_previous`; calling `read_lerc2_mask` on a blob that omits a partial mask returns an unsupported error.
 - Public Rust APIs return `Result<T, LercError>` instead of bool/status pairs. C-compatible FFI wrappers should be added after the safe Rust codec surface is stable.
+- Public Rust documentation is docs.rs-ready under `cargo doc --no-deps`; missing public documentation is a compile error.
 
 ## Next Porting Steps
 
@@ -72,13 +74,17 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 ## Verification Commands
 
 ```sh
+cargo check
 cargo test
+cargo doc --no-deps
 cargo bench --bench rle_bit_stuffer
 ```
 
 Last run in this branch:
 
+- `cargo check`: passed with `#![deny(missing_docs)]` enabled.
 - `cargo test`: passed, 51 unit tests.
+- `cargo doc --no-deps`: passed and generated crate documentation.
 - `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, checked decoded output copying, Lerc2 metadata parsing, Lerc2 data-range aggregation, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, Lerc2 diff tiled decode, high-level supported-subset Lerc2 decode, high-level supported-subset multi-band Lerc2 decode, v6 supported-subset no-data decode, and C API-style supported decode-into-buffer validation.
 
 ## Open Risks
