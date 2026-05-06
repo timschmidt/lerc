@@ -224,6 +224,24 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpp_byte_mask_to_packed_bits_conversion() {
+        let bytes = [255, 0, 2, 0, 1, 1, 0, 7, 0, 1];
+        let mask = BitMask::from_byte_mask(&bytes, 5, 2).unwrap();
+
+        assert_eq!(mask.bits(), &[0b1010_1101, 0b0111_1111]);
+        assert_eq!(mask.count_valid_bits(), 6);
+    }
+
+    #[test]
+    fn matches_cpp_packed_bits_to_byte_mask_conversion() {
+        let mut mask = BitMask::new(5, 2).unwrap();
+        mask.bits_mut().copy_from_slice(&[0b0101_0011, 0b1000_1111]);
+
+        assert_eq!(mask.to_byte_mask(), [0, 1, 0, 1, 0, 0, 1, 1, 1, 0]);
+        assert_eq!(mask.count_valid_bits(), 5);
+    }
+
+    #[test]
     fn rejects_invalid_dimensions_and_indexes() {
         assert!(BitMask::new(0, 3).is_err());
         assert!(BitMask::from_byte_mask(&[1, 0], 3, 1).is_err());
