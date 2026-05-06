@@ -2591,6 +2591,18 @@ mod tests {
     }
 
     #[test]
+    fn reports_data_ranges_for_float_fixture() {
+        let blob = fixture("california_400_400_1_float.lerc2");
+        let ranges = get_lerc2_data_ranges(&blob).unwrap();
+
+        assert_eq!(ranges.n_bands, 1);
+        assert_eq!(ranges.n_depth, 1);
+        assert_eq!(ranges.bytes_consumed, blob.len());
+        assert_eq!(ranges.mins, [-82.972_091_674_804_69]);
+        assert_eq!(ranges.maxs, [4080.613_769_531_25]);
+    }
+
+    #[test]
     fn reports_data_ranges_for_concatenated_lerc2_bands() {
         let first = synthetic_v4_ushort_tiled_raw_blob();
         let mut second = synthetic_v4_ushort_tiled_raw_blob();

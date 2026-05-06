@@ -1108,8 +1108,8 @@ mod tests {
         lerc_getDataRanges,
     };
     use crate::{
-        compute_checksum_fletcher32, get_lerc2_blob_info_arrays, DataType, ErrCode,
-        BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        compute_checksum_fletcher32, get_lerc2_blob_info_arrays, get_lerc2_data_ranges, DataType,
+        ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1241,6 +1241,34 @@ mod tests {
         assert_eq!(status, ErrCode::Ok as u32);
         assert_eq!(mins, [0.0, 0.0, 0.0]);
         assert_eq!(maxs, [255.0, 255.0, 255.0]);
+    }
+
+    #[test]
+    fn c_abi_get_data_ranges_matches_safe_helper_for_lerc2_fixtures() {
+        for (fixture_name, n_depth, n_bands) in [
+            ("bluemarble_256_256_3_byte.lerc2", 1, 3),
+            ("california_400_400_1_float.lerc2", 1, 1),
+        ] {
+            let blob = fixture(fixture_name);
+            let expected = get_lerc2_data_ranges(&blob).unwrap();
+            let mut mins = vec![123.0f64; expected.mins.len()];
+            let mut maxs = vec![123.0f64; expected.maxs.len()];
+
+            let status = unsafe {
+                lerc_getDataRanges(
+                    blob.as_ptr(),
+                    blob.len() as u32,
+                    n_depth,
+                    n_bands,
+                    mins.as_mut_ptr(),
+                    maxs.as_mut_ptr(),
+                )
+            };
+
+            assert_eq!(status, ErrCode::Ok as u32, "{fixture_name}");
+            assert_eq!(mins, expected.mins, "{fixture_name}");
+            assert_eq!(maxs, expected.maxs, "{fixture_name}");
+        }
     }
 
     #[test]
