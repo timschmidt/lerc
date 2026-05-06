@@ -496,6 +496,50 @@ pub fn write_lerc2_mask(
     Ok(writer.pos)
 }
 
+/// Computes the serialized byte count for a Lerc2 v4+ min/max range section.
+pub fn compute_lerc2_min_max_ranges_byte_len(header: &HeaderInfo) -> Result<usize> {
+    if header.version < 4 {
+        return Err(LercError::WrongParam(
+            "Lerc2 min/max ranges require version 4 or newer",
+        ));
+    }
+    if header.n_depth <= 0 {
+        return Err(LercError::WrongParam("Lerc2 depth must be positive"));
+    }
+
+    (header.n_depth as usize)
+        .checked_mul(header.data_type.size_in_bytes())
+        .and_then(|len| len.checked_mul(2))
+        .ok_or(LercError::WrongParam(
+            "Lerc2 min/max range byte count overflow",
+        ))
+}
+
+/// Writes a Lerc2 v4+ min/max range section in little-endian byte order.
+///
+/// Values are written as all per-depth minimums followed by all per-depth
+/// maximums, cast to the scalar type declared by `header`.
+pub fn write_lerc2_min_max_ranges(
+    header: &HeaderInfo,
+    ranges: &MinMaxRanges,
+    output: &mut [u8],
+) -> Result<usize> {
+    validate_lerc2_min_max_ranges_for_write(header, ranges)?;
+    let byte_len = compute_lerc2_min_max_ranges_byte_len(header)?;
+    if output.len() < byte_len {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut writer = Writer::new(output);
+    for &value in &ranges.mins {
+        writer.write_bytes(&encode_value_as_bytes(header.data_type, value))?;
+    }
+    for &value in &ranges.maxs {
+        writer.write_bytes(&encode_value_as_bytes(header.data_type, value))?;
+    }
+    Ok(writer.pos)
+}
+
 /// Reads and decodes the Lerc2 mask section.
 pub fn read_lerc2_mask(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo)> {
     read_lerc2_mask_with_previous(blob, None)
@@ -1385,6 +1429,20 @@ fn validate_lerc2_mask_for_write(
     }
 
     Ok(true)
+}
+
+fn validate_lerc2_min_max_ranges_for_write(
+    header: &HeaderInfo,
+    ranges: &MinMaxRanges,
+) -> Result<()> {
+    let n_depth = header.n_depth as usize;
+    if ranges.mins.len() != n_depth || ranges.maxs.len() != n_depth {
+        return Err(LercError::WrongParam(
+            "Lerc2 min/max range count does not match depth",
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_decode_into_spec(spec: DecodeIntoSpec, has_mask_output: bool) -> Result<()> {
@@ -2343,13 +2401,15 @@ impl<'a> Writer<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
-        decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-        decode_lerc_supported_into, decode_lerc_supported_to_f64, finalize_lerc2_checksum,
-        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
-        read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask,
-        DecodeIntoSpec, HeaderInfo, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        compute_lerc2_min_max_ranges_byte_len, decode_lerc2_bands_supported,
+        decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
+        decode_lerc_supported_to_f64, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, DecodeIntoSpec,
+        HeaderInfo, MinMaxRanges, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -2402,6 +2462,28 @@ mod tests {
             write_lerc2_mask(header, mask, encode_mask, &mut blob[written_header..]).unwrap();
         assert_eq!(written_header, header_len);
         assert_eq!(written_mask, mask_len);
+        blob
+    }
+
+    fn blob_with_written_header_mask_and_ranges(
+        header: &HeaderInfo,
+        mask: Option<&BitMask>,
+        encode_mask: bool,
+        ranges: &MinMaxRanges,
+    ) -> Vec<u8> {
+        let header_len = compute_lerc2_header_byte_len(header.version).unwrap();
+        let mask_len = compute_lerc2_mask_byte_len(header, mask, encode_mask).unwrap();
+        let ranges_len = compute_lerc2_min_max_ranges_byte_len(header).unwrap();
+        let mut blob = vec![0; header_len + mask_len + ranges_len];
+        let written_header = write_lerc2_header(header, &mut blob).unwrap();
+        let written_mask =
+            write_lerc2_mask(header, mask, encode_mask, &mut blob[written_header..]).unwrap();
+        let written_ranges =
+            write_lerc2_min_max_ranges(header, ranges, &mut blob[written_header + written_mask..])
+                .unwrap();
+        assert_eq!(written_header, header_len);
+        assert_eq!(written_mask, mask_len);
+        assert_eq!(written_ranges, ranges_len);
         blob
     }
 
@@ -3250,6 +3332,100 @@ mod tests {
         assert_eq!(ranges.mins, [-100.0, 7.0]);
         assert_eq!(ranges.maxs, [-100.0, 7.0]);
         assert!(ranges.min_max_equal);
+    }
+
+    #[test]
+    fn writes_lerc2_byte_min_max_ranges_for_parser_round_trip() {
+        let mut header = header_for_write(4);
+        header.data_type = DataType::UChar;
+        header.n_depth = 3;
+        let ranges = MinMaxRanges {
+            mins: vec![1.0, 2.0, 3.0],
+            maxs: vec![10.0, 20.0, 30.0],
+            bytes_consumed: 0,
+            min_max_equal: false,
+        };
+        header.blob_size = (header.header_size
+            + compute_lerc2_mask_byte_len(&header, None, false).unwrap()
+            + compute_lerc2_min_max_ranges_byte_len(&header).unwrap())
+            as i32;
+
+        let blob = blob_with_written_header_mask_and_ranges(&header, None, false, &ranges);
+        let (_, _, decoded_ranges) = read_lerc2_min_max_ranges_with_previous(
+            &blob,
+            Some(&BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(decoded_ranges.mins, ranges.mins);
+        assert_eq!(decoded_ranges.maxs, ranges.maxs);
+        assert_eq!(decoded_ranges.bytes_consumed, blob.len());
+        assert!(!decoded_ranges.min_max_equal);
+    }
+
+    #[test]
+    fn writes_lerc2_float_min_max_ranges_for_parser_round_trip() {
+        let mut header = header_for_write(4);
+        header.data_type = DataType::Float;
+        header.n_depth = 2;
+        let ranges = MinMaxRanges {
+            mins: vec![-1.25, 2.5],
+            maxs: vec![9.75, 10.5],
+            bytes_consumed: 0,
+            min_max_equal: false,
+        };
+        header.blob_size = (header.header_size
+            + compute_lerc2_mask_byte_len(&header, None, false).unwrap()
+            + compute_lerc2_min_max_ranges_byte_len(&header).unwrap())
+            as i32;
+
+        let blob = blob_with_written_header_mask_and_ranges(&header, None, false, &ranges);
+        let (_, _, decoded_ranges) = read_lerc2_min_max_ranges_with_previous(
+            &blob,
+            Some(&BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 1], 3, 2).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(decoded_ranges.mins, ranges.mins);
+        assert_eq!(decoded_ranges.maxs, ranges.maxs);
+        assert_eq!(decoded_ranges.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn rejects_invalid_lerc2_min_max_range_write_inputs() {
+        let mut header = header_for_write(4);
+        header.data_type = DataType::UShort;
+        header.n_depth = 2;
+        let ranges = MinMaxRanges {
+            mins: vec![1.0, 2.0],
+            maxs: vec![10.0, 20.0],
+            bytes_consumed: 0,
+            min_max_equal: false,
+        };
+
+        assert_eq!(compute_lerc2_min_max_ranges_byte_len(&header).unwrap(), 8);
+        assert_eq!(
+            write_lerc2_min_max_ranges(&header, &ranges, &mut [0; 7]).unwrap_err(),
+            LercError::BufferTooSmall
+        );
+
+        let bad_ranges = MinMaxRanges {
+            mins: vec![1.0],
+            ..ranges.clone()
+        };
+        assert_eq!(
+            write_lerc2_min_max_ranges(&header, &bad_ranges, &mut [0; 8]).unwrap_err(),
+            LercError::WrongParam("Lerc2 min/max range count does not match depth")
+        );
+
+        let old_header = HeaderInfo {
+            version: 3,
+            ..header
+        };
+        assert_eq!(
+            compute_lerc2_min_max_ranges_byte_len(&old_header).unwrap_err(),
+            LercError::WrongParam("Lerc2 min/max ranges require version 4 or newer")
+        );
     }
 
     #[test]

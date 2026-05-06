@@ -48,17 +48,18 @@ pub use lerc1::{
 };
 pub use lerc2::{
     compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
-    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-    decode_lerc2_supported_with_previous, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-    finalize_lerc2_checksum, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep,
-    read_lerc2_data_one_sweep_with_previous, read_lerc2_mask, read_lerc2_mask_with_previous,
-    read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload,
+    compute_lerc2_min_max_ranges_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
+    decode_lerc2_supported_into, decode_lerc2_supported_with_previous, decode_lerc_supported_into,
+    decode_lerc_supported_to_f64, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+    read_lerc2_data_one_sweep, read_lerc2_data_one_sweep_with_previous, read_lerc2_mask,
+    read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+    read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload,
     read_lerc2_tiled_payload_with_previous, read_lerc2_tiled_raw,
     read_lerc2_tiled_raw_with_previous, validate_lerc2_checksum, write_lerc2_header,
-    write_lerc2_mask, DataOneSweep, DataRanges, DecodeIntoResult, DecodeIntoSpec,
-    DecodeToF64Result, DecodedLerc2, DecodedLerc2Bands, HeaderInfo, LercInfo, MaskInfo,
-    MinMaxRanges, NoDataInfo, TiledData, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+    write_lerc2_mask, write_lerc2_min_max_ranges, DataOneSweep, DataRanges, DecodeIntoResult,
+    DecodeIntoSpec, DecodeToF64Result, DecodedLerc2, DecodedLerc2Bands, HeaderInfo, LercInfo,
+    MaskInfo, MinMaxRanges, NoDataInfo, TiledData, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
 };
 pub use rle::Rle;
 pub use types::{DataType, EncodeSpec, ErrCode, LercError, Result};
