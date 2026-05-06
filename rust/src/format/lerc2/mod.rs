@@ -988,7 +988,7 @@ pub fn encode_lerc2_auto(
 ) -> Result<Vec<u8>> {
     let baseline = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
     if !matches!(spec.data_type, DataType::UChar | DataType::Char)
-        || version < 4
+        || version < 2
         || !auto_byte_huffman_max_z_error_is_lossless_byte(spec, data, max_z_error, masks)?
     {
         return Ok(baseline);
@@ -1143,9 +1143,14 @@ fn encode_lerc2_byte_huffman_bands_impl(
     version: i32,
 ) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "byte Huffman Lerc2 band encode")?;
-    if !(4..=CURRENT_VERSION).contains(&version) {
+    if !(2..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
-            "byte Huffman Lerc2 encode requires version 4 or newer",
+            "byte Huffman Lerc2 encode requires version 2 or newer",
+        ));
+    }
+    if version < 4 && spec.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 encode can only store depth 1",
         ));
     }
     if !matches!(spec.data_type, DataType::UChar | DataType::Char) {
@@ -1442,9 +1447,14 @@ fn encode_lerc2_byte_huffman_band(
     no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "byte Huffman Lerc2 encode")?;
-    if !(4..=CURRENT_VERSION).contains(&version) {
+    if !(2..=CURRENT_VERSION).contains(&version) {
         return Err(LercError::WrongParam(
-            "byte Huffman Lerc2 encode requires version 4 or newer",
+            "byte Huffman Lerc2 encode requires version 2 or newer",
+        ));
+    }
+    if version < 4 && spec.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 encode can only store depth 1",
         ));
     }
     if !matches!(spec.data_type, DataType::UChar | DataType::Char) {
@@ -1516,7 +1526,11 @@ fn encode_lerc2_byte_huffman_band(
     let payload = encode_huffman_int_payload(&header, &mask, data)?;
     let encode_mask = encode_partial_mask && mask.count_valid_bits() < spec.n_cols * spec.n_rows;
     let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
-    let ranges_len = compute_lerc2_min_max_ranges_byte_len(&header)?;
+    let ranges_len = if version >= 4 {
+        compute_lerc2_min_max_ranges_byte_len(&header)?
+    } else {
+        0
+    };
     header.blob_size = header
         .header_size
         .checked_add(mask_len)
@@ -1530,7 +1544,9 @@ fn encode_lerc2_byte_huffman_band(
     let mut blob = vec![0; header.blob_size as usize];
     let mut offset = write_lerc2_header(&header, &mut blob)?;
     offset += write_lerc2_mask(&header, Some(&mask), encode_mask, &mut blob[offset..])?;
-    offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
+    if ranges_len > 0 {
+        offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
+    }
     blob[offset..offset + payload.len()].copy_from_slice(&payload);
     offset += payload.len();
     debug_assert_eq!(offset, blob.len());
@@ -4589,7 +4605,11 @@ struct HuffmanLengthNode {
 
 fn encode_huffman_int_payload(header: &HeaderInfo, mask: &BitMask, data: &[u8]) -> Result<Vec<u8>> {
     let (histo, delta_histo) = compute_huffman_int_histograms(header, mask, data)?;
-    let regular = huffman_candidate(header, mask, data, 2, &histo)?;
+    let regular = if header.version >= 4 {
+        huffman_candidate(header, mask, data, 2, &histo)?
+    } else {
+        None
+    };
     let delta = huffman_candidate(header, mask, data, 1, &delta_histo)?;
     let selected = match (regular, delta) {
         (Some(regular), Some(delta)) => {
@@ -7560,6 +7580,33 @@ mod tests {
     }
 
     #[test]
+    fn encodes_pre_v4_byte_huffman_lerc2_as_delta_huffman() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 16,
+            n_rows: 4,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data: Vec<u8> = (0..spec.n_rows)
+            .flat_map(|row| (0..spec.n_cols).map(move |col| (row * 3 + col * 2) as u8))
+            .collect();
+        let blob = encode_lerc2_byte_huffman(spec, &data, None, 3).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        let header = get_lerc2_header_info(&blob).unwrap().header;
+        let payload_offset =
+            header.header_size + compute_lerc2_mask_byte_len(&header, None, false).unwrap();
+
+        assert_eq!(decoded.header.version, 3);
+        assert_eq!(decoded.header.n_depth, 1);
+        assert!(decoded.ranges.is_none());
+        assert_eq!(&blob[payload_offset..payload_offset + 2], &[0, 1]);
+        assert_eq!(decoded.data, DecodedData::UChar(data));
+        assert_eq!(decoded.bytes_consumed, blob.len());
+    }
+
+    #[test]
     fn encodes_signed_byte_huffman_lerc2_round_trip() {
         let spec = EncodeSpec {
             data_type: DataType::Char,
@@ -7750,8 +7797,21 @@ mod tests {
             LercError::WrongParam("constant byte input should use Lerc2 constant encode")
         );
         assert_eq!(
-            encode_lerc2_byte_huffman(byte_spec, &[1, 2, 3, 4, 5, 6], None, 3).unwrap_err(),
-            LercError::WrongParam("byte Huffman Lerc2 encode requires version 4 or newer")
+            encode_lerc2_byte_huffman(byte_spec, &[1, 2, 3, 4, 5, 6], None, 1).unwrap_err(),
+            LercError::WrongParam("byte Huffman Lerc2 encode requires version 2 or newer")
+        );
+        assert_eq!(
+            encode_lerc2_byte_huffman(
+                EncodeSpec {
+                    n_depth: 2,
+                    ..byte_spec
+                },
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                None,
+                3
+            )
+            .unwrap_err(),
+            LercError::WrongParam("pre-v4 Lerc2 encode can only store depth 1")
         );
     }
 
