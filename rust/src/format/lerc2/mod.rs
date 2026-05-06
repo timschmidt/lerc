@@ -1204,9 +1204,7 @@ pub fn encode_lerc2_one_sweep_with_no_data(
     version: i32,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "one-sweep Lerc2 no-data encode")?;
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if version < 6 {
         return Err(LercError::WrongParam(
             "Lerc2 no-data encode requires version 6 or newer",
@@ -1279,9 +1277,7 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "raw tiled Lerc2 no-data encode")?;
-    if max_z_error < 0.0 {
-        return Err(LercError::WrongParam("max_z_error must be nonnegative"));
-    }
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if version < 6 {
         return Err(LercError::WrongParam(
             "Lerc2 no-data encode requires version 6 or newer",
@@ -8020,6 +8016,36 @@ mod tests {
     }
 
     #[test]
+    fn single_band_no_data_encoders_accept_integer_negative_max_z_error() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
+
+        let one_sweep =
+            encode_lerc2_one_sweep_with_no_data(spec, &data, -0.2, None, 255.0, 6).unwrap();
+        let one_sweep_decoded = decode_lerc2_supported(&one_sweep).unwrap();
+        assert_eq!(one_sweep_decoded.header.max_z_error, 0.5);
+        assert!(one_sweep_decoded.header.has_no_data_values());
+        assert_eq!(
+            one_sweep_decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
+        );
+
+        let raw_tiled =
+            encode_lerc2_tiled_raw_with_no_data(spec, &data, -0.2, None, 255.0, 6, 2).unwrap();
+        let raw_tiled_decoded = decode_lerc2_supported(&raw_tiled).unwrap();
+        assert_eq!(raw_tiled_decoded.header.max_z_error, 0.5);
+        assert!(raw_tiled_decoded.header.has_no_data_values());
+        assert_eq!(raw_tiled_decoded.data, one_sweep_decoded.data);
+    }
+
+    #[test]
     fn encodes_one_sweep_lerc2_bands_with_shared_mask() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -8198,6 +8224,17 @@ mod tests {
         );
         assert_eq!(
             encode_lerc2_one_sweep(spec, &data, -0.01, None, 6).unwrap_err(),
+            LercError::WrongParam("negative max_z_error bit-plane encode requires integer data")
+        );
+
+        let no_data_spec = EncodeSpec { n_depth: 2, ..spec };
+        let no_data = [1.0f32, -9999.0, -9999.0, -9999.0, 2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            encode_lerc2_one_sweep_with_no_data(no_data_spec, &no_data, -0.01, None, -9999.0, 6)
+                .unwrap_err(),
             LercError::WrongParam("negative max_z_error bit-plane encode requires integer data")
         );
     }
