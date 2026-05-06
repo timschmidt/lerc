@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use lerc::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-    decode_lerc2_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
-    get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
-    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-    validate_lerc2_checksum, BitMask, BitStuffer2, DataType, DecodeIntoSpec, Rle,
+    decode_lerc2_supported_into, decode_typed_values, get_lerc1_header_info,
+    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info,
+    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
+    DataType, DecodeIntoSpec, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -44,6 +45,11 @@ fn main() {
     let float_fixture_blob = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../testData/california_400_400_1_float.lerc2"
+    ))
+    .unwrap();
+    let lerc1_blob = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testData/world.lerc1"
     ))
     .unwrap();
     let mut blob_info_array = [0u32; 11];
@@ -130,6 +136,9 @@ fn main() {
     });
     bench("typed-float-decode-250k", 1000, || {
         black_box(decode_typed_values(DataType::Float, black_box(&float_bytes)).unwrap());
+    });
+    bench("lerc1-header-parse", 100_000, || {
+        black_box(get_lerc1_header_info(black_box(&lerc1_blob)).unwrap());
     });
     bench("lerc2-header-parse", 100_000, || {
         black_box(get_lerc2_header_info(black_box(&lerc2_blob)).unwrap());
