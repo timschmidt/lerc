@@ -280,14 +280,17 @@ pub fn read_lerc2_tiled_payload_with_previous(
         ));
     }
 
-    if header.version >= 4 {
+    let ranges = if header.version >= 4 {
         let ranges = read_min_max_ranges(&mut reader, &header)?;
         if ranges.min_max_equal {
             return Err(LercError::Unsupported(
                 "Lerc2 all-constant min/max ranges do not carry tiled payloads",
             ));
         }
-    }
+        Some(ranges)
+    } else {
+        None
+    };
 
     let one_sweep_flag = reader.read_bytes(1)?[0];
     if one_sweep_flag != 0 {
@@ -296,7 +299,7 @@ pub fn read_lerc2_tiled_payload_with_previous(
         ));
     }
 
-    let data = read_tiled_payload(&mut reader, &header, &mask.mask)?;
+    let data = read_tiled_payload(&mut reader, &header, &mask.mask, ranges.as_ref())?;
     Ok((header, mask, data))
 }
 
@@ -520,6 +523,7 @@ fn read_tiled_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
     mask: &BitMask,
+    ranges: Option<&MinMaxRanges>,
 ) -> Result<TiledData> {
     if header.micro_block_size > 32 {
         return Err(LercError::CorruptInput(
@@ -558,7 +562,9 @@ fn read_tiled_payload(
             let j1 = (j0 + mb_size).min(n_cols);
 
             for i_depth in 0..n_depth {
-                read_tile_payload(reader, header, mask, &mut data, i0, i1, j0, j1, i_depth)?;
+                read_tile_payload(
+                    reader, header, mask, ranges, &mut data, i0, i1, j0, j1, i_depth,
+                )?;
             }
         }
     }
@@ -573,6 +579,7 @@ fn read_tile_payload(
     reader: &mut Reader<'_>,
     header: &HeaderInfo,
     mask: &BitMask,
+    ranges: Option<&MinMaxRanges>,
     data: &mut [u8],
     i0: usize,
     i1: usize,
@@ -582,9 +589,9 @@ fn read_tile_payload(
 ) -> Result<()> {
     let raw_flag = reader.read_bytes(1)?[0];
     let diff_encoded = header.version >= 5 && (raw_flag & 4) != 0;
-    if diff_encoded {
-        return Err(LercError::Unsupported(
-            "Lerc2 diff-encoded raw tiles are not ported yet",
+    if diff_encoded && i_depth == 0 {
+        return Err(LercError::CorruptInput(
+            "Lerc2 diff-encoded first depth tile is invalid",
         ));
     }
 
@@ -603,6 +610,11 @@ fn read_tile_payload(
 
     match tile_mode {
         0 => {
+            if diff_encoded {
+                return Err(LercError::Unsupported(
+                    "Lerc2 raw binary diff tiles are invalid",
+                ));
+            }
             for row in i0..i1 {
                 for col in j0..j1 {
                     let pixel_idx = row * n_cols + col;
@@ -615,14 +627,46 @@ fn read_tile_payload(
             }
             Ok(())
         }
-        2 => Ok(()),
+        2 => {
+            if diff_encoded {
+                copy_previous_depth_tile(header, mask, data, i0, i1, j0, j1, i_depth)
+            } else {
+                Ok(())
+            }
+        }
         3 => {
-            let dt_used = get_data_type_used(header.data_type, bits67)?;
+            let dt_used = get_data_type_used(
+                if diff_encoded && (header.data_type as i32) < (DataType::Float as i32) {
+                    DataType::Int
+                } else {
+                    header.data_type
+                },
+                bits67,
+            )?;
             let offset = reader.read_value_as_f64(dt_used)?;
-            fill_tile_with_value(header, mask, data, i0, i1, j0, j1, i_depth, offset)
+            fill_tile_with_value(
+                header,
+                mask,
+                ranges,
+                data,
+                i0,
+                i1,
+                j0,
+                j1,
+                i_depth,
+                offset,
+                diff_encoded,
+            )
         }
         1 => {
-            let dt_used = get_data_type_used(header.data_type, bits67)?;
+            let dt_used = get_data_type_used(
+                if diff_encoded && (header.data_type as i32) < (DataType::Float as i32) {
+                    DataType::Int
+                } else {
+                    header.data_type
+                },
+                bits67,
+            )?;
             let offset = reader.read_value_as_f64(dt_used)?;
             let max_element_count = (i1 - i0) * (j1 - j0);
             let remaining = &reader.bytes[reader.pos..];
@@ -630,7 +674,18 @@ fn read_tile_payload(
                 BitStuffer2::decode(remaining, max_element_count, header.version)?;
             reader.pos += consumed;
             scale_quantized_tile(
-                header, mask, data, i0, i1, j0, j1, i_depth, offset, &quantized,
+                header,
+                mask,
+                ranges,
+                data,
+                i0,
+                i1,
+                j0,
+                j1,
+                i_depth,
+                offset,
+                &quantized,
+                diff_encoded,
             )
         }
         _ => unreachable!(),
@@ -640,6 +695,7 @@ fn read_tile_payload(
 fn fill_tile_with_value(
     header: &HeaderInfo,
     mask: &BitMask,
+    ranges: Option<&MinMaxRanges>,
     data: &mut [u8],
     i0: usize,
     i1: usize,
@@ -647,17 +703,30 @@ fn fill_tile_with_value(
     j1: usize,
     i_depth: usize,
     value: f64,
+    diff_encoded: bool,
 ) -> Result<()> {
     let value_size = header.data_type.size_in_bytes();
     let n_cols = header.n_cols as usize;
     let n_depth = header.n_depth as usize;
-    let value_bytes = encode_value_as_bytes(header.data_type, value);
+    let z_max = z_max_for_depth(header, ranges, i_depth);
 
     for row in i0..i1 {
         for col in j0..j1 {
             let pixel_idx = row * n_cols + col;
             if mask.is_valid(pixel_idx)? {
                 let dst_offset = (pixel_idx * n_depth + i_depth) * value_size;
+                let value = if diff_encoded {
+                    let prev_offset = (pixel_idx * n_depth + i_depth - 1) * value_size;
+                    (value
+                        + read_value_from_bytes(
+                            header.data_type,
+                            &data[prev_offset..prev_offset + value_size],
+                        ))
+                    .min(z_max)
+                } else {
+                    value
+                };
+                let value_bytes = encode_value_as_bytes(header.data_type, value);
                 data[dst_offset..dst_offset + value_size].copy_from_slice(&value_bytes);
             }
         }
@@ -669,6 +738,7 @@ fn fill_tile_with_value(
 fn scale_quantized_tile(
     header: &HeaderInfo,
     mask: &BitMask,
+    ranges: Option<&MinMaxRanges>,
     data: &mut [u8],
     i0: usize,
     i1: usize,
@@ -677,6 +747,7 @@ fn scale_quantized_tile(
     i_depth: usize,
     offset: f64,
     quantized: &[u32],
+    diff_encoded: bool,
 ) -> Result<()> {
     let max_element_count = (i1 - i0) * (j1 - j0);
     let all_valid_tile = quantized.len() == max_element_count;
@@ -684,6 +755,7 @@ fn scale_quantized_tile(
     let n_cols = header.n_cols as usize;
     let n_depth = header.n_depth as usize;
     let inv_scale = 2.0 * header.max_z_error;
+    let z_max = z_max_for_depth(header, ranges, i_depth);
     let mut src_idx = 0usize;
 
     for row in i0..i1 {
@@ -697,7 +769,14 @@ fn scale_quantized_tile(
                 }
 
                 let mut value = offset + quantized[src_idx] as f64 * inv_scale;
-                value = value.min(header.z_max);
+                if diff_encoded {
+                    let prev_offset = (pixel_idx * n_depth + i_depth - 1) * value_size;
+                    value += read_value_from_bytes(
+                        header.data_type,
+                        &data[prev_offset..prev_offset + value_size],
+                    );
+                }
+                value = value.min(z_max);
                 let value_bytes = encode_value_as_bytes(header.data_type, value);
                 let dst_offset = (pixel_idx * n_depth + i_depth) * value_size;
                 data[dst_offset..dst_offset + value_size].copy_from_slice(&value_bytes);
@@ -713,6 +792,46 @@ fn scale_quantized_tile(
     }
 
     Ok(())
+}
+
+fn copy_previous_depth_tile(
+    header: &HeaderInfo,
+    mask: &BitMask,
+    data: &mut [u8],
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    i_depth: usize,
+) -> Result<()> {
+    let value_size = header.data_type.size_in_bytes();
+    let n_cols = header.n_cols as usize;
+    let n_depth = header.n_depth as usize;
+
+    for row in i0..i1 {
+        for col in j0..j1 {
+            let pixel_idx = row * n_cols + col;
+            if mask.is_valid(pixel_idx)? {
+                let dst_offset = (pixel_idx * n_depth + i_depth) * value_size;
+                let prev_offset = dst_offset - value_size;
+                let value = data[prev_offset..prev_offset + value_size].to_vec();
+                data[dst_offset..dst_offset + value_size].copy_from_slice(&value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn z_max_for_depth(header: &HeaderInfo, ranges: Option<&MinMaxRanges>, i_depth: usize) -> f64 {
+    if header.version >= 4 && header.n_depth > 1 {
+        ranges
+            .and_then(|ranges| ranges.maxs.get(i_depth))
+            .copied()
+            .unwrap_or(header.z_max)
+    } else {
+        header.z_max
+    }
 }
 
 fn get_data_type_used(data_type: DataType, tc: u8) -> Result<DataType> {
@@ -746,6 +865,19 @@ fn encode_value_as_bytes(data_type: DataType, value: f64) -> Vec<u8> {
         DataType::UInt => (value as u32).to_le_bytes().to_vec(),
         DataType::Float => (value as f32).to_le_bytes().to_vec(),
         DataType::Double => value.to_le_bytes().to_vec(),
+    }
+}
+
+fn read_value_from_bytes(data_type: DataType, bytes: &[u8]) -> f64 {
+    match data_type {
+        DataType::Char => i8::from_le_bytes(bytes[..1].try_into().unwrap()) as f64,
+        DataType::UChar => bytes[0] as f64,
+        DataType::Short => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as f64,
+        DataType::UShort => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as f64,
+        DataType::Int => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::UInt => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::Float => f32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
+        DataType::Double => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
     }
 }
 
@@ -1118,6 +1250,36 @@ mod tests {
         blob
     }
 
+    fn synthetic_v5_diff_tiled_blob(diff_block: Vec<u8>) -> Vec<u8> {
+        let range_bytes = [10u8, 15, 40, 48];
+        let depth0_block = {
+            let mut block = vec![0];
+            block.extend_from_slice(&[10, 20, 30, 40]);
+            block
+        };
+        let blocks = [depth0_block, diff_block];
+        let tile_bytes_len: usize = blocks.iter().map(Vec::len).sum();
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size = header_size + 4 + range_bytes.len() + 1 + tile_bytes_len;
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&5i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [2, 2, 2, 4, 2, blob_size as i32, DataType::UChar as i32] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&10.0f64.to_le_bytes());
+        blob.extend_from_slice(&48.0f64.to_le_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        blob.extend_from_slice(&range_bytes);
+        blob.push(0);
+        for block in blocks {
+            blob.extend_from_slice(&block);
+        }
+        blob
+    }
+
     fn bit_stuffed_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
         let mut block = vec![1, offset];
         block.extend_from_slice(&BitStuffer2::encode_simple(quantized, 4).unwrap());
@@ -1134,6 +1296,19 @@ mod tests {
 
         let mut block = vec![1, offset];
         block.extend_from_slice(&BitStuffer2::encode_lut(&sorted, 4).unwrap());
+        block
+    }
+
+    fn diff_bit_stuffed_tile_block(offset: i16, quantized: &[u32]) -> Vec<u8> {
+        let mut block = vec![(2 << 6) | 4 | 1];
+        block.extend_from_slice(&offset.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_simple(quantized, 5).unwrap());
+        block
+    }
+
+    fn diff_constant_tile_block(offset: i16) -> Vec<u8> {
+        let mut block = vec![(2 << 6) | 4 | 3];
+        block.extend_from_slice(&offset.to_le_bytes());
         block
     }
 
@@ -1444,6 +1619,33 @@ mod tests {
         ];
         let mut blob = synthetic_v4_tiled_block_blob(DataType::UChar, 1, &valid, &ranges, &blocks);
         blob.pop();
+
+        assert!(read_lerc2_tiled_payload(&blob).is_err());
+    }
+
+    #[test]
+    fn reads_v5_diff_bit_stuffed_tiled_payload() {
+        let blob = synthetic_v5_diff_tiled_blob(diff_bit_stuffed_tile_block(5, &[0, 1, 2, 3]));
+        let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
+
+        assert_eq!(tiled.data, [10, 15, 20, 26, 30, 37, 40, 48]);
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn reads_v5_diff_constant_tiled_payload() {
+        let blob = synthetic_v5_diff_tiled_blob(diff_constant_tile_block(5));
+        let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
+
+        assert_eq!(tiled.data, [10, 15, 20, 25, 30, 35, 40, 45]);
+        assert_eq!(tiled.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn rejects_v5_diff_first_depth_tile() {
+        let mut blob = synthetic_v5_diff_tiled_blob(diff_constant_tile_block(5));
+        let tile_start = blob.len() - (1 + 4) - (1 + 2);
+        blob[tile_start] = 6;
 
         assert!(read_lerc2_tiled_payload(&blob).is_err());
     }

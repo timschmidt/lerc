@@ -44,6 +44,7 @@ fn main() {
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
+    let tiled_diff_blob = synthetic_v5_tiled_diff_blob();
     let encoded_rle = Rle::compress(&byte_data).unwrap();
     let encoded_bits = BitStuffer2::encode_simple(&uint_data, 3).unwrap();
     let bit_mask = BitMask::from_byte_mask(&mask_data, 1000, 1000).unwrap();
@@ -95,6 +96,9 @@ fn main() {
     });
     bench("lerc2-tiled-lut-v4-synthetic", 100_000, || {
         black_box(read_lerc2_tiled_payload(black_box(&tiled_lut_blob)).unwrap());
+    });
+    bench("lerc2-tiled-diff-v5-synthetic", 100_000, || {
+        black_box(read_lerc2_tiled_payload(black_box(&tiled_diff_blob)).unwrap());
     });
 
     std::thread::sleep(Duration::from_millis(1));
@@ -165,6 +169,42 @@ fn synthetic_v4_tiled_lut_blob() -> Vec<u8> {
         vec![3, 24],
     ];
     synthetic_v4_tiled_blocks(DataType::UChar, 1, &valid, &range_bytes, &blocks)
+}
+
+fn synthetic_v5_tiled_diff_blob() -> Vec<u8> {
+    let range_bytes = [10u8, 15, 40, 48];
+    let depth0_block = {
+        let mut block = vec![0];
+        block.extend_from_slice(&[10, 20, 30, 40]);
+        block
+    };
+    let depth1_block = {
+        let mut block = vec![(2 << 6) | 4 | 1];
+        block.extend_from_slice(&5i16.to_le_bytes());
+        block.extend_from_slice(&BitStuffer2::encode_simple(&[0, 1, 2, 3], 5).unwrap());
+        block
+    };
+    let blocks = [depth0_block, depth1_block];
+    let tile_bytes_len: usize = blocks.iter().map(Vec::len).sum();
+    let header_size = 6 + 4 + 4 + 7 * 4 + 3 * 8;
+    let blob_size = header_size + 4 + range_bytes.len() + 1 + tile_bytes_len;
+    let mut blob = Vec::with_capacity(blob_size);
+    blob.extend_from_slice(b"Lerc2 ");
+    blob.extend_from_slice(&5i32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    for value in [2, 2, 2, 4, 2, blob_size as i32, DataType::UChar as i32] {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    blob.extend_from_slice(&0.5f64.to_le_bytes());
+    blob.extend_from_slice(&10.0f64.to_le_bytes());
+    blob.extend_from_slice(&48.0f64.to_le_bytes());
+    blob.extend_from_slice(&0i32.to_le_bytes());
+    blob.extend_from_slice(&range_bytes);
+    blob.push(0);
+    for block in blocks {
+        blob.extend_from_slice(&block);
+    }
+    blob
 }
 
 fn bit_stuffed_tile_block(offset: u8, quantized: &[u32]) -> Vec<u8> {
