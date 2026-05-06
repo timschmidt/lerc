@@ -41,6 +41,11 @@ fn main() {
         "/../testData/bluemarble_256_256_3_byte.lerc2"
     ))
     .unwrap();
+    let float_fixture_blob = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testData/california_400_400_1_float.lerc2"
+    ))
+    .unwrap();
     let mut blob_info_array = [0u32; 11];
     let mut blob_range_array = [0.0f64; 3];
     let mut data_range_mins = [0.0f64; 3];
@@ -75,6 +80,10 @@ fn main() {
     let mut ffi_decode_double_4d_mask = vec![0; 6];
     let mut ffi_decode_double_4d_uses_no_data = vec![0; 1];
     let mut ffi_decode_double_4d_no_data_values = vec![0.0f64; 1];
+    let mut ffi_float_fixture_data = vec![0.0f32; 160_000];
+    let mut ffi_float_fixture_mask = vec![0; 160_000];
+    let mut ffi_float_fixture_double_data = vec![0.0f64; 160_000];
+    let mut ffi_float_fixture_double_mask = vec![0; 160_000];
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
     let tiled_lut_blob = synthetic_v4_tiled_lut_blob();
@@ -178,6 +187,9 @@ fn main() {
             black_box(decode_lerc2_supported(black_box(&one_sweep_no_data_blob)).unwrap());
         },
     );
+    bench("lerc2-supported-decode-float-fixture", 100, || {
+        black_box(decode_lerc2_supported(black_box(&float_fixture_blob)).unwrap());
+    });
     bench("lerc2-supported-write-data-bytes", 100_000, || {
         black_box(
             one_sweep_bands_decoded
@@ -231,6 +243,37 @@ fn main() {
                 2,
                 2,
                 black_box(ffi_decode_double_data.as_mut_ptr()),
+            )
+        });
+    });
+    bench("ffi-decode-float-fixture", 100, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decode(
+                black_box(float_fixture_blob.as_ptr()),
+                float_fixture_blob.len() as u32,
+                1,
+                black_box(ffi_float_fixture_mask.as_mut_ptr()),
+                1,
+                400,
+                400,
+                1,
+                DataType::Float as u32,
+                black_box(ffi_float_fixture_data.as_mut_ptr().cast()),
+            )
+        });
+    });
+    bench("ffi-decode-to-double-float-fixture", 100, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decodeToDouble(
+                black_box(float_fixture_blob.as_ptr()),
+                float_fixture_blob.len() as u32,
+                1,
+                black_box(ffi_float_fixture_double_mask.as_mut_ptr()),
+                1,
+                400,
+                400,
+                1,
+                black_box(ffi_float_fixture_double_data.as_mut_ptr()),
             )
         });
     });

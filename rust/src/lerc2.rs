@@ -2926,6 +2926,26 @@ mod tests {
     }
 
     #[test]
+    fn decodes_single_band_float_fixture_supported_subset() {
+        let blob = fixture("california_400_400_1_float.lerc2");
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.header.data_type, DataType::Float);
+        assert_eq!(decoded.mask.count_valid_bits(), 58_515);
+        match decoded.data {
+            DecodedData::Float(values) => {
+                assert_eq!(values.len(), 160_000);
+                assert_eq!(values[0], 0.0);
+                assert!((values[67] - 1443.2926).abs() < 0.0001);
+                assert!((values[68] - 1330.419).abs() < 0.0001);
+                assert!((values[435] - 181.57863).abs() < 0.0001);
+            }
+            other => panic!("expected float decoded data, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reads_v5_diff_bit_stuffed_tiled_payload() {
         let blob = synthetic_v5_diff_tiled_blob(diff_bit_stuffed_tile_block(5, &[0, 1, 2, 3]));
         let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();

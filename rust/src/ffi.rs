@@ -1675,6 +1675,65 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_decode_float_fixture_writes_data_and_mask() {
+        let blob = fixture("california_400_400_1_float.lerc2");
+        let mut data = vec![0.0f32; 160_000];
+        let mut mask = vec![0u8; 160_000];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                400,
+                400,
+                1,
+                DataType::Float as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 58_515);
+        assert_eq!(mask[0], 0);
+        assert_eq!(mask[67], 1);
+        assert!((data[67] - 1443.2926).abs() < 0.0001);
+        assert!((data[68] - 1330.419).abs() < 0.0001);
+        assert!((data[435] - 181.57863).abs() < 0.0001);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_float_fixture_writes_data_and_mask() {
+        let blob = fixture("california_400_400_1_float.lerc2");
+        let mut data = vec![0.0f64; 160_000];
+        let mut mask = vec![0u8; 160_000];
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                400,
+                400,
+                1,
+                data.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 58_515);
+        assert_eq!(mask[0], 0);
+        assert_eq!(mask[67], 1);
+        assert!((data[67] - 1443.2926).abs() < 0.0001);
+        assert!((data[68] - 1330.419).abs() < 0.0001);
+        assert!((data[435] - 181.57863).abs() < 0.0001);
+    }
+
+    #[test]
     fn c_abi_decode_4d_reports_no_data() {
         let blob = synthetic_v6_uchar_one_sweep_no_data_blob();
         let mut data = [0u8; 12];
