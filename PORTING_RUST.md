@@ -12,7 +12,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added Lerc2 mask-section reading, including RLE mask decompression and previous-mask reuse for concatenated bands.
 - Added Lerc2 Fletcher32 checksum calculation and validation for version 3+ blobs.
 - Added Lerc2 v4+ min/max range-section parsing for all native Lerc data types.
-- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, and malformed input.
+- Added Lerc2 one-sweep raw payload decoding, matching `Lerc2::ReadDataOneSweep`.
+- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -20,7 +21,7 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - The Rust `Rle` byte stream layout is intended to match `src/LercLib/RLE.cpp`: little-endian signed counters, negative repeated runs, positive literal runs, and `i16::MIN` end-of-stream marker.
 - The Rust `BitStuffer2` implementation currently supports Lerc2 version 3 and newer bit packing. The older pre-v2.3 packing path in `BitStuff_Before_Lerc2v3` and `BitUnStuff_Before_Lerc2v3` is explicitly rejected for now.
 - The Rust `BitMask` preserves the C++ MSB-first bit order from `BitMask::Bit`; padding bits may remain set after `set_all_valid`, but `count_valid_bits` excludes them.
-- The Rust Lerc2 parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo`, checksum validation used by `Lerc2::Decode`, mask reading used by `Lerc2::ReadMask`, min/max range parsing used by `Lerc2::ReadMinMaxRanges`, and the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
+- The Rust Lerc2 parser supports versions 0 through 6 and currently covers the fast header path used by `Lerc2::GetHeaderInfo`, checksum validation used by `Lerc2::Decode`, mask reading used by `Lerc2::ReadMask`, min/max range parsing used by `Lerc2::ReadMinMaxRanges`, one-sweep raw payload expansion used by `Lerc2::ReadDataOneSweep`, and the Lerc2 branch of `Lerc::GetLercInfo`. It does not yet fall back to legacy Lerc1 metadata parsing.
 - Lerc2 previous-mask reuse is explicit in Rust via `read_lerc2_mask_with_previous`; calling `read_lerc2_mask` on a blob that omits a partial mask returns an unsupported error.
 - Public Rust APIs return `Result<T, LercError>` instead of bool/status pairs. C-compatible FFI wrappers should be added after the safe Rust codec surface is stable.
 
@@ -36,8 +37,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
    - Compare Rust `get_lerc_info` with C API output for all `testData/*.lerc2` fixtures.
    - Decide whether the Rust crate should implement Lerc1 metadata fallback or expose Lerc2-only behavior explicitly.
 4. Port decode-only Lerc2 block paths.
-   - Port `ReadDataOneSweep` for uncompressed valid-pixel payloads.
-   - Decode uncompressed, bit-stuffed, RLE, and Huffman-backed blocks separately.
+   - Add typed views/conversions over raw one-sweep payload output.
+   - Decode tiled raw, bit-stuffed, LUT, and Huffman-backed blocks separately.
    - Keep each block codec independently fuzzable and benchmarkable.
 5. Add encode paths after decode parity is established.
    - Start with lossless integer and byte tiles.
@@ -55,8 +56,8 @@ cargo bench --bench rle_bit_stuffer
 
 Last run in this branch:
 
-- `cargo test`: passed, 23 unit tests.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, Lerc2 metadata parsing, Lerc2 mask reading, Lerc2 checksum validation, and Lerc2 min/max range parsing.
+- `cargo test`: passed, 26 unit tests.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, Lerc2 metadata parsing, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, and Lerc2 one-sweep decode.
 
 ## Open Risks
 

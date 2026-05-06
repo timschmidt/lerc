@@ -66,6 +66,12 @@ pub struct MinMaxRanges {
     pub min_max_equal: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataOneSweep {
+    pub data: Vec<u8>,
+    pub bytes_consumed: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LercInfo {
     pub version: i32,
@@ -199,6 +205,44 @@ pub fn read_lerc2_min_max_ranges_with_previous(
     };
 
     Ok((header, mask, ranges))
+}
+
+pub fn read_lerc2_data_one_sweep(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, DataOneSweep)> {
+    read_lerc2_data_one_sweep_with_previous(blob, None)
+}
+
+pub fn read_lerc2_data_one_sweep_with_previous(
+    blob: &[u8],
+    previous_mask: Option<&BitMask>,
+) -> Result<(HeaderInfo, MaskInfo, DataOneSweep)> {
+    let mut reader = Reader::new(blob);
+    let header = read_header(&mut reader)?;
+    let mask = read_mask(&mut reader, &header, previous_mask)?;
+
+    if header.num_valid_pixel == 0 || header.z_min == header.z_max {
+        return Err(LercError::Unsupported(
+            "Lerc2 const or empty blobs do not carry one-sweep payloads",
+        ));
+    }
+
+    if header.version >= 4 {
+        let ranges = read_min_max_ranges(&mut reader, &header)?;
+        if ranges.min_max_equal {
+            return Err(LercError::Unsupported(
+                "Lerc2 all-constant min/max ranges do not carry one-sweep payloads",
+            ));
+        }
+    }
+
+    let flag = reader.read_bytes(1)?[0];
+    if flag != 1 {
+        return Err(LercError::Unsupported(
+            "Lerc2 blob is not encoded one-sweep",
+        ));
+    }
+
+    let data = read_data_one_sweep(&mut reader, &header, &mask.mask)?;
+    Ok((header, mask, data))
 }
 
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
@@ -362,6 +406,58 @@ fn read_min_max_ranges(reader: &mut Reader<'_>, header: &HeaderInfo) -> Result<M
         maxs,
         bytes_consumed: reader.pos,
         min_max_equal,
+    })
+}
+
+fn read_data_one_sweep(
+    reader: &mut Reader<'_>,
+    header: &HeaderInfo,
+    mask: &BitMask,
+) -> Result<DataOneSweep> {
+    let n_depth = header.n_depth as usize;
+    let bytes_per_pixel = n_depth
+        .checked_mul(header.data_type.size_in_bytes())
+        .ok_or(LercError::CorruptInput(
+            "Lerc2 one-sweep pixel byte width overflow",
+        ))?;
+    let pixel_count = (header.n_cols as usize)
+        .checked_mul(header.n_rows as usize)
+        .ok_or(LercError::CorruptInput(
+            "Lerc2 one-sweep pixel count overflow",
+        ))?;
+    let output_len = pixel_count
+        .checked_mul(bytes_per_pixel)
+        .ok_or(LercError::CorruptInput(
+            "Lerc2 one-sweep output size overflow",
+        ))?;
+    let payload_len = (header.num_valid_pixel as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or(LercError::CorruptInput(
+            "Lerc2 one-sweep payload size overflow",
+        ))?;
+
+    if mask.count_valid_bits() != header.num_valid_pixel as usize {
+        return Err(LercError::CorruptInput(
+            "Lerc2 one-sweep mask valid count does not match header",
+        ));
+    }
+
+    let payload = reader.read_bytes(payload_len)?;
+    let mut data = vec![0; output_len];
+    let mut src_offset = 0usize;
+
+    for pixel_idx in 0..pixel_count {
+        if mask.is_valid(pixel_idx)? {
+            let dst_offset = pixel_idx * bytes_per_pixel;
+            data[dst_offset..dst_offset + bytes_per_pixel]
+                .copy_from_slice(&payload[src_offset..src_offset + bytes_per_pixel]);
+            src_offset += bytes_per_pixel;
+        }
+    }
+
+    Ok(DataOneSweep {
+        data,
+        bytes_consumed: reader.pos,
     })
 }
 
@@ -568,11 +664,11 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, validate_lerc2_checksum,
-        FILE_KEY,
+        compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info,
+        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
+        read_lerc2_min_max_ranges, validate_lerc2_checksum, FILE_KEY,
     };
-    use crate::DataType;
+    use crate::{DataType, Rle};
     use std::fs;
     use std::path::PathBuf;
 
@@ -599,6 +695,49 @@ mod tests {
         blob.extend_from_slice(&1000.0f64.to_le_bytes());
         blob.extend_from_slice(&0i32.to_le_bytes());
         blob.extend_from_slice(range_bytes);
+        blob
+    }
+
+    fn synthetic_v4_one_sweep_blob(
+        data_type: DataType,
+        n_depth: i32,
+        valid: &[u8],
+        range_bytes: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let num_valid = valid.iter().filter(|&&value| value != 0).count();
+        let encoded_mask = if num_valid > 0 && num_valid < valid.len() {
+            let mask = crate::BitMask::from_byte_mask(valid, 3, 2).unwrap();
+            Rle::compress(mask.bits()).unwrap()
+        } else {
+            Vec::new()
+        };
+        let header_size = FILE_KEY.len() + 4 + 4 + 7 * 4 + 3 * 8;
+        let blob_size =
+            header_size + 4 + encoded_mask.len() + range_bytes.len() + 1 + payload.len();
+        let mut blob = Vec::with_capacity(blob_size);
+        blob.extend_from_slice(FILE_KEY);
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        for value in [
+            2,
+            3,
+            n_depth,
+            num_valid as i32,
+            8,
+            blob_size as i32,
+            data_type as i32,
+        ] {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&(-10.0f64).to_le_bytes());
+        blob.extend_from_slice(&1000.0f64.to_le_bytes());
+        blob.extend_from_slice(&(encoded_mask.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&encoded_mask);
+        blob.extend_from_slice(range_bytes);
+        blob.push(1);
+        blob.extend_from_slice(payload);
         blob
     }
 
@@ -752,6 +891,52 @@ mod tests {
         let range_bytes = [1u8, 2, 3, 10, 20];
         let blob = synthetic_v4_blob(DataType::UChar, 3, &range_bytes);
         assert!(read_lerc2_min_max_ranges(&blob).is_err());
+    }
+
+    #[test]
+    fn reads_v4_byte_one_sweep_payload_with_mask() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 2, 10, 20];
+        let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let blob = synthetic_v4_one_sweep_blob(DataType::UChar, 2, &valid, &ranges, &payload);
+        let (_, _, one_sweep) = read_lerc2_data_one_sweep(&blob).unwrap();
+
+        assert_eq!(one_sweep.data, [1, 2, 0, 0, 3, 4, 5, 6, 0, 0, 7, 8]);
+        assert_eq!(one_sweep.bytes_consumed, blob.len());
+    }
+
+    #[test]
+    fn reads_v4_float_one_sweep_payload_all_valid() {
+        let valid = [1, 1, 1, 1, 1, 1];
+        let mut ranges = Vec::new();
+        for value in [-1.0f32, 10.0] {
+            ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        let values = [1.25f32, 2.5, 3.75, 4.0, 5.5, 6.25];
+        let mut payload = Vec::new();
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let blob = synthetic_v4_one_sweep_blob(DataType::Float, 1, &valid, &ranges, &payload);
+        let (_, _, one_sweep) = read_lerc2_data_one_sweep(&blob).unwrap();
+        assert_eq!(one_sweep.data, payload);
+    }
+
+    #[test]
+    fn rejects_non_one_sweep_and_truncated_payloads() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 2, 10, 20];
+        let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut blob = synthetic_v4_one_sweep_blob(DataType::UChar, 2, &valid, &ranges, &payload);
+
+        let flag_offset = blob.len() - payload.len() - 1;
+        blob[flag_offset] = 0;
+        assert!(read_lerc2_data_one_sweep(&blob).is_err());
+
+        blob[flag_offset] = 1;
+        blob.pop();
+        assert!(read_lerc2_data_one_sweep(&blob).is_err());
     }
 
     #[test]

@@ -84,3 +84,14 @@ impl TryFrom<i32> for DataType {
         }
     }
 }
+
+impl DataType {
+    pub fn size_in_bytes(self) -> usize {
+        match self {
+            Self::Char | Self::UChar => 1,
+            Self::Short | Self::UShort => 2,
+            Self::Int | Self::UInt | Self::Float => 4,
+            Self::Double => 8,
+        }
+    }
+}

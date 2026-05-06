@@ -29,10 +29,10 @@ pub mod types;
 pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
 pub use lerc2::{
-    compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_mask,
-    read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
-    read_lerc2_min_max_ranges_with_previous, validate_lerc2_checksum, HeaderInfo, LercInfo,
-    MaskInfo, MinMaxRanges,
+    compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
+    read_lerc2_data_one_sweep_with_previous, read_lerc2_mask, read_lerc2_mask_with_previous,
+    read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous, validate_lerc2_checksum,
+    DataOneSweep, HeaderInfo, LercInfo, MaskInfo, MinMaxRanges,
 };
 pub use rle::Rle;
 pub use types::{DataType, ErrCode, LercError, Result};

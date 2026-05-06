@@ -2,8 +2,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    get_lerc2_header_info, get_lerc_info, read_lerc2_mask, read_lerc2_min_max_ranges,
-    validate_lerc2_checksum, BitMask, BitStuffer2, DataType, Rle,
+    get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+    read_lerc2_min_max_ranges, validate_lerc2_checksum, BitMask, BitStuffer2, DataType, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -39,6 +39,7 @@ fn main() {
     ))
     .unwrap();
     let min_max_blob = synthetic_v4_min_max_blob();
+    let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let encoded_rle = Rle::compress(&byte_data).unwrap();
     let encoded_bits = BitStuffer2::encode_simple(&uint_data, 3).unwrap();
     let bit_mask = BitMask::from_byte_mask(&mask_data, 1000, 1000).unwrap();
@@ -79,8 +80,47 @@ fn main() {
     bench("lerc2-min-max-ranges-v4-synthetic", 100_000, || {
         black_box(read_lerc2_min_max_ranges(black_box(&min_max_blob)).unwrap());
     });
+    bench("lerc2-data-one-sweep-v4-synthetic", 100_000, || {
+        black_box(read_lerc2_data_one_sweep(black_box(&one_sweep_blob)).unwrap());
+    });
 
     std::thread::sleep(Duration::from_millis(1));
+}
+
+fn synthetic_v4_one_sweep_blob() -> Vec<u8> {
+    let n_depth = 2i32;
+    let valid = [1, 0, 1, 1, 0, 1];
+    let mask = BitMask::from_byte_mask(&valid, 3, 2).unwrap();
+    let encoded_mask = Rle::compress(mask.bits()).unwrap();
+    let num_valid = valid.iter().filter(|&&value| value != 0).count();
+    let range_bytes = [1u8, 2, 10, 20];
+    let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let header_size = 6 + 4 + 4 + 7 * 4 + 3 * 8;
+    let blob_size = header_size + 4 + encoded_mask.len() + range_bytes.len() + 1 + payload.len();
+    let mut blob = Vec::with_capacity(blob_size);
+    blob.extend_from_slice(b"Lerc2 ");
+    blob.extend_from_slice(&4i32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    for value in [
+        2,
+        3,
+        n_depth,
+        num_valid as i32,
+        8,
+        blob_size as i32,
+        DataType::UChar as i32,
+    ] {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    blob.extend_from_slice(&0.5f64.to_le_bytes());
+    blob.extend_from_slice(&1.0f64.to_le_bytes());
+    blob.extend_from_slice(&20.0f64.to_le_bytes());
+    blob.extend_from_slice(&(encoded_mask.len() as i32).to_le_bytes());
+    blob.extend_from_slice(&encoded_mask);
+    blob.extend_from_slice(&range_bytes);
+    blob.push(1);
+    blob.extend_from_slice(&payload);
+    blob
 }
 
 fn synthetic_v4_min_max_blob() -> Vec<u8> {
