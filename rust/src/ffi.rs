@@ -11,8 +11,8 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! C ABI entry points backed by the safe Rust implementation.
 
 use crate::{
-    decode_lerc2_supported_into, get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info,
-    DataType, DecodeIntoSpec, ErrCode, LercError,
+    decode_lerc2_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
+    get_lerc2_data_ranges, get_lerc_info, DataType, DecodeIntoSpec, ErrCode, LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -112,6 +112,45 @@ pub unsafe extern "C" fn lerc_decode(
             n_rows,
             n_bands,
             data_type,
+            p_data,
+        )
+    }))
+    .unwrap_or(ErrCode::Failed as u32)
+}
+
+/// C ABI equivalent of `lerc_decodeToDouble` for the supported Lerc2 subset.
+///
+/// Decoded values are converted to 64-bit floating point values in band-major
+/// order. Valid-pixel bytes are written when `n_masks` is nonzero.
+///
+/// # Safety
+///
+/// `p_lerc_blob` must point to `blob_size` readable bytes. `p_data` must point
+/// to writable storage for `n_depth * n_cols * n_rows * n_bands` `double`
+/// values. When `n_masks` is nonzero, `p_valid_bytes` must point to writable
+/// storage for `n_cols * n_rows * n_masks` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lerc_decodeToDouble(
+    p_lerc_blob: *const u8,
+    blob_size: u32,
+    n_masks: i32,
+    p_valid_bytes: *mut u8,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    p_data: *mut f64,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        lerc_decode_to_double_impl(
+            p_lerc_blob,
+            blob_size,
+            n_masks,
+            p_valid_bytes,
+            n_depth,
+            n_cols,
+            n_rows,
+            n_bands,
             p_data,
         )
     }))
@@ -262,6 +301,83 @@ unsafe fn lerc_decode_impl(
     }
 }
 
+unsafe fn lerc_decode_to_double_impl(
+    p_lerc_blob: *const u8,
+    blob_size: u32,
+    n_masks: i32,
+    p_valid_bytes: *mut u8,
+    n_depth: i32,
+    n_cols: i32,
+    n_rows: i32,
+    n_bands: i32,
+    p_data: *mut f64,
+) -> u32 {
+    if p_lerc_blob.is_null()
+        || blob_size == 0
+        || p_data.is_null()
+        || n_depth <= 0
+        || n_cols <= 0
+        || n_rows <= 0
+        || n_bands <= 0
+        || !(n_masks == 0 || n_masks == 1 || n_masks == n_bands)
+        || (n_masks > 0 && p_valid_bytes.is_null())
+    {
+        return ErrCode::WrongParam as u32;
+    }
+
+    let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
+    let info = match get_lerc_info(blob) {
+        Ok(info) if info.n_uses_no_data_value > 0 && n_depth > 1 => {
+            return ErrCode::HasNoData as u32;
+        }
+        Ok(info) => info,
+        Err(err) => return err.err_code() as u32,
+    };
+    let spec = DecodeIntoSpec {
+        data_type: info.data_type,
+        n_depth: n_depth as usize,
+        n_cols: n_cols as usize,
+        n_rows: n_rows as usize,
+        n_bands: n_bands as usize,
+        n_masks: n_masks as usize,
+    };
+
+    let data_len = match decoded_data_byte_len(spec) {
+        Ok(len) => len,
+        Err(err) => return err.err_code() as u32,
+    };
+    let value_count = match decoded_value_count(spec) {
+        Ok(len) => len,
+        Err(err) => return err.err_code() as u32,
+    };
+    let mask_len = match decoded_mask_byte_len(spec) {
+        Ok(len) => len,
+        Err(err) => return err.err_code() as u32,
+    };
+
+    let mut native_data = vec![0u8; data_len];
+    let mut mask_output = if n_masks > 0 {
+        Some(unsafe { slice::from_raw_parts_mut(p_valid_bytes, mask_len) })
+    } else {
+        None
+    };
+    let decoded =
+        match decode_lerc2_supported_into(blob, spec, &mut native_data, mask_output.as_deref_mut())
+        {
+            Ok(_) => match decode_typed_values(info.data_type, &native_data) {
+                Ok(decoded) => decoded,
+                Err(err) => return err.err_code() as u32,
+            },
+            Err(err) => return err.err_code() as u32,
+        };
+
+    let output = unsafe { slice::from_raw_parts_mut(p_data, value_count) };
+    match decoded.write_f64_values(output) {
+        Ok(_) => ErrCode::Ok as u32,
+        Err(err) => err.err_code() as u32,
+    }
+}
+
 fn decoded_data_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
     spec.n_bands
         .checked_mul(spec.n_rows)
@@ -269,6 +385,14 @@ fn decoded_data_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
         .and_then(|count| count.checked_mul(spec.n_depth))
         .and_then(|count| count.checked_mul(spec.data_type.size_in_bytes()))
         .ok_or(LercError::WrongParam("decode output byte count overflow"))
+}
+
+fn decoded_value_count(spec: DecodeIntoSpec) -> Result<usize, LercError> {
+    spec.n_bands
+        .checked_mul(spec.n_rows)
+        .and_then(|count| count.checked_mul(spec.n_cols))
+        .and_then(|count| count.checked_mul(spec.n_depth))
+        .ok_or(LercError::WrongParam("decode output value count overflow"))
 }
 
 fn decoded_mask_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
@@ -280,7 +404,7 @@ fn decoded_mask_byte_len(spec: DecodeIntoSpec) -> Result<usize, LercError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lerc_decode, lerc_getBlobInfo, lerc_getDataRanges};
+    use super::{lerc_decode, lerc_decodeToDouble, lerc_getBlobInfo, lerc_getDataRanges};
     use crate::{
         compute_checksum_fletcher32, DataType, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN,
         BLOB_INFO_ARRAY_LEN,
@@ -533,6 +657,83 @@ mod tests {
                 1,
                 99,
                 data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_writes_data_and_mask() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0.0f64; 6];
+        let mut mask = [0u8; 6];
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                data.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(data, [7.0; 6]);
+        assert_eq!(mask, [1; 6]);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_rejects_invalid_arguments() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0.0f64; 6];
+        let mut mask = [0u8; 6];
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                ptr::null(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                ptr::null_mut(),
+                1,
+                3,
+                2,
+                1,
+                data.as_mut_ptr(),
             )
         };
         assert_eq!(status, ErrCode::WrongParam as u32);

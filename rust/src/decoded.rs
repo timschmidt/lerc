@@ -96,6 +96,27 @@ impl DecodedData {
 
         Ok(byte_len)
     }
+
+    /// Writes the scalar values to `output` as 64-bit floating point values.
+    pub fn write_f64_values(&self, output: &mut [f64]) -> Result<usize> {
+        let len = self.len();
+        if output.len() < len {
+            return Err(LercError::BufferTooSmall);
+        }
+
+        match self {
+            Self::Char(values) => write_as_f64(output, values, |value| value as f64),
+            Self::UChar(values) => write_as_f64(output, values, |value| value as f64),
+            Self::Short(values) => write_as_f64(output, values, |value| value as f64),
+            Self::UShort(values) => write_as_f64(output, values, |value| value as f64),
+            Self::Int(values) => write_as_f64(output, values, |value| value as f64),
+            Self::UInt(values) => write_as_f64(output, values, |value| value as f64),
+            Self::Float(values) => write_as_f64(output, values, |value| value as f64),
+            Self::Double(values) => output[..len].copy_from_slice(values),
+        }
+
+        Ok(len)
+    }
 }
 
 fn write_native_values<T, const N: usize>(
@@ -107,6 +128,15 @@ fn write_native_values<T, const N: usize>(
 {
     for (chunk, &value) in output.chunks_exact_mut(N).zip(values.iter()) {
         chunk.copy_from_slice(&to_le_bytes(value));
+    }
+}
+
+fn write_as_f64<T>(output: &mut [f64], values: &[T], convert: fn(T) -> f64)
+where
+    T: Copy,
+{
+    for (dst, &value) in output.iter_mut().zip(values.iter()) {
+        *dst = convert(value);
     }
 }
 
@@ -259,5 +289,25 @@ mod tests {
         let data = DecodedData::UShort(vec![1, 2]);
         let mut output = [0u8; 3];
         assert!(data.write_le_bytes(&mut output).is_err());
+    }
+
+    #[test]
+    fn writes_decoded_values_as_f64() {
+        let mut output = [0.0; 3];
+        let written = DecodedData::Short(vec![-2, 0, 300])
+            .write_f64_values(&mut output)
+            .unwrap();
+        assert_eq!(written, 3);
+        assert_eq!(output, [-2.0, 0.0, 300.0]);
+
+        let mut output = [0.0; 2];
+        DecodedData::Float(vec![1.25, -2.5])
+            .write_f64_values(&mut output)
+            .unwrap();
+        assert_eq!(output, [1.25, -2.5]);
+
+        assert!(DecodedData::Double(vec![1.0])
+            .write_f64_values(&mut [])
+            .is_err());
     }
 }

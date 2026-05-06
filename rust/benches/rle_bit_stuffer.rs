@@ -64,6 +64,8 @@ fn main() {
     let mut decode_into_mask = vec![0; 6];
     let mut ffi_decode_data = vec![0; one_sweep_bands_decoded.data_byte_len()];
     let mut ffi_decode_mask = vec![0; 6];
+    let mut ffi_decode_double_data = vec![0.0f64; 24];
+    let mut ffi_decode_double_mask = vec![0; 6];
     let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
     let tiled_raw_blob = synthetic_v4_tiled_raw_blob();
     let tiled_bitstuff_blob = synthetic_v4_tiled_bitstuff_blob();
@@ -206,6 +208,21 @@ fn main() {
                 2,
                 DataType::UChar as u32,
                 black_box(ffi_decode_data.as_mut_ptr().cast()),
+            )
+        });
+    });
+    bench("ffi-decode-to-double-v4-synthetic", 100_000, || {
+        black_box(unsafe {
+            lerc::ffi::lerc_decodeToDouble(
+                black_box(one_sweep_bands_blob.as_ptr()),
+                one_sweep_bands_blob.len() as u32,
+                1,
+                black_box(ffi_decode_double_mask.as_mut_ptr()),
+                2,
+                3,
+                2,
+                2,
+                black_box(ffi_decode_double_data.as_mut_ptr()),
             )
         });
     });
