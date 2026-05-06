@@ -2,8 +2,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    decode_typed_values, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
+    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
     validate_lerc2_checksum, BitMask, BitStuffer2, DataType, Rle,
 };
 
@@ -48,6 +48,9 @@ fn main() {
     let encoded_rle = Rle::compress(&byte_data).unwrap();
     let encoded_bits = BitStuffer2::encode_simple(&uint_data, 3).unwrap();
     let bit_mask = BitMask::from_byte_mask(&mask_data, 1000, 1000).unwrap();
+    let float_bytes: Vec<u8> = (0..250_000)
+        .flat_map(|idx| ((idx as f32) * 0.25).to_le_bytes())
+        .collect();
 
     bench("rle-compress-1mb", 50, || {
         black_box(Rle::compress(black_box(&byte_data)).unwrap());
@@ -69,6 +72,9 @@ fn main() {
     });
     bench("bit-mask-count-valid-1mp", 1000, || {
         black_box(black_box(&bit_mask).count_valid_bits());
+    });
+    bench("typed-float-decode-250k", 1000, || {
+        black_box(decode_typed_values(DataType::Float, black_box(&float_bytes)).unwrap());
     });
     bench("lerc2-header-parse", 100_000, || {
         black_box(get_lerc2_header_info(black_box(&lerc2_blob)).unwrap());

@@ -22,12 +22,14 @@ limitations under the License.
 
 pub mod bit_mask;
 pub mod bit_stuffer;
+pub mod decoded;
 pub mod lerc2;
 pub mod rle;
 pub mod types;
 
 pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
+pub use decoded::{decode_typed_values, DecodedData};
 pub use lerc2::{
     compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
     read_lerc2_data_one_sweep_with_previous, read_lerc2_mask, read_lerc2_mask_with_previous,

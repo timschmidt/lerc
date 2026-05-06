@@ -9,6 +9,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 */
 
 use crate::types::{DataType, LercError, Result};
+use crate::{decode_typed_values, DecodedData};
 use crate::{BitMask, BitStuffer2, Rle};
 
 pub const CURRENT_VERSION: i32 = 6;
@@ -72,10 +73,22 @@ pub struct DataOneSweep {
     pub bytes_consumed: usize,
 }
 
+impl DataOneSweep {
+    pub fn decode_typed(&self, data_type: DataType) -> Result<DecodedData> {
+        decode_typed_values(data_type, &self.data)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TiledData {
     pub data: Vec<u8>,
     pub bytes_consumed: usize,
+}
+
+impl TiledData {
+    pub fn decode_typed(&self, data_type: DataType) -> Result<DecodedData> {
+        decode_typed_values(data_type, &self.data)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1089,7 +1102,7 @@ mod tests {
         read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         validate_lerc2_checksum, FILE_KEY,
     };
-    use crate::{BitStuffer2, DataType, Rle};
+    use crate::{BitStuffer2, DataType, DecodedData, Rle};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1473,6 +1486,10 @@ mod tests {
         let (_, _, one_sweep) = read_lerc2_data_one_sweep(&blob).unwrap();
 
         assert_eq!(one_sweep.data, [1, 2, 0, 0, 3, 4, 5, 6, 0, 0, 7, 8]);
+        assert_eq!(
+            one_sweep.decode_typed(DataType::UChar).unwrap(),
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 0, 0, 7, 8])
+        );
         assert_eq!(one_sweep.bytes_consumed, blob.len());
     }
 
@@ -1492,6 +1509,10 @@ mod tests {
         let blob = synthetic_v4_one_sweep_blob(DataType::Float, 1, &valid, &ranges, &payload);
         let (_, _, one_sweep) = read_lerc2_data_one_sweep(&blob).unwrap();
         assert_eq!(one_sweep.data, payload);
+        assert_eq!(
+            one_sweep.decode_typed(DataType::Float).unwrap(),
+            DecodedData::Float(values.to_vec())
+        );
     }
 
     #[test]
@@ -1565,6 +1586,10 @@ mod tests {
         let (_, _, tiled) = read_lerc2_tiled_payload(&blob).unwrap();
 
         assert_eq!(tiled.data, (10u8..=24).collect::<Vec<_>>());
+        assert_eq!(
+            tiled.decode_typed(DataType::UChar).unwrap(),
+            DecodedData::UChar((10u8..=24).collect())
+        );
         assert_eq!(tiled.bytes_consumed, blob.len());
     }
 

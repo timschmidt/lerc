@@ -17,7 +17,8 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
 - Added Lerc2 tiled simple bit-stuffed payload decoding and constant-zMin tile handling.
 - Added Lerc2 tiled LUT payload decoding via the shared `BitStuffer2` stream decoder.
 - Added Lerc2 v5 diff-encoded tiled payload decoding for integer lossless simple/constant tile modes.
-- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, and malformed input.
+- Added typed decoded-data conversion helpers for all Lerc native data types, plus typed accessors for one-sweep and tiled decode outputs.
+- Added unit tests for round trips, boundary counters, bit widths, LUT streams, bit-mask packing, byte-mask conversion, typed decoded values, Lerc2 fixture metadata, Lerc2 masks, checksum validation, checksum mismatch detection, synthetic v4 min/max ranges, one-sweep payload expansion, raw tiled payload expansion, simple bit-stuffed tiled expansion, LUT tiled expansion, diff tiled expansion, and malformed input.
 - Added a dependency-free benchmark harness at `rust/benches/rle_bit_stuffer.rs`.
 
 ## Compatibility Notes
@@ -41,7 +42,6 @@ This branch is the start of a native Rust port of the LERC C++ library. The goal
    - Compare Rust `get_lerc_info` with C API output for all `testData/*.lerc2` fixtures.
    - Decide whether the Rust crate should implement Lerc1 metadata fallback or expose Lerc2-only behavior explicitly.
 4. Port decode-only Lerc2 block paths.
-   - Add typed views/conversions over raw one-sweep payload output.
    - Extend diff-encoded coverage to LUT and floating-point cases where C++ supports them.
    - Decode Huffman-backed blocks separately.
    - Keep each block codec independently fuzzable and benchmarkable.
@@ -61,8 +61,8 @@ cargo bench --bench rle_bit_stuffer
 
 Last run in this branch:
 
-- `cargo test`: passed, 35 unit tests.
-- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, Lerc2 metadata parsing, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, and Lerc2 diff tiled decode.
+- `cargo test`: passed, 37 unit tests.
+- `cargo bench --bench rle_bit_stuffer`: passed and printed timings for RLE compress/decompress, BitStuffer encode/decode, BitMask conversion/count operations, typed decoded value conversion, Lerc2 metadata parsing, Lerc2 mask reading, Lerc2 checksum validation, Lerc2 min/max range parsing, Lerc2 one-sweep decode, Lerc2 raw tiled decode, Lerc2 simple bit-stuffed tiled decode, Lerc2 LUT tiled decode, and Lerc2 diff tiled decode.
 
 ## Open Risks
 
