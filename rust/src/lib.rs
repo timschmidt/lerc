@@ -20,10 +20,12 @@ limitations under the License.
 //! The full LERC image encoder/decoder will be layered on these modules as the
 //! port progresses.
 
+pub mod bit_mask;
 pub mod bit_stuffer;
 pub mod rle;
 pub mod types;
 
+pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
 pub use rle::Rle;
 pub use types::{DataType, ErrCode, LercError, Result};
