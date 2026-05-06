@@ -348,6 +348,17 @@ pub struct DecodeIntoResult {
     pub mask_bytes_written: usize,
 }
 
+/// Byte counts produced by a supported decode-to-`f64` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeToF64Result {
+    /// Total bytes consumed from the input blob.
+    pub bytes_consumed: usize,
+    /// Number of `f64` values written to the decoded output buffer.
+    pub values_written: usize,
+    /// Bytes written to the decoded mask output buffer.
+    pub mask_bytes_written: usize,
+}
+
 /// Reads the Lerc2 header and reports whether an explicit mask follows it.
 pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     let mut reader = Reader::new(blob);
@@ -811,6 +822,33 @@ pub fn decode_lerc_supported_into(
     } else {
         decode_lerc2_supported_into(blob, spec, data_output, mask_output)
     }
+}
+
+/// Decodes supported LERC data into caller-provided `f64` output.
+///
+/// The blob is decoded through its native scalar type first, then converted to
+/// `f64`, matching the public C API `lerc_decodeToDouble` behavior. Masks are
+/// written as one byte per pixel when requested by [`DecodeIntoSpec::n_masks`].
+pub fn decode_lerc_supported_to_f64(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data_output: &mut [f64],
+    mask_output: Option<&mut [u8]>,
+) -> Result<DecodeToF64Result> {
+    let mut native_data = vec![0u8; spec.data_byte_len()?];
+    let decoded = decode_lerc_supported_into(blob, spec, &mut native_data, mask_output).and_then(
+        |result| {
+            decode_typed_values(spec.data_type, &native_data[..result.data_bytes_written])
+                .map(|decoded| (result, decoded))
+        },
+    )?;
+
+    let values_written = decoded.1.write_f64_values(data_output)?;
+    Ok(DecodeToF64Result {
+        bytes_consumed: decoded.0.bytes_consumed,
+        values_written,
+        mask_bytes_written: decoded.0.mask_bytes_written,
+    })
 }
 
 fn decode_lerc1_supported_into(
@@ -2084,12 +2122,12 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        decode_lerc2_supported_into, decode_lerc_supported_into, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-        validate_lerc2_checksum, DecodeIntoSpec, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
-        FILE_KEY,
+        decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+        get_lerc2_no_data_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
+        read_lerc2_tiled_raw, validate_lerc2_checksum, DecodeIntoSpec, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
@@ -3292,6 +3330,60 @@ mod tests {
         }
         assert_eq!(z_min, -27.458_635);
         assert_eq!(z_max, 5474.173);
+    }
+
+    #[test]
+    fn decodes_supported_lerc_to_f64_for_lerc2_and_lerc1() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 20];
+        let payload = [1u8, 2, 3, 4];
+        let lerc2 = synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &payload);
+        let lerc2_spec = DecodeIntoSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = [0.0f64; 6];
+        let mut mask = [0u8; 6];
+        let result =
+            decode_lerc_supported_to_f64(&lerc2, lerc2_spec, &mut data, Some(&mut mask)).unwrap();
+        assert_eq!(result.bytes_consumed, lerc2.len());
+        assert_eq!(result.values_written, 6);
+        assert_eq!(result.mask_bytes_written, 6);
+        assert_eq!(data, [1.0, 0.0, 2.0, 3.0, 0.0, 4.0]);
+        assert_eq!(mask, valid);
+
+        let lerc1 = fixture("world.lerc1");
+        let lerc1_spec = DecodeIntoSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 257,
+            n_rows: 257,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = vec![0.0f64; lerc1_spec.value_count().unwrap()];
+        let mut mask = vec![0u8; lerc1_spec.mask_byte_len().unwrap()];
+        let result =
+            decode_lerc_supported_to_f64(&lerc1, lerc1_spec, &mut data, Some(&mut mask)).unwrap();
+        assert_eq!(result.bytes_consumed, lerc1.len());
+        assert_eq!(result.values_written, data.len());
+        assert_eq!(result.mask_bytes_written, mask.len());
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+
+        let mut z_min = f64::INFINITY;
+        let mut z_max = f64::NEG_INFINITY;
+        for (&value, &valid) in data.iter().zip(mask.iter()) {
+            if valid != 0 {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            }
+        }
+        assert_eq!(z_min, -27.458_635_330_200_195);
+        assert_eq!(z_max, 5474.172_851_562_5);
     }
 
     #[test]

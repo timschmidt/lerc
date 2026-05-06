@@ -11,9 +11,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! C ABI entry points backed by the safe Rust implementation.
 
 use crate::{
-    decode_lerc_supported_into, decode_typed_values, get_lerc2_blob_info_arrays,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, get_lerc2_blob_info_arrays,
     get_lerc2_data_ranges, get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec,
-    DecodedData, ErrCode, LercError,
+    ErrCode, LercError,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -921,10 +921,6 @@ unsafe fn lerc_decode_to_double_impl(
         n_masks: n_masks as usize,
     };
 
-    let data_len = match spec.data_byte_len() {
-        Ok(len) => len,
-        Err(err) => return err.err_code() as u32,
-    };
     let value_count = match spec.value_count() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
@@ -934,20 +930,13 @@ unsafe fn lerc_decode_to_double_impl(
         Err(err) => return err.err_code() as u32,
     };
 
-    let mut native_data = vec![0u8; data_len];
     let mut mask_output = if n_masks > 0 {
         Some(unsafe { slice::from_raw_parts_mut(p_valid_bytes, mask_len) })
     } else {
         None
     };
-    let decoded =
-        match decode_native_into_typed(blob, spec, &mut native_data, mask_output.as_deref_mut()) {
-            Ok(decoded) => decoded,
-            Err(err) => return err.err_code() as u32,
-        };
-
     let output = unsafe { slice::from_raw_parts_mut(p_data, value_count) };
-    match decoded.write_f64_values(output) {
+    match decode_lerc_supported_to_f64(blob, spec, output, mask_output.as_deref_mut()) {
         Ok(_) => ErrCode::Ok as u32,
         Err(err) => err.err_code() as u32,
     }
@@ -999,10 +988,6 @@ unsafe fn lerc_decode_to_double_4d_impl(
         n_masks: n_masks as usize,
     };
 
-    let data_len = match spec.data_byte_len() {
-        Ok(len) => len,
-        Err(err) => return err.err_code() as u32,
-    };
     let value_count = match spec.value_count() {
         Ok(len) => len,
         Err(err) => return err.err_code() as u32,
@@ -1012,19 +997,13 @@ unsafe fn lerc_decode_to_double_4d_impl(
         Err(err) => return err.err_code() as u32,
     };
 
-    let mut native_data = vec![0u8; data_len];
     let mut mask_output = if n_masks > 0 {
         Some(unsafe { slice::from_raw_parts_mut(p_valid_bytes, mask_len) })
     } else {
         None
     };
-    let decoded =
-        match decode_native_into_typed(blob, spec, &mut native_data, mask_output.as_deref_mut()) {
-            Ok(decoded) => decoded,
-            Err(err) => return err.err_code() as u32,
-        };
     let output = unsafe { slice::from_raw_parts_mut(p_data, value_count) };
-    if let Err(err) = decoded.write_f64_values(output) {
+    if let Err(err) = decode_lerc_supported_to_f64(blob, spec, output, mask_output.as_deref_mut()) {
         return err.err_code() as u32;
     }
 
@@ -1039,16 +1018,6 @@ unsafe fn lerc_decode_to_double_4d_impl(
     } else {
         ErrCode::Ok as u32
     }
-}
-
-fn decode_native_into_typed(
-    blob: &[u8],
-    spec: DecodeIntoSpec,
-    data_output: &mut [u8],
-    mask_output: Option<&mut [u8]>,
-) -> crate::Result<DecodedData> {
-    let result = decode_lerc_supported_into(blob, spec, data_output, mask_output)?;
-    decode_typed_values(spec.data_type, &data_output[..result.data_bytes_written])
 }
 
 fn write_no_data_info(
