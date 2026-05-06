@@ -858,6 +858,9 @@ pub fn encode_lerc2_uncompressed(
 ) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(spec, data, masks, "uncompressed Lerc2 encode")?;
     if spec.n_bands != 1 {
+        if all_bands_constant_for_uncompressed_encode(spec, data)? {
+            return encode_lerc2_constant_bands(spec, data, max_z_error, masks, version);
+        }
         return encode_lerc2_one_sweep_bands(spec, data, max_z_error, masks, version);
     }
 
@@ -2065,9 +2068,114 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
 pub fn encode_lerc2_constant(
     spec: EncodeSpec,
     value: f64,
+    max_z_error: f64,
+    mask: Option<&BitMask>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    encode_lerc2_constant_band(spec, value, max_z_error, mask, version, 0, true)
+}
+
+/// Encodes band-major data as concatenated constant Lerc2 blobs.
+///
+/// Each band must be constant across all pixels and depths. Masks follow the
+/// public C API convention: no masks means all pixels are valid, one mask is
+/// shared by all bands, and `n_bands` masks provide one mask per band. Version
+/// 6 blobs carry `nBlobsMore`; version 4 and 5 concatenation relies on the
+/// following blob header, matching the other band-major encoders.
+pub fn encode_lerc2_constant_bands(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    validate_encode_bands_inputs(spec, data, masks, "constant Lerc2 band encode")?;
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    let mask_len = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam(
+            "Lerc2 encode mask byte count overflow",
+        ))?;
+    let mut blob = Vec::new();
+    let mut previous_mask: Option<BitMask> = None;
+
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let band_data = &data[data_start..data_start + band_data_len];
+        let value = constant_value_for_uncompressed_encode(spec.data_type, band_data)?.ok_or(
+            LercError::WrongParam("constant Lerc2 band encode requires constant data"),
+        )?;
+        let mask = match masks {
+            Some(mask_bytes) if spec.n_masks == 1 => Some(BitMask::from_byte_mask(
+                &mask_bytes[..mask_len],
+                spec.n_cols,
+                spec.n_rows,
+            )?),
+            Some(mask_bytes) => {
+                let mask_start = band
+                    .checked_mul(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 encode mask offset overflow"))?;
+                Some(BitMask::from_byte_mask(
+                    &mask_bytes[mask_start..mask_start + mask_len],
+                    spec.n_cols,
+                    spec.n_rows,
+                )?)
+            }
+            None => None,
+        };
+        let encode_mask = if band == 0 {
+            true
+        } else if spec.n_masks == 1 {
+            false
+        } else {
+            match (mask.as_ref(), &previous_mask) {
+                (Some(mask), Some(previous)) => mask != previous,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        };
+        let n_blobs_more = if version >= 6 {
+            i32::try_from(spec.n_bands - 1 - band)
+                .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
+        } else {
+            0
+        };
+        let band_blob = encode_lerc2_constant_band(
+            EncodeSpec {
+                n_masks: usize::from(mask.is_some()),
+                ..band_spec
+            },
+            value,
+            max_z_error,
+            mask.as_ref(),
+            version,
+            n_blobs_more,
+            encode_mask,
+        )?;
+        blob.extend_from_slice(&band_blob);
+        previous_mask = mask;
+    }
+
+    Ok(blob)
+}
+
+fn encode_lerc2_constant_band(
+    spec: EncodeSpec,
+    value: f64,
     mut max_z_error: f64,
     mask: Option<&BitMask>,
     version: i32,
+    n_blobs_more: i32,
+    encode_mask: bool,
 ) -> Result<Vec<u8>> {
     spec.validate()?;
     if spec.n_bands != 1 {
@@ -2120,7 +2228,7 @@ pub fn encode_lerc2_constant(
         num_valid_pixel: num_valid_pixel as i32,
         micro_block_size: 8,
         blob_size: 1,
-        n_blobs_more: 0,
+        n_blobs_more,
         b_pass_no_data_values: 0,
         b_is_int: u8::from(value.fract() == 0.0),
         b_reserved_3: 0,
@@ -2134,7 +2242,7 @@ pub fn encode_lerc2_constant(
         header_size: compute_lerc2_header_byte_len(version)?,
     };
 
-    let mask_len = compute_lerc2_mask_byte_len(&header, mask, mask.is_some())?;
+    let mask_len = compute_lerc2_mask_byte_len(&header, mask, encode_mask)?;
     header.blob_size = header
         .header_size
         .checked_add(mask_len)
@@ -2143,7 +2251,7 @@ pub fn encode_lerc2_constant(
 
     let mut blob = vec![0; header.blob_size as usize];
     let header_len = write_lerc2_header(&header, &mut blob)?;
-    write_lerc2_mask(&header, mask, mask.is_some(), &mut blob[header_len..])?;
+    write_lerc2_mask(&header, mask, encode_mask, &mut blob[header_len..])?;
     finalize_lerc2_checksum(&mut blob)?;
     Ok(blob)
 }
@@ -3694,6 +3802,29 @@ fn constant_value_for_uncompressed_encode(data_type: DataType, data: &[u8]) -> R
         }
     }
     Ok(Some(value))
+}
+
+fn all_bands_constant_for_uncompressed_encode(spec: EncodeSpec, data: &[u8]) -> Result<bool> {
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let data_end = data_start
+            .checked_add(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        if constant_value_for_uncompressed_encode(spec.data_type, &data[data_start..data_end])?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 struct PreparedNoDataBand {
@@ -5922,9 +6053,9 @@ mod tests {
         decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
         encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
         encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
-        encode_lerc2_constant, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
-        encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+        encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_one_sweep,
+        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
+        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
         encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data,
         extract_fpl_compressed_buffer, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
@@ -7826,6 +7957,36 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
         );
+    }
+
+    #[test]
+    fn encodes_uncompressed_lerc2_multi_band_constants_via_constant_bands_path() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let data = [7u8; 12];
+        let mask = [1u8, 0, 1, 1, 1, 0];
+        let blob = encode_lerc2_uncompressed(spec, &data, 0.0, Some(&mask), 6).unwrap();
+        let expected = encode_lerc2_constant_bands(spec, &data, 0.0, Some(&mask), 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(blob, expected);
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 1);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert_eq!(decoded.bands[0].header.z_min, 7.0);
+        assert_eq!(decoded.bands[1].header.z_min, 7.0);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![7, 0, 7, 7, 7, 0])
+        );
+        assert_eq!(decoded.bands[1].data, decoded.bands[0].data);
+        assert_eq!(decoded.bytes_consumed, blob.len());
     }
 
     #[test]
