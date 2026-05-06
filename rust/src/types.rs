@@ -38,6 +38,7 @@ pub enum DataType {
 pub enum LercError {
     WrongParam(&'static str),
     BufferTooSmall,
+    HasNoData,
     CorruptInput(&'static str),
     Unsupported(&'static str),
 }
@@ -47,6 +48,7 @@ impl LercError {
         match self {
             Self::WrongParam(_) => ErrCode::WrongParam,
             Self::BufferTooSmall => ErrCode::BufferTooSmall,
+            Self::HasNoData => ErrCode::HasNoData,
             Self::CorruptInput(_) | Self::Unsupported(_) => ErrCode::Failed,
         }
     }
@@ -57,6 +59,7 @@ impl fmt::Display for LercError {
         match self {
             Self::WrongParam(msg) => write!(f, "wrong parameter: {msg}"),
             Self::BufferTooSmall => f.write_str("buffer too small"),
+            Self::HasNoData => f.write_str("has no-data values"),
             Self::CorruptInput(msg) => write!(f, "corrupt input: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }

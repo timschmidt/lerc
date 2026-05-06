@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 
 use lerc::{
     compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-    decode_typed_values, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
-    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
-    validate_lerc2_checksum, BitMask, BitStuffer2, DataType, Rle,
+    decode_typed_values, get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info,
+    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, BitMask, BitStuffer2,
+    DataType, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -85,6 +86,9 @@ fn main() {
     });
     bench("lerc2-info-aggregate-3-band", 50_000, || {
         black_box(get_lerc_info(black_box(&lerc2_blob)).unwrap());
+    });
+    bench("lerc2-data-ranges-3-band", 50_000, || {
+        black_box(get_lerc2_data_ranges(black_box(&lerc2_blob)).unwrap());
     });
     bench("lerc2-mask-read-first-band", 10_000, || {
         black_box(read_lerc2_mask(black_box(&lerc2_blob)).unwrap());

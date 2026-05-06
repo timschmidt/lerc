@@ -123,6 +123,15 @@ pub struct DecodedLerc2Bands {
     pub bytes_consumed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataRanges {
+    pub mins: Vec<f64>,
+    pub maxs: Vec<f64>,
+    pub n_bands: usize,
+    pub n_depth: usize,
+    pub bytes_consumed: usize,
+}
+
 pub fn get_lerc2_header_info(blob: &[u8]) -> Result<HeaderProbe> {
     let mut reader = Reader::new(blob);
     let header = read_header(&mut reader)?;
@@ -239,6 +248,55 @@ pub fn read_lerc2_min_max_ranges_with_previous(
     };
 
     Ok((header, mask, ranges))
+}
+
+pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
+    let mut offset = 0usize;
+    let mut previous_mask: Option<BitMask> = None;
+    let mut first_header: Option<HeaderInfo> = None;
+    let mut mins = Vec::new();
+    let mut maxs = Vec::new();
+    let mut n_bands = 0usize;
+
+    loop {
+        let (header, mask, ranges) = read_lerc2_data_ranges_blob(
+            &blob[offset..],
+            first_header.as_ref(),
+            previous_mask.as_ref(),
+        )?;
+        let blob_size = header.blob_size as usize;
+        if blob_size == 0 || blob_size > blob.len().saturating_sub(offset) {
+            return Err(LercError::BufferTooSmall);
+        }
+
+        if first_header.is_none() {
+            first_header = Some(header.clone());
+        }
+
+        mins.extend_from_slice(&ranges.mins);
+        maxs.extend_from_slice(&ranges.maxs);
+        n_bands += 1;
+
+        let has_more = header.version <= 5 || header.n_blobs_more > 0;
+        offset += blob_size;
+        previous_mask = Some(mask.mask);
+
+        if !has_more || offset >= blob.len() {
+            break;
+        }
+    }
+
+    let n_depth = first_header
+        .as_ref()
+        .map(|header| header.n_depth as usize)
+        .unwrap_or(0);
+    Ok(DataRanges {
+        mins,
+        maxs,
+        n_bands,
+        n_depth,
+        bytes_consumed: offset,
+    })
 }
 
 pub fn read_lerc2_data_one_sweep(blob: &[u8]) -> Result<(HeaderInfo, MaskInfo, DataOneSweep)> {
@@ -634,6 +692,71 @@ fn read_min_max_ranges(reader: &mut Reader<'_>, header: &HeaderInfo) -> Result<M
         bytes_consumed: reader.pos,
         min_max_equal,
     })
+}
+
+fn read_lerc2_data_ranges_blob(
+    blob: &[u8],
+    first_header: Option<&HeaderInfo>,
+    previous_mask: Option<&BitMask>,
+) -> Result<(HeaderInfo, MaskInfo, MinMaxRanges)> {
+    let mut reader = Reader::new(blob);
+    let header = read_header(&mut reader)?;
+    if let Some(first) = first_header {
+        if header.n_depth != first.n_depth
+            || header.n_cols != first.n_cols
+            || header.n_rows != first.n_rows
+            || header.data_type != first.data_type
+        {
+            return Err(LercError::CorruptInput(
+                "concatenated Lerc2 header mismatch",
+            ));
+        }
+    }
+
+    if header.n_depth == 1 {
+        let mask = read_mask(&mut reader, &header, previous_mask)?;
+        return Ok((
+            header.clone(),
+            mask,
+            MinMaxRanges {
+                mins: vec![header.z_min],
+                maxs: vec![header.z_max],
+                bytes_consumed: reader.pos,
+                min_max_equal: header.z_min.to_bits() == header.z_max.to_bits(),
+            },
+        ));
+    }
+
+    if header.has_no_data_values() {
+        return Err(LercError::HasNoData);
+    }
+
+    if header.version < 4 {
+        return Err(LercError::Unsupported(
+            "multi-depth Lerc2 data ranges require version 4+ blobs",
+        ));
+    }
+
+    let mask = read_mask(&mut reader, &header, previous_mask)?;
+    let ranges = if header.num_valid_pixel == 0 {
+        MinMaxRanges {
+            mins: vec![0.0; header.n_depth as usize],
+            maxs: vec![0.0; header.n_depth as usize],
+            bytes_consumed: reader.pos,
+            min_max_equal: true,
+        }
+    } else if header.z_min == header.z_max {
+        MinMaxRanges {
+            mins: vec![header.z_min; header.n_depth as usize],
+            maxs: vec![header.z_max; header.n_depth as usize],
+            bytes_consumed: reader.pos,
+            min_max_equal: true,
+        }
+    } else {
+        read_min_max_ranges(&mut reader, &header)?
+    };
+
+    Ok((header, mask, ranges))
 }
 
 fn read_data_one_sweep(
@@ -1436,11 +1559,11 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges, read_lerc2_tiled_payload,
-        read_lerc2_tiled_raw, validate_lerc2_checksum, FILE_KEY,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc_info, read_lerc2_data_one_sweep,
+        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, FILE_KEY,
     };
-    use crate::{BitStuffer2, DataType, DecodedData, Rle};
+    use crate::{BitStuffer2, DataType, DecodedData, LercError, Rle};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1938,6 +2061,48 @@ mod tests {
     }
 
     #[test]
+    fn reports_data_ranges_for_single_and_multi_depth_lerc2() {
+        let single = synthetic_v4_ushort_tiled_raw_blob();
+        let ranges = get_lerc2_data_ranges(&single).unwrap();
+        assert_eq!(ranges.n_bands, 1);
+        assert_eq!(ranges.n_depth, 1);
+        assert_eq!(ranges.bytes_consumed, single.len());
+        assert_eq!(ranges.mins, [100.0]);
+        assert_eq!(ranges.maxs, [400.0]);
+
+        let mut multi_ranges = Vec::new();
+        for value in [-1.25f32, 2.5, 9.75, 10.5] {
+            multi_ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        let multi = synthetic_v4_blob(DataType::Float, 2, &multi_ranges);
+        let ranges = get_lerc2_data_ranges(&multi).unwrap();
+        assert_eq!(ranges.n_bands, 1);
+        assert_eq!(ranges.n_depth, 2);
+        assert_eq!(ranges.mins, [-1.25, 2.5]);
+        assert_eq!(ranges.maxs, [9.75, 10.5]);
+    }
+
+    #[test]
+    fn reports_data_ranges_for_concatenated_lerc2_bands() {
+        let first = synthetic_v4_ushort_tiled_raw_blob();
+        let mut second = synthetic_v4_ushort_tiled_raw_blob();
+        let z_min_offset = FILE_KEY.len() + 4 + 4 + 7 * 4 + 8;
+        second[z_min_offset..z_min_offset + 8].copy_from_slice(&500.0f64.to_le_bytes());
+        second[z_min_offset + 8..z_min_offset + 16].copy_from_slice(&800.0f64.to_le_bytes());
+        set_lerc2_checksum(&mut second);
+
+        let mut concatenated = first;
+        concatenated.extend_from_slice(&second);
+        let ranges = get_lerc2_data_ranges(&concatenated).unwrap();
+
+        assert_eq!(ranges.n_bands, 2);
+        assert_eq!(ranges.n_depth, 1);
+        assert_eq!(ranges.bytes_consumed, concatenated.len());
+        assert_eq!(ranges.mins, [100.0, 500.0]);
+        assert_eq!(ranges.maxs, [400.0, 800.0]);
+    }
+
+    #[test]
     fn rejects_truncated_v4_min_max_ranges() {
         let range_bytes = [1u8, 2, 3, 10, 20];
         let blob = synthetic_v4_blob(DataType::UChar, 3, &range_bytes);
@@ -2197,6 +2362,14 @@ mod tests {
             decoded.data,
             DecodedData::UChar(vec![1, 255, 2, 3, 255, 4, 5, 6, 7, 255, 8, 9])
         );
+    }
+
+    #[test]
+    fn data_ranges_report_has_no_data_for_v6_multi_depth_no_data() {
+        let blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let err = get_lerc2_data_ranges(&blob).unwrap_err();
+        assert_eq!(err, LercError::HasNoData);
+        assert_eq!(err.err_code(), crate::ErrCode::HasNoData);
     }
 
     #[test]
