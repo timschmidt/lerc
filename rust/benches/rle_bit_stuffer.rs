@@ -1,7 +1,10 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lerc::{get_lerc2_header_info, get_lerc_info, read_lerc2_mask, BitMask, BitStuffer2, Rle};
+use lerc::{
+    get_lerc2_header_info, get_lerc_info, read_lerc2_mask, validate_lerc2_checksum, BitMask,
+    BitStuffer2, Rle,
+};
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
     let start = Instant::now();
@@ -68,6 +71,9 @@ fn main() {
     });
     bench("lerc2-mask-read-first-band", 10_000, || {
         black_box(read_lerc2_mask(black_box(&lerc2_blob)).unwrap());
+    });
+    bench("lerc2-checksum-first-band", 10_000, || {
+        black_box(validate_lerc2_checksum(black_box(&lerc2_blob)).unwrap());
     });
 
     std::thread::sleep(Duration::from_millis(1));

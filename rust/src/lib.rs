@@ -29,8 +29,8 @@ pub mod types;
 pub use bit_mask::BitMask;
 pub use bit_stuffer::BitStuffer2;
 pub use lerc2::{
-    get_lerc2_header_info, get_lerc_info, read_lerc2_mask, read_lerc2_mask_with_previous,
-    HeaderInfo, LercInfo, MaskInfo,
+    compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_mask,
+    read_lerc2_mask_with_previous, validate_lerc2_checksum, HeaderInfo, LercInfo, MaskInfo,
 };
 pub use rle::Rle;
 pub use types::{DataType, ErrCode, LercError, Result};

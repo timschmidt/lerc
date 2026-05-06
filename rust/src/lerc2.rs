@@ -13,6 +13,7 @@ use crate::{BitMask, Rle};
 
 pub const CURRENT_VERSION: i32 = 6;
 pub const FILE_KEY: &[u8; 6] = b"Lerc2 ";
+const CHECKSUM_START_OFFSET: usize = FILE_KEY.len() + 4 + 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeaderInfo {
@@ -96,6 +97,61 @@ pub fn read_lerc2_mask_with_previous(
     let header = read_header(&mut reader)?;
     let mask = read_mask(&mut reader, &header, previous_mask)?;
     Ok((header, mask))
+}
+
+pub fn compute_checksum_fletcher32(bytes: &[u8]) -> u32 {
+    let mut sum1 = 0xffffu32;
+    let mut sum2 = 0xffffu32;
+    let mut pos = 0usize;
+    let mut words = bytes.len() / 2;
+
+    while words > 0 {
+        let tlen = words.min(359);
+        words -= tlen;
+
+        for _ in 0..tlen {
+            sum1 += (bytes[pos] as u32) << 8;
+            pos += 1;
+            sum1 += bytes[pos] as u32;
+            pos += 1;
+            sum2 += sum1;
+        }
+
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+    }
+
+    if bytes.len() & 1 != 0 {
+        sum1 += (bytes[pos] as u32) << 8;
+        sum2 += sum1;
+    }
+
+    sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+    sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+    (sum2 << 16) | sum1
+}
+
+pub fn validate_lerc2_checksum(blob: &[u8]) -> Result<HeaderInfo> {
+    let probe = get_lerc2_header_info(blob)?;
+    let header = probe.header;
+
+    if header.blob_size as usize > blob.len() {
+        return Err(LercError::BufferTooSmall);
+    }
+    if header.version < 3 {
+        return Ok(header);
+    }
+    if header.blob_size as usize <= CHECKSUM_START_OFFSET {
+        return Err(LercError::CorruptInput("Lerc2 blob too small for checksum"));
+    }
+
+    let checksum =
+        compute_checksum_fletcher32(&blob[CHECKSUM_START_OFFSET..header.blob_size as usize]);
+    if checksum != header.checksum {
+        return Err(LercError::CorruptInput("Lerc2 checksum mismatch"));
+    }
+
+    Ok(header)
 }
 
 pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
@@ -419,7 +475,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_lerc2_header_info, get_lerc_info, read_lerc2_mask, read_lerc2_mask_with_previous,
+        compute_checksum_fletcher32, get_lerc2_header_info, get_lerc_info, read_lerc2_mask,
+        read_lerc2_mask_with_previous, validate_lerc2_checksum,
     };
     use crate::DataType;
     use std::fs;
@@ -521,11 +578,45 @@ mod tests {
     }
 
     #[test]
+    fn validates_v3_fixture_checksums() {
+        let california = fixture("california_400_400_1_float.lerc2");
+        let header = validate_lerc2_checksum(&california).unwrap();
+        assert_eq!(
+            header.checksum,
+            compute_checksum_fletcher32(&california[14..])
+        );
+
+        let bluemarble = fixture("bluemarble_256_256_3_byte.lerc2");
+        let mut offset = 0usize;
+        let mut checksums = Vec::new();
+        while offset < bluemarble.len() {
+            let header = validate_lerc2_checksum(&bluemarble[offset..]).unwrap();
+            checksums.push(header.checksum);
+            offset += header.blob_size as usize;
+        }
+
+        assert_eq!(offset, bluemarble.len());
+        assert_eq!(checksums.len(), 3);
+        assert_eq!(checksums, [0x86ce_e665, 0x2419_e3dc, 0x5e2d_64e2]);
+    }
+
+    #[test]
+    fn rejects_checksum_mismatch() {
+        let mut blob = fixture("california_400_400_1_float.lerc2");
+        assert!(validate_lerc2_checksum(&blob).is_ok());
+
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        assert!(validate_lerc2_checksum(&blob).is_err());
+    }
+
+    #[test]
     fn detects_truncated_header_and_blob() {
         let blob = fixture("california_400_400_1_float.lerc2");
         assert!(get_lerc2_header_info(&blob[..12]).is_err());
         assert!(get_lerc_info(&blob[..blob.len() - 1]).is_err());
         assert!(read_lerc2_mask(&blob[..80]).is_err());
+        assert!(validate_lerc2_checksum(&blob[..blob.len() - 1]).is_err());
     }
 
     #[test]
