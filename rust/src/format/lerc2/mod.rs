@@ -769,6 +769,7 @@ fn encode_lerc2_tiled_simple_payload(
     data: &[u8],
     include_image_mode: bool,
     allow_lut: bool,
+    allow_depth_diff: bool,
 ) -> Result<Vec<u8>> {
     validate_lerc2_tiled_raw_for_write(header, mask, Some(data))?;
     if header.max_z_error <= 0.0 {
@@ -797,30 +798,26 @@ fn encode_lerc2_tiled_simple_payload(
             let j0 = j_tile * mb_size;
             let j1 = (j0 + mb_size).min(n_cols);
             let tile_flag_base = raw_tile_flag(header.version, j0);
+            let mut previous_values: Vec<f64> = Vec::new();
             for depth in 0..n_depth {
                 let values = collect_valid_tile_values(header, mask, data, i0, i1, j0, j1, depth)?;
-                if values.is_empty() {
-                    payload.push(tile_flag_base | 2);
-                    continue;
-                }
-
-                let z_min = values.iter().copied().fold(f64::INFINITY, f64::min);
-                let z_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let max_elem = ((z_max - z_min) / (2.0 * header.max_z_error) + 0.5) as u32;
-                if max_elem == 0 {
-                    payload.push(tile_flag_base | 3);
-                    payload.extend_from_slice(&encode_value_as_bytes(header.data_type, z_min));
-                    continue;
-                }
-
-                let quantized = quantize_lerc2_tile_values(header, &values, z_min)?;
-                payload.push(tile_flag_base | 1);
-                payload.extend_from_slice(&encode_value_as_bytes(header.data_type, z_min));
-                payload.extend_from_slice(&encode_quantized_tile_values(
-                    &quantized,
-                    header.version,
+                let absolute = encode_lerc2_quantized_tile(
+                    header,
+                    &values,
+                    tile_flag_base,
+                    header.data_type,
                     allow_lut,
-                )?);
+                    false,
+                )?;
+                let tile = if allow_depth_diff && depth > 0 && !values.is_empty() {
+                    encode_lerc2_diff_tile(header, &values, &previous_values, tile_flag_base)?
+                        .filter(|diff| diff.len() < absolute.len())
+                        .unwrap_or(absolute)
+                } else {
+                    absolute
+                };
+                payload.extend_from_slice(&tile);
+                previous_values = values;
             }
         }
     }
@@ -829,6 +826,78 @@ fn encode_lerc2_tiled_simple_payload(
         return Err(LercError::WrongParam("invalid Lerc2 data type byte width"));
     }
     Ok(payload)
+}
+
+fn encode_lerc2_quantized_tile(
+    header: &HeaderInfo,
+    values: &[f64],
+    tile_flag_base: u8,
+    offset_data_type: DataType,
+    allow_lut: bool,
+    diff_encoded: bool,
+) -> Result<Vec<u8>> {
+    let diff_bit = if diff_encoded { 4 } else { 0 };
+    if values.is_empty() {
+        return Ok(vec![tile_flag_base | diff_bit | 2]);
+    }
+
+    let z_min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let z_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let max_elem = ((z_max - z_min) / (2.0 * header.max_z_error) + 0.5) as u32;
+    if max_elem == 0 {
+        let mut out = vec![tile_flag_base | diff_bit | 3];
+        out.extend_from_slice(&encode_value_as_bytes(offset_data_type, z_min));
+        return Ok(out);
+    }
+
+    let quantized = quantize_lerc2_tile_values(header, values, z_min)?;
+    let mut out = vec![tile_flag_base | diff_bit | 1];
+    out.extend_from_slice(&encode_value_as_bytes(offset_data_type, z_min));
+    out.extend_from_slice(&encode_quantized_tile_values(
+        &quantized,
+        header.version,
+        allow_lut,
+    )?);
+    Ok(out)
+}
+
+fn encode_lerc2_diff_tile(
+    header: &HeaderInfo,
+    values: &[f64],
+    previous_values: &[f64],
+    tile_flag_base: u8,
+) -> Result<Option<Vec<u8>>> {
+    if values.len() != previous_values.len() || header.version < 5 {
+        return Ok(None);
+    }
+    let mut diff_values = Vec::with_capacity(values.len());
+    let mut previous_value = 0i32;
+    let mut same_value_count = 0usize;
+    for (&value, &previous) in values.iter().zip(previous_values.iter()) {
+        let diff = value - previous;
+        if diff < i32::MIN as f64 || diff > i32::MAX as f64 {
+            return Ok(None);
+        }
+        let diff = diff as i32;
+        if diff as f64 != value - previous {
+            return Ok(None);
+        }
+        if diff == previous_value {
+            same_value_count += 1;
+        }
+        previous_value = diff;
+        diff_values.push(diff as f64);
+    }
+    let try_lut = values.len() > 4 && 2 * same_value_count > values.len();
+    encode_lerc2_quantized_tile(
+        header,
+        &diff_values,
+        tile_flag_base,
+        DataType::Int,
+        try_lut,
+        true,
+    )
+    .map(Some)
 }
 
 fn encode_quantized_tile_values(
@@ -1888,7 +1957,19 @@ fn encode_lerc2_tiled_simple_band(
 
     let include_image_mode = try_huffman_int(&header) || try_huffman_float(&header);
     let payload = if has_valid && header.z_min != header.z_max && !ranges.min_max_equal {
-        encode_lerc2_tiled_simple_payload(&header, &mask, data, include_image_mode, allow_lut)?
+        let allow_depth_diff = allow_lut
+            && header.version >= 5
+            && header.n_depth > 1
+            && is_integer_data_type(header.data_type)
+            && header.max_z_error == 0.5;
+        encode_lerc2_tiled_simple_payload(
+            &header,
+            &mask,
+            data,
+            include_image_mode,
+            allow_lut,
+            allow_depth_diff,
+        )?
     } else {
         Vec::new()
     };
@@ -9091,6 +9172,47 @@ mod tests {
         assert_eq!(blob[payload_offset], 0);
         assert_eq!(blob[payload_offset + 1] & 3, 1);
         assert_ne!(blob[bit_stuffer_header_offset] & (1 << 5), 0);
+    }
+
+    #[test]
+    fn encodes_depth_diff_lut_tiled_lerc2_blob_for_supported_decode_round_trip() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 2,
+            n_cols: 8,
+            n_rows: 8,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let mut values = Vec::with_capacity(spec.n_cols * spec.n_rows * spec.n_depth);
+        for idx in 0..spec.n_cols * spec.n_rows {
+            let first = if idx % 5 == 0 { 100u16 } else { 10u16 };
+            values.push(first);
+            values.push(first + 5);
+        }
+        let data = values
+            .iter()
+            .copied()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let blob = encode_lerc2_tiled_lut(spec, &data, 0.5, None, 5, 8).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        let header = get_lerc2_header_info(&blob).unwrap().header;
+        let payload_offset = header.header_size
+            + compute_lerc2_mask_byte_len(&header, None, false).unwrap()
+            + compute_lerc2_min_max_ranges_byte_len(&header).unwrap();
+        let mut pos = payload_offset + 1;
+        assert_eq!(blob[pos] & 3, 1);
+        pos += 1 + DataType::UShort.size_in_bytes();
+        let (_, consumed) =
+            BitStuffer2::decode(&blob[pos..], spec.n_cols * spec.n_rows, 5).unwrap();
+        pos += consumed;
+
+        assert_eq!(decoded.header.version, 5);
+        assert_eq!(decoded.data, DecodedData::UShort(values));
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_ne!(blob[pos] & 4, 0);
+        assert_eq!(blob[pos] & 3, 3);
     }
 
     #[test]

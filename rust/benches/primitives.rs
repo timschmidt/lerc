@@ -168,6 +168,22 @@ fn main() {
         let shifted = value + 7;
         shifted.to_le_bytes()
     }));
+    let lut_diff_encode_spec = EncodeSpec {
+        n_depth: 2,
+        ..lut_encode_spec
+    };
+    let mut lut_diff_encode_values =
+        Vec::with_capacity(lut_diff_encode_spec.n_cols * lut_diff_encode_spec.n_rows * 2);
+    for idx in 0..lut_diff_encode_spec.n_cols * lut_diff_encode_spec.n_rows {
+        let first = if idx % 5 == 0 { 100u16 } else { 10u16 };
+        lut_diff_encode_values.push(first);
+        lut_diff_encode_values.push(first + 5);
+    }
+    let lut_diff_encode_data = lut_diff_encode_values
+        .iter()
+        .copied()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
     let mut encode_one_sweep_bytes =
         vec![0; compute_lerc2_one_sweep_byte_len(&encode_header).unwrap()];
     let mut encode_tiled_raw_bytes =
@@ -736,6 +752,19 @@ fn main() {
                 0.5,
                 None,
                 6,
+                8,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-tiled-lut-diff-encode-v5", 100_000, || {
+        black_box(
+            encode_lerc2_tiled_lut(
+                lut_diff_encode_spec,
+                black_box(&lut_diff_encode_data),
+                0.5,
+                None,
+                5,
                 8,
             )
             .unwrap(),
