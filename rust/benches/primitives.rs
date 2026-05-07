@@ -841,6 +841,11 @@ fn main() {
             .unwrap(),
         );
     });
+    bench("lerc2-auto-lut-tiled-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_auto(lut_encode_spec, black_box(&lut_encode_data), 0.5, None, 6).unwrap(),
+        );
+    });
     bench("lerc2-auto-byte-huffman-bands-encode-v6", 10_000, || {
         black_box(
             encode_lerc2_auto(
@@ -862,6 +867,20 @@ fn main() {
                 None,
                 Some(black_box(&[1])),
                 Some(black_box(&[255.0])),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-auto-lut-tiled-no-data-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_auto_with_no_data(
+                lut_diff_encode_spec,
+                black_box(&lut_no_data_encode_data),
+                0.5,
+                None,
+                Some(black_box(&lut_no_data_uses)),
+                Some(black_box(&lut_no_data_values)),
                 6,
             )
             .unwrap(),

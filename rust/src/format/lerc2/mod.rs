@@ -1131,10 +1131,11 @@ pub fn encode_lerc2_uncompressed_with_no_data(
 /// Encodes Lerc2 data with optional no-data metadata using the ported size selector.
 ///
 /// This is the no-data-aware variant of [`encode_lerc2_auto`]. It keeps
-/// [`encode_lerc2_uncompressed_with_no_data`] as the baseline and, for version
-/// 6+ `UChar`/`Char` data with `max_z_error == 0.5`, also tries byte Huffman
-/// after applying the same no-data mask filtering and internal-sentinel remap
-/// as the uncompressed no-data helpers. The smaller valid blob is returned.
+/// [`encode_lerc2_uncompressed_with_no_data`] as the baseline, tries the
+/// LUT-capable tiled encoder, and for version 6+ `UChar`/`Char` data with
+/// `max_z_error == 0.5`, also tries byte Huffman after applying the same
+/// no-data mask filtering and internal-sentinel remap as the uncompressed
+/// no-data helpers. The smallest valid blob is returned.
 pub fn encode_lerc2_auto_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1151,7 +1152,7 @@ pub fn encode_lerc2_auto_with_no_data(
         return encode_lerc2_auto(spec, data, max_z_error, masks, version);
     }
 
-    let baseline = encode_lerc2_uncompressed_with_no_data(
+    let mut best = encode_lerc2_uncompressed_with_no_data(
         spec,
         data,
         max_z_error,
@@ -1160,11 +1161,28 @@ pub fn encode_lerc2_auto_with_no_data(
         no_data_values,
         version,
     )?;
+    if version >= 2 {
+        match encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            data,
+            max_z_error,
+            masks,
+            uses_no_data,
+            no_data_values,
+            version,
+            8,
+        ) {
+            Ok(tiled) if tiled.len() < best.len() => best = tiled,
+            Ok(_) => {}
+            Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
     if !matches!(spec.data_type, DataType::UChar | DataType::Char)
         || version < 6
         || !auto_byte_huffman_max_z_error_is_lossless_byte(spec, data, max_z_error, masks)?
     {
-        return Ok(baseline);
+        return Ok(best);
     }
 
     match encode_lerc2_byte_huffman_bands_with_no_data(
@@ -1175,26 +1193,25 @@ pub fn encode_lerc2_auto_with_no_data(
         no_data_values,
         version,
     ) {
-        Ok(huffman) if huffman.len() < baseline.len() => Ok(huffman),
-        Ok(_) => Ok(baseline),
+        Ok(huffman) if huffman.len() < best.len() => Ok(huffman),
+        Ok(_) => Ok(best),
         Err(LercError::WrongParam("constant byte input should use Lerc2 constant encode")) => {
-            Ok(baseline)
+            Ok(best)
         }
         Err(LercError::WrongParam("constant byte ranges should use Lerc2 constant encode")) => {
-            Ok(baseline)
+            Ok(best)
         }
-        Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => {
-            Ok(baseline)
-        }
+        Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => Ok(best),
         Err(err) => Err(err),
     }
 }
 
 /// Encodes Lerc2 data using the currently ported size-based safe selector.
 ///
-/// The selector keeps [`encode_lerc2_uncompressed`] as the baseline and, for
-/// `UChar`/`Char` data with `max_z_error == 0.5`, also tries byte Huffman.
-/// The smaller valid blob is returned.
+/// The selector keeps [`encode_lerc2_uncompressed`] as the baseline, tries the
+/// LUT-capable tiled encoder, and for `UChar`/`Char` data with
+/// `max_z_error == 0.5`, also tries byte Huffman. The smallest valid blob is
+/// returned.
 pub fn encode_lerc2_auto(
     spec: EncodeSpec,
     data: &[u8],
@@ -1202,26 +1219,34 @@ pub fn encode_lerc2_auto(
     masks: Option<&[u8]>,
     version: i32,
 ) -> Result<Vec<u8>> {
-    let baseline = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
+    let mut best = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
+    if version >= 2 {
+        match encode_lerc2_tiled_lut_bands(spec, data, max_z_error, masks, version, 8) {
+            Ok(tiled) if tiled.len() < best.len() => best = tiled,
+            Ok(_) => {}
+            Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
     if !matches!(spec.data_type, DataType::UChar | DataType::Char)
         || version < 2
         || !auto_byte_huffman_max_z_error_is_lossless_byte(spec, data, max_z_error, masks)?
     {
-        return Ok(baseline);
+        return Ok(best);
     }
 
     if spec.n_bands != 1 {
         return match encode_lerc2_byte_huffman_bands(spec, data, masks, version) {
-            Ok(huffman) if huffman.len() < baseline.len() => Ok(huffman),
-            Ok(_) => Ok(baseline),
+            Ok(huffman) if huffman.len() < best.len() => Ok(huffman),
+            Ok(_) => Ok(best),
             Err(LercError::WrongParam("constant byte input should use Lerc2 constant encode")) => {
-                Ok(baseline)
+                Ok(best)
             }
             Err(LercError::WrongParam("constant byte ranges should use Lerc2 constant encode")) => {
-                Ok(baseline)
+                Ok(best)
             }
             Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => {
-                Ok(baseline)
+                Ok(best)
             }
             Err(err) => Err(err),
         };
@@ -1236,17 +1261,15 @@ pub fn encode_lerc2_auto(
         None => None,
     };
     match encode_lerc2_byte_huffman(spec, data, mask.as_ref(), version) {
-        Ok(huffman) if huffman.len() < baseline.len() => Ok(huffman),
-        Ok(_) => Ok(baseline),
+        Ok(huffman) if huffman.len() < best.len() => Ok(huffman),
+        Ok(_) => Ok(best),
         Err(LercError::WrongParam("constant byte input should use Lerc2 constant encode")) => {
-            Ok(baseline)
+            Ok(best)
         }
         Err(LercError::WrongParam("constant byte ranges should use Lerc2 constant encode")) => {
-            Ok(baseline)
+            Ok(best)
         }
-        Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => {
-            Ok(baseline)
-        }
+        Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => Ok(best),
         Err(err) => Err(err),
     }
 }
@@ -8818,6 +8841,110 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(expected[band_len..].to_vec())
         );
+    }
+
+    #[test]
+    fn auto_lerc2_selector_uses_lut_tiled_candidate_when_smaller() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 32,
+            n_rows: 16,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let mut data = Vec::with_capacity(spec.n_cols * spec.n_rows * 2);
+        let mut expected = Vec::with_capacity(spec.n_cols * spec.n_rows);
+        for row in 0..spec.n_rows {
+            for col in 0..spec.n_cols {
+                let value = (100 + row * 3 + col / 4) as u16;
+                data.extend_from_slice(&value.to_le_bytes());
+                expected.push(value);
+            }
+        }
+
+        let baseline = encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
+        let tiled = encode_lerc2_tiled_lut_bands(spec, &data, 0.5, None, 6, 8).unwrap();
+        let auto = encode_lerc2_auto(spec, &data, 0.5, None, 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&auto).unwrap();
+
+        assert!(tiled.len() < baseline.len());
+        assert_eq!(auto, tiled);
+        assert_eq!(decoded.bands.len(), 1);
+        assert_eq!(decoded.bands[0].data, DecodedData::UShort(expected));
+    }
+
+    #[test]
+    fn auto_lerc2_no_data_selector_uses_lut_tiled_candidate_when_smaller() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 2,
+            n_cols: 16,
+            n_rows: 16,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth * 2);
+        let mut expected = Vec::with_capacity(n_pixels * spec.n_depth);
+        for pixel in 0..n_pixels {
+            if pixel % 29 == 0 {
+                data.extend_from_slice(&u16::MAX.to_le_bytes());
+                data.extend_from_slice(&u16::MAX.to_le_bytes());
+                expected.extend_from_slice(&[0, 0]);
+            } else if pixel % 31 == 0 {
+                data.extend_from_slice(&u16::MAX.to_le_bytes());
+                data.extend_from_slice(&25u16.to_le_bytes());
+                expected.extend_from_slice(&[u16::MAX, 25]);
+            } else {
+                let first = if pixel % 5 == 0 { 200u16 } else { 20u16 };
+                let second = first + 3;
+                data.extend_from_slice(&first.to_le_bytes());
+                data.extend_from_slice(&second.to_le_bytes());
+                expected.extend_from_slice(&[first, second]);
+            }
+        }
+
+        let baseline = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[u16::MAX as f64]),
+            6,
+        )
+        .unwrap();
+        let tiled = encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[u16::MAX as f64]),
+            6,
+            8,
+        )
+        .unwrap();
+        let auto = encode_lerc2_auto_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[u16::MAX as f64]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_bands_supported(&auto).unwrap();
+        let no_data = get_lerc2_no_data_info(&auto, 1).unwrap();
+
+        assert!(tiled.len() < baseline.len());
+        assert_eq!(auto, tiled);
+        assert_eq!(no_data.uses_no_data, [1]);
+        assert_eq!(no_data.no_data_values, [u16::MAX as f64]);
+        assert_eq!(decoded.bands.len(), 1);
+        assert_eq!(decoded.bands[0].data, DecodedData::UShort(expected));
     }
 
     #[test]

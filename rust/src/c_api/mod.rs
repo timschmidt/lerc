@@ -23,8 +23,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// C ABI equivalent of `lerc_computeCompressedSize`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
-/// through the 4D entry points.
+/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
+/// available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -67,8 +67,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
 /// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
-/// through the 4D entry points.
+/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
+/// available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -110,8 +110,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
 /// C ABI equivalent of `lerc_encode`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
-/// through the 4D entry points.
+/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
+/// available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -158,8 +158,8 @@ pub unsafe extern "C" fn lerc_encode(
 /// C ABI equivalent of `lerc_encodeForVersion`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, and eligible byte-Huffman paths. No-data metadata is available
-/// through the 4D entry points.
+/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
+/// available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -204,8 +204,9 @@ pub unsafe extern "C" fn lerc_encodeForVersion(
 
 /// C ABI equivalent of `lerc_computeCompressedSize_4D`.
 ///
-/// Calls with or without active no-data bands are encoded by the Rust
-/// one-sweep Lerc2 paths.
+/// Calls with or without active no-data bands are encoded by the Rust Lerc2
+/// auto selector, including no-data-aware tiled LUT and eligible byte-Huffman
+/// paths.
 ///
 /// # Safety
 ///
@@ -249,8 +250,9 @@ pub unsafe extern "C" fn lerc_computeCompressedSize_4D(
 
 /// C ABI equivalent of `lerc_encode_4D`.
 ///
-/// Calls with or without active no-data bands are encoded by the Rust
-/// one-sweep Lerc2 paths.
+/// Calls with or without active no-data bands are encoded by the Rust Lerc2
+/// auto selector, including no-data-aware tiled LUT and eligible byte-Huffman
+/// paths.
 ///
 /// # Safety
 ///
