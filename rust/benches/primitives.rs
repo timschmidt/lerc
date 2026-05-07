@@ -83,7 +83,7 @@ fn main() {
         n_cols: 3,
         n_rows: 2,
         n_bands: 2,
-        n_masks: 1,
+        n_masks: 2,
     };
     let encode_spec = EncodeSpec {
         data_type: DataType::UChar,
@@ -220,13 +220,13 @@ fn main() {
     )
     .unwrap();
     let mut decode_into_data = vec![0; one_sweep_bands_decoded.data_byte_len()];
-    let mut decode_into_mask = vec![0; 6];
+    let mut decode_into_mask = vec![0; 12];
     let mut decode_to_f64_data = vec![0.0f64; decode_into_spec.value_count().unwrap()];
-    let mut decode_to_f64_mask = vec![0; 6];
+    let mut decode_to_f64_mask = vec![0; 12];
     let mut ffi_decode_data = vec![0; one_sweep_bands_decoded.data_byte_len()];
-    let mut ffi_decode_mask = vec![0; 6];
+    let mut ffi_decode_mask = vec![0; 12];
     let mut ffi_decode_double_data = vec![0.0f64; 24];
-    let mut ffi_decode_double_mask = vec![0; 6];
+    let mut ffi_decode_double_mask = vec![0; 12];
     let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
     let mut ffi_decode_4d_data = vec![0u8; 12];
     let mut ffi_decode_4d_mask = vec![0; 6];
@@ -1213,7 +1213,7 @@ fn main() {
             lerc::ffi::lerc_decode(
                 black_box(one_sweep_bands_blob.as_ptr()),
                 one_sweep_bands_blob.len() as u32,
-                1,
+                2,
                 black_box(ffi_decode_mask.as_mut_ptr()),
                 2,
                 3,
@@ -1229,7 +1229,7 @@ fn main() {
             lerc::ffi::lerc_decodeToDouble(
                 black_box(one_sweep_bands_blob.as_ptr()),
                 one_sweep_bands_blob.len() as u32,
-                1,
+                2,
                 black_box(ffi_decode_double_mask.as_mut_ptr()),
                 2,
                 3,
