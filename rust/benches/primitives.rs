@@ -9,15 +9,16 @@ use lerc::{
     decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_auto,
     encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_constant,
     encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data,
-    encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands, encode_lerc2_tiled_raw,
-    encode_lerc2_tiled_raw_bands, encode_lerc2_tiled_raw_bands_with_no_data,
-    encode_lerc2_tiled_raw_with_no_data, encode_lerc2_tiled_simple,
-    encode_lerc2_tiled_simple_bands, encode_lerc2_tiled_simple_bands_with_no_data,
-    encode_lerc2_tiled_simple_with_no_data, encode_lerc2_uncompressed,
-    encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum, get_lerc1_header_info,
-    get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-    get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask, read_lerc1_z_stats,
-    read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
+    encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+    encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
+    encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+    encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
+    encode_lerc2_tiled_simple, encode_lerc2_tiled_simple_bands,
+    encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
+    encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
+    get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
+    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
+    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
     read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
     write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
     BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
@@ -184,6 +185,25 @@ fn main() {
         .copied()
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
+    let mut lut_no_data_encode_values =
+        Vec::with_capacity(lut_diff_encode_spec.n_cols * lut_diff_encode_spec.n_rows * 2);
+    for idx in 0..lut_diff_encode_spec.n_cols * lut_diff_encode_spec.n_rows {
+        let first = if idx % 5 == 0 { 100u16 } else { 10u16 };
+        if idx == 0 {
+            lut_no_data_encode_values.extend([u16::MAX, u16::MAX]);
+        } else if idx == 1 {
+            lut_no_data_encode_values.extend([u16::MAX, 15]);
+        } else {
+            lut_no_data_encode_values.extend([first, first + 5]);
+        }
+    }
+    let lut_no_data_encode_data = lut_no_data_encode_values
+        .iter()
+        .copied()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let lut_no_data_uses = [1u8; 1];
+    let lut_no_data_values = [u16::MAX as f64; 1];
     let mut encode_one_sweep_bytes =
         vec![0; compute_lerc2_one_sweep_byte_len(&encode_header).unwrap()];
     let mut encode_tiled_raw_bytes =
@@ -784,6 +804,20 @@ fn main() {
             .unwrap(),
         );
     });
+    bench("lerc2-tiled-lut-no-data-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_tiled_lut_with_no_data(
+                lut_diff_encode_spec,
+                black_box(&lut_no_data_encode_data),
+                0.5,
+                None,
+                u16::MAX as f64,
+                6,
+                8,
+            )
+            .unwrap(),
+        );
+    });
     bench("lerc2-byte-huffman-encode-v6", 100_000, || {
         black_box(
             encode_lerc2_byte_huffman(
@@ -906,6 +940,21 @@ fn main() {
             );
         },
     );
+    bench("lerc2-tiled-lut-bands-no-data-encode-v6", 100_000, || {
+        black_box(
+            encode_lerc2_tiled_lut_bands_with_no_data(
+                lut_diff_encode_spec,
+                black_box(&lut_no_data_encode_data),
+                0.5,
+                None,
+                Some(black_box(&lut_no_data_uses)),
+                Some(black_box(&lut_no_data_values)),
+                6,
+                8,
+            )
+            .unwrap(),
+        );
+    });
     bench("lerc2-one-sweep-bands-encode-v6", 100_000, || {
         black_box(
             encode_lerc2_one_sweep_bands(
