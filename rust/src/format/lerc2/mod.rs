@@ -10,6 +10,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 //! Lerc2 metadata readers and supported-subset decoders.
 
+use crate::format::lerc1::decode_lerc1_bands_for_metadata;
 use crate::types::{DataType, EncodeSpec, LercError, Result};
 use crate::{decode_lerc1_bands, decode_typed_values, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
@@ -3511,7 +3512,7 @@ pub fn get_lerc2_data_ranges(blob: &[u8]) -> Result<DataRanges> {
 }
 
 fn get_lerc1_data_ranges(blob: &[u8]) -> Result<DataRanges> {
-    let decoded = decode_lerc1_bands(blob)?;
+    let decoded = decode_lerc1_bands_for_metadata(blob)?;
     Ok(DataRanges {
         mins: decoded
             .stats
@@ -4109,7 +4110,7 @@ pub fn get_lerc_info(blob: &[u8]) -> Result<LercInfo> {
 }
 
 fn get_lerc1_info(blob: &[u8]) -> Result<LercInfo> {
-    let decoded = decode_lerc1_bands(blob)?;
+    let decoded = decode_lerc1_bands_for_metadata(blob)?;
     let z_min = decoded
         .stats
         .iter()

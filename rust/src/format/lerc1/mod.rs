@@ -354,6 +354,24 @@ pub fn decode_lerc1(blob: &[u8]) -> Result<DecodedLerc1> {
 /// and left as `0.0` in each returned band.
 pub fn decode_lerc1_bands(blob: &[u8]) -> Result<DecodedLerc1Bands> {
     let first = decode_lerc1(blob)?;
+    decode_lerc1_continuation_bands(blob, first, false)
+}
+
+/// Decodes Lerc1 metadata while tolerating failed continuation bands.
+///
+/// The C++ `GetLercInfo` path returns metadata for the bands decoded so far
+/// when a later legacy z-only continuation cannot be read. Full data decode
+/// remains strict through [`decode_lerc1_bands`].
+pub(crate) fn decode_lerc1_bands_for_metadata(blob: &[u8]) -> Result<DecodedLerc1Bands> {
+    let first = decode_lerc1(blob)?;
+    decode_lerc1_continuation_bands(blob, first, true)
+}
+
+fn decode_lerc1_continuation_bands(
+    blob: &[u8],
+    first: DecodedLerc1,
+    tolerate_failed_continuation: bool,
+) -> Result<DecodedLerc1Bands> {
     let pixel_count = (first.header.n_cols as usize)
         .checked_mul(first.header.n_rows as usize)
         .ok_or(LercError::CorruptInput("Lerc1 pixel count overflow"))?;
@@ -365,16 +383,26 @@ pub fn decode_lerc1_bands(blob: &[u8]) -> Result<DecodedLerc1Bands> {
 
     while offset < blob.len() {
         let (header, band_values, band_stats, consumed) =
-            decode_lerc1_z_only_band(&blob[offset..], &first.mask_info.mask)?;
+            match decode_lerc1_z_only_band(&blob[offset..], &first.mask_info.mask) {
+                Ok(decoded) => decoded,
+                Err(_err) if tolerate_failed_continuation => break,
+                Err(err) => return Err(err),
+            };
         if header.n_cols != first.header.n_cols
             || header.n_rows != first.header.n_rows
             || header.max_z_error != first.header.max_z_error
         {
+            if tolerate_failed_continuation {
+                break;
+            }
             return Err(LercError::CorruptInput(
                 "concatenated Lerc1 header mismatch",
             ));
         }
         if band_values.len() != pixel_count {
+            if tolerate_failed_continuation {
+                break;
+            }
             return Err(LercError::CorruptInput("Lerc1 band size mismatch"));
         }
         values.extend_from_slice(&band_values);
@@ -985,6 +1013,26 @@ mod tests {
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn lerc1_metadata_tolerates_failed_continuation_after_valid_bands() {
+        let mut blob = synthetic_lerc1_two_band_blob();
+        let valid_len = blob.len();
+        blob.extend_from_slice(&[0u8; 48]);
+
+        let info = get_lerc_info(&blob).unwrap();
+        let ranges = get_lerc2_data_ranges(&blob).unwrap();
+
+        assert_eq!(info.n_bands, 2);
+        assert_eq!(info.blob_size as usize, valid_len);
+        assert_eq!(info.z_min, 1.0);
+        assert_eq!(info.z_max, 40.0);
+        assert_eq!(ranges.n_bands, 2);
+        assert_eq!(ranges.bytes_consumed, valid_len);
+        assert_eq!(ranges.mins, [1.0, 10.0]);
+        assert_eq!(ranges.maxs, [4.0, 40.0]);
+        assert!(decode_lerc1_bands(&blob).is_err());
     }
 
     #[test]
