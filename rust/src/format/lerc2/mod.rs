@@ -3834,8 +3834,8 @@ pub fn decode_lerc2_supported_into(
 /// Decodes supported LERC data directly into caller-provided byte buffers.
 ///
 /// This is the format-agnostic safe helper used by the C ABI decode wrappers.
-/// It dispatches legacy Lerc1 `CntZImage` blobs to the Lerc1 float decoder and
-/// all other blobs to [`decode_lerc2_supported_into`].
+/// It dispatches legacy Lerc1 `CntZImage` blobs to the Lerc1 decoder and all
+/// other blobs to [`decode_lerc2_supported_into`].
 pub fn decode_lerc_supported_into(
     blob: &[u8],
     spec: DecodeIntoSpec,
@@ -3885,8 +3885,7 @@ fn decode_lerc1_supported_into(
 ) -> Result<DecodeIntoResult> {
     let decoded = decode_lerc1_bands_prefix(blob, spec.n_bands)?;
     let metadata = decode_lerc1_bands_for_metadata(blob)?;
-    if spec.data_type != DataType::Float
-        || spec.n_depth != 1
+    if spec.n_depth != 1
         || spec.n_bands > metadata.n_bands
         || spec.n_cols != decoded.header.n_cols as usize
         || spec.n_rows != decoded.header.n_rows as usize
@@ -3906,8 +3905,9 @@ fn decode_lerc1_supported_into(
             "Lerc1 decoded value count is smaller than requested output",
         ));
     }
-    let data_bytes_written = DecodedData::Float(decoded.values[..requested_value_count].to_vec())
-        .write_le_bytes(data_output)?;
+    let data_bytes_written =
+        decode_lerc1_values_as_type(spec.data_type, &decoded.values[..requested_value_count])
+            .write_le_bytes(data_output)?;
     let mask_bytes_written = if let Some(mask_output) = mask_output {
         let byte_mask = decoded.mask_info.mask.to_byte_mask();
         let required_len = byte_mask
@@ -3931,6 +3931,53 @@ fn decode_lerc1_supported_into(
         data_bytes_written,
         mask_bytes_written,
     })
+}
+
+fn decode_lerc1_values_as_type(data_type: DataType, values: &[f32]) -> DecodedData {
+    match data_type {
+        DataType::Char => DecodedData::Char(
+            values
+                .iter()
+                .map(|&value| lerc1_round_integer(value) as i8)
+                .collect(),
+        ),
+        DataType::UChar => DecodedData::UChar(
+            values
+                .iter()
+                .map(|&value| lerc1_round_integer(value) as u8)
+                .collect(),
+        ),
+        DataType::Short => DecodedData::Short(
+            values
+                .iter()
+                .map(|&value| lerc1_round_integer(value) as i16)
+                .collect(),
+        ),
+        DataType::UShort => DecodedData::UShort(
+            values
+                .iter()
+                .map(|&value| lerc1_round_integer(value) as u16)
+                .collect(),
+        ),
+        DataType::Int => DecodedData::Int(
+            values
+                .iter()
+                .map(|&value| lerc1_round_integer(value) as i32)
+                .collect(),
+        ),
+        DataType::UInt => DecodedData::UInt(
+            values
+                .iter()
+                .map(|&value| lerc1_round_integer(value) as u32)
+                .collect(),
+        ),
+        DataType::Float => DecodedData::Float(values.to_vec()),
+        DataType::Double => DecodedData::Double(values.iter().map(|&value| value as f64).collect()),
+    }
+}
+
+fn lerc1_round_integer(value: f32) -> f64 {
+    ((value as f64) + 0.5).floor()
 }
 
 /// Decodes one Lerc2 blob, allowing omitted masks to reuse `previous_mask`.
@@ -11348,6 +11395,42 @@ mod tests {
         }
         assert_eq!(z_min, -27.458_635);
         assert_eq!(z_max, 5474.173);
+    }
+
+    #[test]
+    fn decodes_lerc1_into_integer_output_with_cpp_rounding() {
+        let blob = fixture("world.lerc1");
+        let spec = DecodeIntoSpec {
+            data_type: DataType::Int,
+            n_depth: 1,
+            n_cols: 257,
+            n_rows: 257,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = vec![0u8; 257 * 257 * 4];
+        let mut mask = vec![0u8; 257 * 257];
+
+        let result = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(result.bytes_consumed, blob.len());
+        assert_eq!(result.data_bytes_written, data.len());
+        assert_eq!(result.mask_bytes_written, mask.len());
+
+        let values = match crate::decode_typed_values(DataType::Int, &data).unwrap() {
+            DecodedData::Int(values) => values,
+            _ => unreachable!("requested int output"),
+        };
+        let mut z_min = i32::MAX;
+        let mut z_max = i32::MIN;
+        for (&value, &valid) in values.iter().zip(mask.iter()) {
+            if valid != 0 {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            }
+        }
+        assert_eq!(z_min, -27);
+        assert_eq!(z_max, 5474);
     }
 
     #[test]

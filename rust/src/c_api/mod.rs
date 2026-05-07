@@ -3027,6 +3027,42 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_decode_legacy_lerc1_writes_integer_data_with_cpp_rounding() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![123i32; 257 * 257];
+        let mut mask = vec![123u8; 257 * 257];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                257,
+                257,
+                1,
+                DataType::Int as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 65_025);
+
+        let mut z_min = i32::MAX;
+        let mut z_max = i32::MIN;
+        for (&value, &valid) in data.iter().zip(mask.iter()) {
+            if valid != 0 {
+                z_min = z_min.min(value);
+                z_max = z_max.max(value);
+            }
+        }
+        assert_eq!(z_min, -27);
+        assert_eq!(z_max, 5474);
+    }
+
+    #[test]
     fn c_abi_decode_to_double_float_fixture_writes_data_and_mask() {
         let blob = fixture("california_400_400_1_float.lerc2");
         let mut data = vec![0.0f64; 160_000];
