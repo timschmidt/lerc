@@ -736,17 +736,26 @@ unsafe fn try_encode_supported_blob(
         None
     };
     let uses_no_data = unsafe { encode_uses_no_data_slice(spec.n_bands, p_uses_no_data) };
-    let no_data_values = if uses_no_data
+    let has_active_no_data = uses_no_data
         .as_ref()
-        .is_some_and(|uses| uses.iter().any(|&v| v != 0))
-    {
-        no_data_values.map(|ptr| unsafe { slice::from_raw_parts(ptr, spec.n_bands) })
+        .is_some_and(|uses| uses.iter().any(|&v| v != 0));
+    let no_data_values = if has_active_no_data {
+        match no_data_values {
+            Some(ptr) if !ptr.is_null() => {
+                Some(unsafe { slice::from_raw_parts(ptr, spec.n_bands) })
+            }
+            _ => {
+                return Err(LercError::WrongParam(
+                    "active no-data encode requires values",
+                ))
+            }
+        }
     } else {
         None
     };
 
     if let Some(uses_no_data) = uses_no_data.as_ref() {
-        if uses_no_data.iter().any(|&uses| uses != 0) {
+        if has_active_no_data {
             if version < 6 {
                 return Ok(None);
             }
@@ -890,9 +899,10 @@ fn validate_no_data_inputs(
     p_uses_no_data: Option<*const u8>,
     no_data_values: Option<*const f64>,
 ) -> bool {
-    match (p_uses_no_data, no_data_values) {
-        (Some(ptr), Some(values)) => ptr.is_null() || !values.is_null(),
-        _ => true,
+    if let Some(values) = no_data_values {
+        !values.is_null() || p_uses_no_data.is_some()
+    } else {
+        true
     }
 }
 
@@ -2637,6 +2647,7 @@ mod tests {
         let no_data_values = [0.0f64; 2];
         let mut out = [0u8; 256];
         let mut written = 0u32;
+        let mut computed_size = 0u32;
 
         let status = unsafe {
             lerc_encode_4D(
@@ -2668,6 +2679,47 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
         );
+
+        let status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                2,
+                1,
+                valid.as_ptr(),
+                0.5,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert!(computed_size > 0);
+
+        written = 0;
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                1,
+                3,
+                2,
+                2,
+                1,
+                valid.as_ptr(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(written, computed_size);
     }
 
     #[test]
