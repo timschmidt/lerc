@@ -3766,7 +3766,7 @@ pub fn decode_lerc2_supported_into(
         }
     }
 
-    let required_masks = required_mask_count(selected_bands);
+    let required_masks = required_mask_count(&decoded.bands);
     if spec.n_masks < required_masks {
         return Err(LercError::WrongParam(
             "caller did not provide enough mask buffers for the Lerc2 blob",
@@ -3863,15 +3863,27 @@ fn decode_lerc1_supported_into(
     let decoded = decode_lerc1_bands(blob)?;
     if spec.data_type != DataType::Float
         || spec.n_depth != 1
-        || spec.n_bands != decoded.n_bands
+        || spec.n_bands > decoded.n_bands
         || spec.n_cols != decoded.header.n_cols as usize
         || spec.n_rows != decoded.header.n_rows as usize
-        || !(spec.n_masks == 0 || spec.n_masks == 1 || spec.n_masks == decoded.n_bands)
     {
         return Err(LercError::WrongParam("Lerc1 decode shape/type mismatch"));
     }
 
-    let data_bytes_written = DecodedData::Float(decoded.values).write_le_bytes(data_output)?;
+    let band_value_count = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam("Lerc1 output value count overflow"))?;
+    let requested_value_count = band_value_count
+        .checked_mul(spec.n_bands)
+        .ok_or(LercError::WrongParam("Lerc1 output value count overflow"))?;
+    if decoded.values.len() < requested_value_count {
+        return Err(LercError::CorruptInput(
+            "Lerc1 decoded value count is smaller than requested output",
+        ));
+    }
+    let data_bytes_written = DecodedData::Float(decoded.values[..requested_value_count].to_vec())
+        .write_le_bytes(data_output)?;
     let mask_bytes_written = if let Some(mask_output) = mask_output {
         let byte_mask = decoded.mask_info.mask.to_byte_mask();
         let required_len = byte_mask
@@ -10182,6 +10194,46 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(vec![10, 20, 0, 0, 50, 60])
         );
+    }
+
+    #[test]
+    fn prefix_decode_rejects_lerc2_blob_with_more_masks_than_requested() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 2,
+        };
+        let data = [1u8, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60];
+        let masks = [1u8, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1];
+        let blob = encode_lerc2_one_sweep_bands(spec, &data, 0.5, Some(&masks), 6).unwrap();
+        let decode_spec = DecodeIntoSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut decoded_data = [0u8; 6];
+        let mut decoded_mask = [0u8; 6];
+
+        let err = decode_lerc2_supported_into(
+            &blob,
+            decode_spec,
+            &mut decoded_data,
+            Some(&mut decoded_mask),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            LercError::WrongParam("caller did not provide enough mask buffers for the Lerc2 blob")
+        );
+        assert_eq!(decoded_data, [0; 6]);
+        assert_eq!(decoded_mask, [0; 6]);
     }
 
     #[test]

@@ -962,6 +962,32 @@ mod tests {
     }
 
     #[test]
+    fn decodes_prefix_of_concatenated_lerc1_bands_through_supported_dispatch() {
+        let blob = synthetic_lerc1_two_band_blob();
+        let spec = DecodeIntoSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = vec![0u8; spec.data_byte_len().unwrap()];
+        let mut mask = vec![0u8; spec.mask_byte_len().unwrap()];
+        let decoded = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.data_bytes_written, 4 * std::mem::size_of::<f32>());
+        assert_eq!(decoded.mask_bytes_written, 4);
+        assert_eq!(mask, [1, 1, 1, 1]);
+        let expected = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(data, expected);
+    }
+
+    #[test]
     fn rejects_non_lerc1_and_truncated_headers() {
         let blob = fixture("california_400_400_1_float.lerc2");
         assert!(get_lerc1_header_info(&blob).is_err());
