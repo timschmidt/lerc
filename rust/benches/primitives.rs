@@ -564,7 +564,7 @@ fn main() {
     bench("lerc2-supported-decode-byte-huffman-fixture", 100, || {
         black_box(decode_lerc2_bands_supported(black_box(&lerc2_blob)).unwrap());
     });
-    bench("lerc2-supported-decode-float-huffman-raw-v6", 1_000, || {
+    bench("lerc2-supported-decode-float-huffman-v6", 1_000, || {
         black_box(decode_lerc2_supported(black_box(&float_huffman_blob)).unwrap());
     });
     bench("lerc2-supported-write-data-bytes", 100_000, || {
@@ -854,7 +854,7 @@ fn main() {
             .unwrap(),
         );
     });
-    bench("lerc2-float-huffman-raw-encode-v6", 10_000, || {
+    bench("lerc2-float-huffman-encode-v6", 10_000, || {
         black_box(
             encode_lerc2_float_huffman(
                 float_huffman_encode_spec,

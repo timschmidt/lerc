@@ -1258,9 +1258,10 @@ pub fn encode_lerc2_auto_with_no_data(
 /// Encodes Lerc2 data using the currently ported size-based safe selector.
 ///
 /// The selector keeps [`encode_lerc2_uncompressed`] as the baseline, tries the
-/// LUT-capable tiled encoder, and for `UChar`/`Char` data with
-/// `max_z_error == 0.5`, also tries byte Huffman. The smallest valid blob is
-/// returned.
+/// LUT-capable tiled encoder, for version 6 `Float`/`Double` data with
+/// `max_z_error == 0`, tries floating-point Huffman, and for `UChar`/`Char`
+/// data with `max_z_error == 0.5`, also tries byte Huffman. The smallest valid
+/// blob is returned.
 pub fn encode_lerc2_auto(
     spec: EncodeSpec,
     data: &[u8],
@@ -1272,6 +1273,17 @@ pub fn encode_lerc2_auto(
     if version >= 2 {
         match encode_lerc2_tiled_lut_bands(spec, data, max_z_error, masks, version, 8) {
             Ok(tiled) if tiled.len() < best.len() => best = tiled,
+            Ok(_) => {}
+            Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if matches!(spec.data_type, DataType::Float | DataType::Double)
+        && version == 6
+        && max_z_error == 0.0
+    {
+        match encode_lerc2_float_huffman_bands(spec, data, masks, version) {
+            Ok(huffman) if huffman.len() < best.len() => best = huffman,
             Ok(_) => {}
             Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
             Err(err) => return Err(err),
@@ -1426,11 +1438,12 @@ pub fn encode_lerc2_byte_huffman_bands_with_no_data(
 ///
 /// This ports the version 6 floating-point Huffman image-mode envelope used by
 /// the C++ decoder for `Float` and `Double` data with `max_z_error == 0`. The
-/// current Rust writer stores predictor-none byte planes in the wrapped
-/// no-encoding mode, so it is intended as a compatibility encoder and fixture
-/// generator rather than the final compressed predictor-selection path. Masks
-/// follow the public C API convention: no masks means all pixels are valid, one
-/// mask is shared by all bands, and `n_bands` masks provide one mask per band.
+/// current Rust writer uses predictor-none byte planes, applies per-plane
+/// byte-delta selection, and chooses the smallest wrapped RLE, raw, or normal
+/// Huffman payload. It is still missing the C++ row/cross predictor selection
+/// path. Masks follow the public C API convention: no masks means all pixels
+/// are valid, one mask is shared by all bands, and `n_bands` masks provide one
+/// mask per band.
 pub fn encode_lerc2_float_huffman_bands(
     spec: EncodeSpec,
     data: &[u8],
@@ -1532,7 +1545,8 @@ pub fn encode_lerc2_float_huffman_bands(
 ///
 /// Multi-band input supports no mask or one shared mask; per-band masks are
 /// available through [`encode_lerc2_float_huffman_bands`]. The current writer
-/// emits predictor-none raw wrapped byte planes inside image mode 3.
+/// emits predictor-none byte planes with wrapped RLE, raw, or normal Huffman
+/// plane payloads inside image mode 3.
 pub fn encode_lerc2_float_huffman(
     spec: EncodeSpec,
     data: &[u8],
@@ -6700,17 +6714,86 @@ fn write_fp_huffman_slice(
         for sample_idx in 0..sample_count {
             plane.push(transformed[sample_idx * value_size + byte_index]);
         }
+        let (byte_delta, compressed) =
+            best_fpl_compressed_plane(&plane, predictor.max_byte_delta())?;
         out.push(byte_index as u8);
-        out.push(0);
-        let compressed_size = u32::try_from(plane.len().checked_add(1).ok_or(
-            LercError::WrongParam("floating-point Huffman plane size overflow"),
-        )?)
-        .map_err(|_| LercError::WrongParam("floating-point Huffman plane is too large"))?;
+        out.push(byte_delta);
+        let compressed_size = u32::try_from(compressed.len())
+            .map_err(|_| LercError::WrongParam("floating-point Huffman plane is too large"))?;
         out.extend_from_slice(&compressed_size.to_le_bytes());
-        out.push(FPL_HUFFMAN_NO_ENCODING);
-        out.extend_from_slice(&plane);
+        out.extend_from_slice(&compressed);
     }
     Ok(())
+}
+
+fn best_fpl_compressed_plane(plane: &[u8], max_delta: u8) -> Result<(u8, Vec<u8>)> {
+    let mut best_level = 0;
+    let mut best = encode_fpl_compressed_buffer(plane)?;
+    for level in 1..=max_delta {
+        let delta_plane = apply_fp_byte_delta_sequence(plane, level)?;
+        let compressed = encode_fpl_compressed_buffer(&delta_plane)?;
+        if compressed.len() < best.len() {
+            best = compressed;
+            best_level = level;
+        }
+    }
+    Ok((best_level, best))
+}
+
+fn apply_fp_byte_delta_sequence(data: &[u8], level: u8) -> Result<Vec<u8>> {
+    if level > FP_MAX_DELTA {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman byte delta level is invalid",
+        ));
+    }
+
+    let mut delta = data.to_vec();
+    for order in 1..=level as usize {
+        for idx in (order..delta.len()).rev() {
+            delta[idx] = delta[idx].wrapping_sub(delta[idx - 1]);
+        }
+    }
+    Ok(delta)
+}
+
+fn encode_fpl_compressed_buffer(data: &[u8]) -> Result<Vec<u8>> {
+    let (&first, _) = data.split_first().ok_or(LercError::WrongParam(
+        "floating-point Huffman plane must not be empty",
+    ))?;
+
+    let mut best = Vec::with_capacity(data.len() + 1);
+    best.push(FPL_HUFFMAN_NO_ENCODING);
+    best.extend_from_slice(data);
+
+    if data.iter().all(|&value| value == first) {
+        let count = u32::try_from(data.len())
+            .map_err(|_| LercError::WrongParam("floating-point Huffman RLE plane is too large"))?;
+        let mut rle = Vec::with_capacity(6);
+        rle.push(FPL_HUFFMAN_RLE);
+        rle.push(first);
+        rle.extend_from_slice(&count.to_le_bytes());
+        return Ok(rle);
+    }
+
+    let mut histo = [0usize; 256];
+    for &value in data {
+        histo[value as usize] += 1;
+    }
+    if let Some(table) = compute_huffman_encode_table(&histo)? {
+        let mut normal = Vec::new();
+        normal.push(FPL_HUFFMAN_NORMAL);
+        write_huffman_code_table(&table, 5, &mut normal)?;
+        let mut bits = HuffmanBitWriter::new();
+        for &value in data {
+            write_huffman_symbol(&mut bits, &table, value as usize)?;
+        }
+        normal.extend_from_slice(&bits.finish(true));
+        if normal.len() < best.len() {
+            best = normal;
+        }
+    }
+
+    Ok(best)
 }
 
 fn transform_fp_huffman_input_bytes(data: &[u8], data_type: DataType) -> Result<Vec<u8>> {
@@ -7801,13 +7884,14 @@ impl<'a> Writer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_checksum_fletcher32, compute_huffman_encode_table,
-        compute_lerc2_data_ranges_for_encode, compute_lerc2_header_byte_len,
-        compute_lerc2_mask_byte_len, compute_lerc2_min_max_ranges_byte_len,
-        compute_lerc2_one_sweep_byte_len, compute_lerc2_tiled_raw_byte_len,
-        decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-        decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
-        encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
+        apply_fp_byte_delta_sequence, best_fpl_compressed_plane, compute_checksum_fletcher32,
+        compute_huffman_encode_table, compute_lerc2_data_ranges_for_encode,
+        compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
+        compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
+        compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
+        decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
+        encode_fpl_compressed_buffer, encode_lerc2_auto, encode_lerc2_auto_with_no_data,
+        encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
         encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
         encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_float_huffman,
         encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
@@ -8845,6 +8929,40 @@ mod tests {
             restore_fp_byte_delta_sequence(&[1, 2, 3], 6).unwrap_err(),
             LercError::CorruptInput("floating-point Huffman byte delta level is invalid")
         );
+    }
+
+    #[test]
+    fn encodes_floating_point_huffman_wrapped_rle_and_normal_payloads() {
+        let rle = encode_fpl_compressed_buffer(&[0xab; 12]).unwrap();
+        assert_eq!(rle[0], 1);
+        assert_eq!(extract_fpl_compressed_buffer(&rle, 12).unwrap(), [0xab; 12]);
+
+        let mut repeated = Vec::new();
+        for idx in 0..192 {
+            repeated.push([3u8, 7, 11, 19][idx % 4]);
+        }
+        let encoded = encode_fpl_compressed_buffer(&repeated).unwrap();
+        assert_eq!(encoded[0], 0);
+        assert!(encoded.len() < repeated.len() + 1);
+        assert_eq!(
+            extract_fpl_compressed_buffer(&encoded, repeated.len()).unwrap(),
+            repeated
+        );
+    }
+
+    #[test]
+    fn selects_floating_point_huffman_byte_delta_level_per_plane() {
+        let plane = (0..160).map(|idx| idx as u8).collect::<Vec<_>>();
+        let delta = apply_fp_byte_delta_sequence(&plane, 1).unwrap();
+        assert_eq!(restore_fp_byte_delta_sequence(&delta, 1).unwrap(), plane);
+
+        let (level, encoded) = best_fpl_compressed_plane(&plane, 5).unwrap();
+        let restored_delta = extract_fpl_compressed_buffer(&encoded, plane.len()).unwrap();
+        assert_eq!(
+            restore_fp_byte_delta_sequence(&restored_delta, level).unwrap(),
+            plane
+        );
+        assert!(level > 0);
     }
 
     fn encode_fpl_normal_huffman_payload(data: &[u8]) -> Vec<u8> {
@@ -9999,6 +10117,35 @@ mod tests {
             decoded.bands[1].data,
             DecodedData::UChar(data[band_len..].to_vec())
         );
+        assert_eq!(decoded.bytes_consumed, auto.len());
+    }
+
+    #[test]
+    fn auto_encode_selects_float_huffman_when_smaller() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 128,
+            n_rows: 64,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let mut data = Vec::with_capacity(spec.n_cols * spec.n_rows * 4);
+        let mut expected = Vec::with_capacity(spec.n_cols * spec.n_rows);
+        for idx in 0..(spec.n_cols * spec.n_rows) {
+            let value = ((idx % 32) as f32) * 0.25;
+            expected.push(value);
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let auto = encode_lerc2_auto(spec, &data, 0.0, None, 6).unwrap();
+        let huffman = encode_lerc2_float_huffman(spec, &data, None, 6).unwrap();
+        let uncompressed = encode_lerc2_uncompressed(spec, &data, 0.0, None, 6).unwrap();
+        let decoded = decode_lerc2_supported(&auto).unwrap();
+
+        assert!(huffman.len() < uncompressed.len());
+        assert_eq!(auto, huffman);
+        assert_eq!(decoded.data, DecodedData::Float(expected));
         assert_eq!(decoded.bytes_consumed, auto.len());
     }
 

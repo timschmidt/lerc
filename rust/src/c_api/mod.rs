@@ -23,8 +23,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// C ABI equivalent of `lerc_computeCompressedSize`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
-/// available through the 4D entry points.
+/// one-sweep, tiled LUT, eligible byte-Huffman, and eligible floating-point
+/// Huffman paths. No-data metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -67,8 +67,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
 /// C ABI equivalent of `lerc_computeCompressedSizeForVersion`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
-/// available through the 4D entry points.
+/// one-sweep, tiled LUT, eligible byte-Huffman, and eligible floating-point
+/// Huffman paths. No-data metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -110,8 +110,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
 /// C ABI equivalent of `lerc_encode`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
-/// available through the 4D entry points.
+/// one-sweep, tiled LUT, eligible byte-Huffman, and eligible floating-point
+/// Huffman paths. No-data metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -158,8 +158,8 @@ pub unsafe extern "C" fn lerc_encode(
 /// C ABI equivalent of `lerc_encodeForVersion`.
 ///
 /// Inputs are encoded by the Rust Lerc2 auto selector, including constant,
-/// one-sweep, tiled LUT, and eligible byte-Huffman paths. No-data metadata is
-/// available through the 4D entry points.
+/// one-sweep, tiled LUT, eligible byte-Huffman, and eligible floating-point
+/// Huffman paths. No-data metadata is available through the 4D entry points.
 ///
 /// # Safety
 ///
@@ -205,8 +205,8 @@ pub unsafe extern "C" fn lerc_encodeForVersion(
 /// C ABI equivalent of `lerc_computeCompressedSize_4D`.
 ///
 /// Calls with or without active no-data bands are encoded by the Rust Lerc2
-/// auto selector, including no-data-aware tiled LUT and eligible byte-Huffman
-/// paths.
+/// auto selector, including no-data-aware tiled LUT, eligible byte-Huffman, and
+/// eligible floating-point Huffman paths.
 ///
 /// # Safety
 ///
@@ -251,8 +251,8 @@ pub unsafe extern "C" fn lerc_computeCompressedSize_4D(
 /// C ABI equivalent of `lerc_encode_4D`.
 ///
 /// Calls with or without active no-data bands are encoded by the Rust Lerc2
-/// auto selector, including no-data-aware tiled LUT and eligible byte-Huffman
-/// paths.
+/// auto selector, including no-data-aware tiled LUT, eligible byte-Huffman, and
+/// eligible floating-point Huffman paths.
 ///
 /// # Safety
 ///
@@ -1953,6 +1953,69 @@ mod tests {
         assert!((written as usize) < uncompressed.len());
         let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
         assert_eq!(decoded.data, DecodedData::UChar(data));
+    }
+
+    #[test]
+    fn c_abi_encode_selects_float_huffman_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 128,
+            n_rows: 64,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let mut values = Vec::with_capacity(spec.n_cols * spec.n_rows);
+        let mut data = Vec::with_capacity(spec.n_cols * spec.n_rows * 4);
+        for idx in 0..(spec.n_cols * spec.n_rows) {
+            let value = ((idx % 32) as f32) * 0.25;
+            values.push(value);
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let uncompressed = crate::encode_lerc2_uncompressed(spec, &data, 0.0, None, 6).unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                128,
+                64,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                128,
+                64,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        assert!((written as usize) < uncompressed.len());
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.data, DecodedData::Float(values));
     }
 
     #[test]
