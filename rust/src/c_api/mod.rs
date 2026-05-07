@@ -1300,8 +1300,10 @@ mod tests {
     };
     use crate::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
-        encode_lerc2_auto, get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info,
-        DataType, DecodedData, ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
+        encode_lerc2_auto, encode_lerc2_tiled_lut_bands, encode_lerc2_tiled_lut_bands_with_no_data,
+        encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc_info, DataType, DecodedData,
+        ErrCode, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1951,6 +1953,75 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_encode_selects_lut_tiled_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 32,
+            n_rows: 16,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data: Vec<u16> = (0..(spec.n_cols * spec.n_rows))
+            .map(|idx| (100 + idx / 8) as u16)
+            .collect();
+        let data_bytes = data
+            .iter()
+            .copied()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let uncompressed = encode_lerc2_uncompressed(spec, &data_bytes, 0.5, None, 6).unwrap();
+        let tiled = encode_lerc2_tiled_lut_bands(spec, &data_bytes, 0.5, None, 6, 8).unwrap();
+        let expected = encode_lerc2_auto(spec, &data_bytes, 0.5, None, 6).unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UShort as u32,
+                1,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UShort as u32,
+                1,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert!(tiled.len() < uncompressed.len());
+        assert_eq!(expected, tiled);
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size as usize, tiled.len());
+        assert_eq!(written as usize, tiled.len());
+        assert_eq!(&out[..written as usize], expected.as_slice());
+        let decoded = decode_lerc2_bands_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.bands[0].data, DecodedData::UShort(data));
+    }
+
+    #[test]
     fn c_abi_4d_encode_selects_byte_huffman_with_no_data_when_smaller() {
         let spec = crate::EncodeSpec {
             data_type: DataType::UChar,
@@ -2032,6 +2103,111 @@ mod tests {
         assert!(decoded.header.has_no_data_values());
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
         assert_eq!(decoded.data, DecodedData::UChar(expected));
+    }
+
+    #[test]
+    fn c_abi_4d_encode_selects_lut_tiled_with_no_data_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 2,
+            n_cols: 16,
+            n_rows: 16,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth);
+        let mut expected = Vec::with_capacity(n_pixels * spec.n_depth);
+        for pixel in 0..n_pixels {
+            if pixel % 29 == 0 {
+                data.extend_from_slice(&[u16::MAX, u16::MAX]);
+                expected.extend_from_slice(&[0, 0]);
+            } else if pixel % 31 == 0 {
+                data.extend_from_slice(&[u16::MAX, 25]);
+                expected.extend_from_slice(&[u16::MAX, 25]);
+            } else {
+                let first = if pixel % 5 == 0 { 200u16 } else { 20u16 };
+                data.extend_from_slice(&[first, first + 3]);
+                expected.extend_from_slice(&[first, first + 3]);
+            }
+        }
+        let data_bytes = data
+            .iter()
+            .copied()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let uses_no_data = [1u8];
+        let no_data_values = [u16::MAX as f64];
+        let uncompressed = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data_bytes,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        let tiled = encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            &data_bytes,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+            8,
+        )
+        .unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UShort as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UShort as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                1,
+                0,
+                ptr::null(),
+                0.5,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert!(tiled.len() < uncompressed.len());
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size as usize, tiled.len());
+        assert_eq!(written as usize, tiled.len());
+        assert_eq!(&out[..written as usize], tiled.as_slice());
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val_orig, u16::MAX as f64);
+        assert_eq!(decoded.data, DecodedData::UShort(expected));
     }
 
     #[test]
