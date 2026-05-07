@@ -564,12 +564,17 @@ unsafe fn lerc_compute_compressed_size_impl(
     if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
         return ErrCode::WrongParam as u32;
     }
+    let version = match normalize_encode_version(codec_version) {
+        Ok(version) => version,
+        Err(err) => return err as u32,
+    };
+
     match try_encode_supported_blob(
         p_data,
         spec,
         p_valid_bytes,
         max_z_err,
-        normalize_encode_version(codec_version),
+        version,
         p_uses_no_data,
         no_data_values,
     ) {
@@ -631,12 +636,17 @@ unsafe fn lerc_encode_impl(
     if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
         return ErrCode::WrongParam as u32;
     }
+    let version = match normalize_encode_version(codec_version) {
+        Ok(version) => version,
+        Err(err) => return err as u32,
+    };
+
     match try_encode_supported_blob(
         p_data,
         spec,
         p_valid_bytes,
         max_z_err,
-        normalize_encode_version(codec_version),
+        version,
         p_uses_no_data,
         no_data_values,
     ) {
@@ -700,11 +710,13 @@ fn validate_encode_shape(
     Ok(spec)
 }
 
-fn normalize_encode_version(codec_version: i32) -> i32 {
+fn normalize_encode_version(codec_version: i32) -> core::result::Result<i32, ErrCode> {
     if codec_version < 0 {
-        6
+        Ok(6)
+    } else if (2..=6).contains(&codec_version) {
+        Ok(codec_version)
     } else {
-        codec_version
+        Err(ErrCode::WrongParam)
     }
 }
 
@@ -1656,6 +1668,54 @@ mod tests {
         assert_eq!(info.n_depth, 1);
         assert_eq!(info.n_cols, 3);
         assert_eq!(info.n_rows, 2);
+    }
+
+    #[test]
+    fn c_abi_versioned_encode_rejects_invalid_codec_versions() {
+        let data = [1u8, 2, 3, 4, 5, 6];
+        let mut out = [0u8; 128];
+
+        for version in [0, 1, 7] {
+            let mut num_bytes = 123u32;
+            let status = unsafe {
+                lerc_computeCompressedSizeForVersion(
+                    data.as_ptr().cast(),
+                    version,
+                    DataType::UChar as u32,
+                    1,
+                    3,
+                    2,
+                    1,
+                    0,
+                    ptr::null(),
+                    0.0,
+                    &mut num_bytes,
+                )
+            };
+            assert_eq!(status, ErrCode::WrongParam as u32);
+            assert_eq!(num_bytes, 0);
+
+            let mut written = 123u32;
+            let status = unsafe {
+                lerc_encodeForVersion(
+                    data.as_ptr().cast(),
+                    version,
+                    DataType::UChar as u32,
+                    1,
+                    3,
+                    2,
+                    1,
+                    0,
+                    ptr::null(),
+                    0.0,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    &mut written,
+                )
+            };
+            assert_eq!(status, ErrCode::WrongParam as u32);
+            assert_eq!(written, 0);
+        }
     }
 
     #[test]
