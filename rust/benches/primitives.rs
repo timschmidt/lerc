@@ -8,8 +8,8 @@ use lerc::{
     decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
     decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_auto,
     encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_constant,
-    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data,
-    encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+    encode_lerc2_float_huffman, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+    encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
     encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
     encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
     encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
@@ -295,6 +295,28 @@ fn main() {
             }
         })
         .collect();
+    let float_huffman_encode_spec = EncodeSpec {
+        data_type: DataType::Float,
+        n_depth: 1,
+        n_cols: 128,
+        n_rows: 128,
+        n_bands: 1,
+        n_masks: 0,
+    };
+    let float_huffman_encode_data = (0..(float_huffman_encode_spec.n_cols
+        * float_huffman_encode_spec.n_rows))
+        .flat_map(|idx| {
+            let value = ((idx % 257) as f32 * 0.125) + ((idx / 257) as f32 * 0.01);
+            value.to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let float_huffman_blob = encode_lerc2_float_huffman(
+        float_huffman_encode_spec,
+        &float_huffman_encode_data,
+        None,
+        6,
+    )
+    .unwrap();
     let ffi_constant_encode_mask = [1u8, 0, 1, 1, 1, 1];
     let mut ffi_constant_encode_size = 0u32;
     let mut ffi_constant_encode_out = [0u8; 128];
@@ -541,6 +563,9 @@ fn main() {
     });
     bench("lerc2-supported-decode-byte-huffman-fixture", 100, || {
         black_box(decode_lerc2_bands_supported(black_box(&lerc2_blob)).unwrap());
+    });
+    bench("lerc2-supported-decode-float-huffman-raw-v6", 1_000, || {
+        black_box(decode_lerc2_supported(black_box(&float_huffman_blob)).unwrap());
     });
     bench("lerc2-supported-write-data-bytes", 100_000, || {
         black_box(
@@ -824,6 +849,17 @@ fn main() {
                 huffman_encode_spec,
                 black_box(&huffman_encode_data),
                 Some(black_box(&huffman_encode_mask)),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-float-huffman-raw-encode-v6", 10_000, || {
+        black_box(
+            encode_lerc2_float_huffman(
+                float_huffman_encode_spec,
+                black_box(&float_huffman_encode_data),
+                None,
                 6,
             )
             .unwrap(),

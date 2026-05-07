@@ -1422,6 +1422,134 @@ pub fn encode_lerc2_byte_huffman_bands_with_no_data(
     encode_lerc2_byte_huffman_bands_impl(spec, data, masks, uses_no_data, no_data_values, version)
 }
 
+/// Encodes band-major floating-point data as concatenated Lerc2 FP-Huffman blobs.
+///
+/// This ports the version 6 floating-point Huffman image-mode envelope used by
+/// the C++ decoder for `Float` and `Double` data with `max_z_error == 0`. The
+/// current Rust writer stores predictor-none byte planes in the wrapped
+/// no-encoding mode, so it is intended as a compatibility encoder and fixture
+/// generator rather than the final compressed predictor-selection path. Masks
+/// follow the public C API convention: no masks means all pixels are valid, one
+/// mask is shared by all bands, and `n_bands` masks provide one mask per band.
+pub fn encode_lerc2_float_huffman_bands(
+    spec: EncodeSpec,
+    data: &[u8],
+    masks: Option<&[u8]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    validate_encode_bands_inputs(
+        spec,
+        data,
+        masks,
+        "floating-point Huffman Lerc2 band encode",
+    )?;
+    if version != 6 {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires version 6",
+        ));
+    }
+    if !matches!(spec.data_type, DataType::Float | DataType::Double) {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires Float or Double data",
+        ));
+    }
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    let mask_len = spec.mask_byte_len()?;
+    let mut blob = Vec::new();
+    let mut previous_mask: Option<BitMask> = None;
+
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let data_end = data_start
+            .checked_add(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let band_data = data
+            .get(data_start..data_end)
+            .ok_or(LercError::WrongParam("Lerc2 encode data length mismatch"))?;
+        let mask = match masks {
+            Some(mask_bytes) if spec.n_masks == 1 => Some(BitMask::from_byte_mask(
+                &mask_bytes[..mask_len],
+                spec.n_cols,
+                spec.n_rows,
+            )?),
+            Some(mask_bytes) => {
+                let mask_start = band
+                    .checked_mul(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 encode mask offset overflow"))?;
+                let mask_end = mask_start
+                    .checked_add(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 encode mask offset overflow"))?;
+                Some(BitMask::from_byte_mask(
+                    mask_bytes
+                        .get(mask_start..mask_end)
+                        .ok_or(LercError::WrongParam("Lerc2 mask byte length mismatch"))?,
+                    spec.n_cols,
+                    spec.n_rows,
+                )?)
+            }
+            None => None,
+        };
+        let encode_mask = if band == 0 {
+            true
+        } else if spec.n_masks == 1 {
+            false
+        } else {
+            match (mask.as_ref(), &previous_mask) {
+                (Some(mask), Some(previous)) => mask != previous,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        };
+        let n_blobs_more = i32::try_from(spec.n_bands - 1 - band)
+            .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?;
+        let band_blob = encode_lerc2_float_huffman_band(
+            EncodeSpec {
+                n_masks: usize::from(mask.is_some()),
+                ..band_spec
+            },
+            band_data,
+            mask.as_ref(),
+            version,
+            n_blobs_more,
+            encode_mask,
+        )?;
+        blob.extend_from_slice(&band_blob);
+        previous_mask = mask;
+    }
+
+    Ok(blob)
+}
+
+/// Encodes one or more floating-point Lerc2 bands using the FP-Huffman envelope.
+///
+/// Multi-band input supports no mask or one shared mask; per-band masks are
+/// available through [`encode_lerc2_float_huffman_bands`]. The current writer
+/// emits predictor-none raw wrapped byte planes inside image mode 3.
+pub fn encode_lerc2_float_huffman(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "floating-point Huffman Lerc2 encode helper supports at most one shared mask",
+        )?;
+        return encode_lerc2_float_huffman_bands(spec, data, mask_bytes.as_deref(), version);
+    }
+    encode_lerc2_float_huffman_band(spec, data, mask, version, 0, true)
+}
+
 fn encode_lerc2_byte_huffman_bands_impl(
     spec: EncodeSpec,
     data: &[u8],
@@ -2147,6 +2275,95 @@ fn encode_lerc2_byte_huffman_band(
     if ranges_len > 0 {
         offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
     }
+    blob[offset..offset + payload.len()].copy_from_slice(&payload);
+    offset += payload.len();
+    debug_assert_eq!(offset, blob.len());
+    finalize_lerc2_checksum(&mut blob)?;
+    Ok(blob)
+}
+
+fn encode_lerc2_float_huffman_band(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    version: i32,
+    n_blobs_more: i32,
+    encode_partial_mask: bool,
+) -> Result<Vec<u8>> {
+    validate_single_band_encode_inputs(spec, data, mask, "floating-point Huffman Lerc2 encode")?;
+    if version != 6 {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires version 6",
+        ));
+    }
+    if !matches!(spec.data_type, DataType::Float | DataType::Double) {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires Float or Double data",
+        ));
+    }
+
+    let mask = effective_encode_mask(spec, mask)?;
+    let num_valid_pixel = mask.count_valid_bits();
+    if num_valid_pixel == 0 {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires valid pixels",
+        ));
+    }
+    let ranges = compute_lerc2_data_ranges_for_encode_with_mask(spec, data, &mask)?;
+    if ranges.min_max_equal {
+        return Err(LercError::WrongParam(
+            "constant floating-point ranges should use Lerc2 constant encode",
+        ));
+    }
+
+    let z_min = ranges.mins.iter().copied().fold(f64::INFINITY, f64::min);
+    let z_max = ranges
+        .maxs
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let header_size = compute_lerc2_header_byte_len(version)?;
+    let mut header = HeaderInfo {
+        version,
+        checksum: 0,
+        n_rows: spec.n_rows as i32,
+        n_cols: spec.n_cols as i32,
+        n_depth: spec.n_depth as i32,
+        num_valid_pixel: num_valid_pixel as i32,
+        micro_block_size: 8,
+        blob_size: 1,
+        n_blobs_more,
+        b_pass_no_data_values: 0,
+        b_is_int: 0,
+        b_reserved_3: 0,
+        b_reserved_4: 0,
+        data_type: spec.data_type,
+        max_z_error: 0.0,
+        z_min,
+        z_max,
+        no_data_val: 0.0,
+        no_data_val_orig: 0.0,
+        header_size,
+    };
+
+    let payload = encode_huffman_float_payload(&header, data)?;
+    let encode_mask = encode_partial_mask && mask.count_valid_bits() < spec.n_cols * spec.n_rows;
+    let mask_len = compute_lerc2_mask_byte_len(&header, Some(&mask), encode_mask)?;
+    let ranges_len = compute_lerc2_min_max_ranges_byte_len(&header)?;
+    header.blob_size = header
+        .header_size
+        .checked_add(mask_len)
+        .and_then(|len| len.checked_add(ranges_len))
+        .and_then(|len| len.checked_add(payload.len()))
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or(LercError::WrongParam(
+            "Lerc2 floating-point Huffman blob size overflow",
+        ))?;
+
+    let mut blob = vec![0; header.blob_size as usize];
+    let mut offset = write_lerc2_header(&header, &mut blob)?;
+    offset += write_lerc2_mask(&header, Some(&mask), encode_mask, &mut blob[offset..])?;
+    offset += write_lerc2_min_max_ranges(&header, &ranges, &mut blob[offset..])?;
     blob[offset..offset + payload.len()].copy_from_slice(&payload);
     offset += payload.len();
     debug_assert_eq!(offset, blob.len());
@@ -6405,6 +6622,126 @@ fn write_huffman_symbol(
     bits.push_bits(code, len)
 }
 
+fn encode_huffman_float_payload(header: &HeaderInfo, data: &[u8]) -> Result<Vec<u8>> {
+    if !try_huffman_float(header) {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman payload requires version 6 Float or Double data with zero max_z_error",
+        ));
+    }
+
+    let n_cols = header.n_cols as usize;
+    let n_rows = header.n_rows as usize;
+    let n_depth = header.n_depth as usize;
+    let (slice_cols, slice_rows) = if n_depth == 1 {
+        (n_cols, n_rows)
+    } else {
+        (
+            n_depth,
+            n_cols.checked_mul(n_rows).ok_or(LercError::WrongParam(
+                "floating-point Huffman slice row count overflow",
+            ))?,
+        )
+    };
+
+    let mut out = Vec::new();
+    out.push(0);
+    out.push(3);
+    write_fp_huffman_slice(
+        data,
+        header.data_type,
+        slice_cols,
+        slice_rows,
+        FpPredictor::None,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+fn write_fp_huffman_slice(
+    data: &[u8],
+    data_type: DataType,
+    cols: usize,
+    rows: usize,
+    predictor: FpPredictor,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if predictor != FpPredictor::None {
+        return Err(LercError::Unsupported(
+            "floating-point Huffman predictor encode is not ported yet",
+        ));
+    }
+    let value_size = match data_type {
+        DataType::Float => 4,
+        DataType::Double => 8,
+        _ => {
+            return Err(LercError::WrongParam(
+                "floating-point Huffman slice requires float or double data",
+            ))
+        }
+    };
+    let sample_count = cols.checked_mul(rows).ok_or(LercError::WrongParam(
+        "floating-point Huffman sample count overflow",
+    ))?;
+    let expected_len = sample_count
+        .checked_mul(value_size)
+        .ok_or(LercError::WrongParam(
+            "floating-point Huffman byte count overflow",
+        ))?;
+    if data.len() != expected_len {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman data length mismatch",
+        ));
+    }
+
+    out.push(predictor.code());
+    let transformed = transform_fp_huffman_input_bytes(data, data_type)?;
+    for byte_index in 0..value_size {
+        let mut plane = Vec::with_capacity(sample_count);
+        for sample_idx in 0..sample_count {
+            plane.push(transformed[sample_idx * value_size + byte_index]);
+        }
+        out.push(byte_index as u8);
+        out.push(0);
+        let compressed_size = u32::try_from(plane.len().checked_add(1).ok_or(
+            LercError::WrongParam("floating-point Huffman plane size overflow"),
+        )?)
+        .map_err(|_| LercError::WrongParam("floating-point Huffman plane is too large"))?;
+        out.extend_from_slice(&compressed_size.to_le_bytes());
+        out.push(FPL_HUFFMAN_NO_ENCODING);
+        out.extend_from_slice(&plane);
+    }
+    Ok(())
+}
+
+fn transform_fp_huffman_input_bytes(data: &[u8], data_type: DataType) -> Result<Vec<u8>> {
+    match data_type {
+        DataType::Float => {
+            if data.len() % 4 != 0 {
+                return Err(LercError::WrongParam(
+                    "floating-point Huffman float byte length mismatch",
+                ));
+            }
+            let mut out = Vec::with_capacity(data.len());
+            for chunk in data.chunks_exact(4) {
+                let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                out.extend_from_slice(&float_transform_bits(value).to_le_bytes());
+            }
+            Ok(out)
+        }
+        DataType::Double => Ok(data.to_vec()),
+        _ => Err(LercError::WrongParam(
+            "floating-point Huffman transform requires float or double data",
+        )),
+    }
+}
+
+fn float_transform_bits(value: u32) -> u32 {
+    let mantissa = value & 0x007f_ffff;
+    let exponent = ((value & 0xff80_0000) >> 23) & 0xff;
+    let sign = (value >> 31) & 0x01;
+    mantissa | (exponent << 24) | (sign << 23)
+}
+
 #[allow(dead_code)]
 fn extract_fpl_compressed_buffer(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
     let (&mode, payload) = encoded.split_first().ok_or(LercError::BufferTooSmall)?;
@@ -7472,9 +7809,10 @@ mod tests {
         decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
         encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
         encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
-        encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_one_sweep,
-        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
-        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+        encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_float_huffman,
+        encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
+        encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
         encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
@@ -8664,6 +9002,97 @@ mod tests {
         let decoded = decode_lerc2_supported(&blob).unwrap();
         assert_eq!(decoded.bytes_consumed, blob.len());
         assert_eq!(decoded.data, DecodedData::Float(vec![1.0, 2.5]));
+    }
+
+    #[test]
+    fn encodes_float_huffman_blob_with_raw_wrapped_byte_planes() {
+        let spec = EncodeSpec {
+            n_cols: 3,
+            n_rows: 2,
+            n_depth: 1,
+            n_bands: 1,
+            n_masks: 1,
+            data_type: DataType::Float,
+        };
+        let values = [1.0f32, 2.5, -3.25, 4.0, 9.5, 12.25];
+        let mut data = Vec::new();
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let mask = BitMask::from_byte_mask(&[1, 1, 0, 1, 1, 1], 3, 2).unwrap();
+
+        let blob = encode_lerc2_float_huffman(spec, &data, Some(&mask), 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.version, 6);
+        assert_eq!(decoded.header.max_z_error, 0.0);
+        assert_eq!(decoded.header.micro_block_size, 8);
+        assert_eq!(decoded.mask, mask);
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.data, DecodedData::Float(values.to_vec()));
+    }
+
+    #[test]
+    fn encodes_multi_band_double_huffman_blobs_with_shared_mask() {
+        let spec = EncodeSpec {
+            n_cols: 2,
+            n_rows: 2,
+            n_depth: 2,
+            n_bands: 2,
+            n_masks: 1,
+            data_type: DataType::Double,
+        };
+        let band0 = [1.0f64, 2.0, 3.5, 4.5, 5.25, 6.25, 7.75, 8.75];
+        let band1 = [-1.0f64, -2.0, -3.5, -4.5, 9.25, 10.25, 11.75, 12.75];
+        let mut data = Vec::new();
+        for value in band0.into_iter().chain(band1) {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let mask_bytes = [1, 0, 1, 1];
+
+        let blob = encode_lerc2_float_huffman_bands(spec, &data, Some(&mask_bytes), 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bytes_consumed, blob.len());
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 1);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+        assert_eq!(decoded.bands[0].data, DecodedData::Double(band0.to_vec()));
+        assert_eq!(decoded.bands[1].data, DecodedData::Double(band1.to_vec()));
+    }
+
+    #[test]
+    fn rejects_invalid_float_huffman_encode_inputs() {
+        let spec = EncodeSpec {
+            n_cols: 2,
+            n_rows: 1,
+            n_depth: 1,
+            n_bands: 1,
+            n_masks: 0,
+            data_type: DataType::Float,
+        };
+        let data = [1.0f32.to_le_bytes(), 2.0f32.to_le_bytes()].concat();
+
+        assert_eq!(
+            encode_lerc2_float_huffman(spec, &data, None, 5).unwrap_err(),
+            LercError::WrongParam("floating-point Huffman Lerc2 encode requires version 6")
+        );
+        assert_eq!(
+            encode_lerc2_float_huffman(
+                EncodeSpec {
+                    data_type: DataType::UChar,
+                    ..spec
+                },
+                &[1, 2],
+                None,
+                6
+            )
+            .unwrap_err(),
+            LercError::WrongParam(
+                "floating-point Huffman Lerc2 encode requires Float or Double data"
+            )
+        );
     }
 
     #[test]
