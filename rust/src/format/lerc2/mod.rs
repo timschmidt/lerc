@@ -1070,10 +1070,20 @@ fn one_sweep_shared_mask_bytes(
     spec: EncodeSpec,
     mask: Option<&BitMask>,
 ) -> Result<Option<Vec<u8>>> {
+    shared_mask_bytes_for_convenience_encode(
+        spec,
+        mask,
+        "one-sweep Lerc2 encode helper supports at most one shared mask",
+    )
+}
+
+fn shared_mask_bytes_for_convenience_encode(
+    spec: EncodeSpec,
+    mask: Option<&BitMask>,
+    too_many_masks_message: &'static str,
+) -> Result<Option<Vec<u8>>> {
     if spec.n_masks > 1 {
-        return Err(LercError::WrongParam(
-            "one-sweep Lerc2 encode helper supports at most one shared mask",
-        ));
+        return Err(LercError::WrongParam(too_many_masks_message));
     }
     match (spec.n_masks, mask) {
         (0, None) => Ok(None),
@@ -1540,13 +1550,14 @@ fn encode_lerc2_byte_huffman_bands_impl(
     Ok(blob)
 }
 
-/// Encodes a single-band Lerc2 blob using one-sweep payloads with no-data metadata.
+/// Encodes one or more Lerc2 bands using one-sweep payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
 /// internal sentinel when needed and restored during decode. Single-depth inputs
-/// use mask filtering only and do not write no-data metadata.
+/// use mask filtering only and do not write no-data metadata. Multi-band input
+/// supports one shared no-data sentinel and either no mask or one shared mask.
 pub fn encode_lerc2_one_sweep_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1555,6 +1566,23 @@ pub fn encode_lerc2_one_sweep_with_no_data(
     no_data_value: f64,
     version: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "one-sweep Lerc2 no-data encode helper supports at most one shared mask",
+        )?;
+        let (uses_no_data, no_data_values) = repeated_no_data_vectors(spec.n_bands, no_data_value);
+        return encode_lerc2_one_sweep_bands_with_no_data(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            version,
+        );
+    }
     validate_single_band_encode_inputs(spec, data, mask, "one-sweep Lerc2 no-data encode")?;
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if version < 6 {
@@ -1584,13 +1612,15 @@ pub fn encode_lerc2_one_sweep_with_no_data(
     )
 }
 
-/// Encodes a single-band Lerc2 blob using raw tiled payloads.
+/// Encodes one or more Lerc2 bands using raw tiled payloads.
 ///
 /// This safe encode path writes version 2 and newer blobs. Version 2 and 3
 /// blobs are limited by the Lerc2 header layout to single-depth data. Version
 /// 4 and newer blobs also carry per-depth min/max ranges. Header configurations
 /// that use the C++ Huffman-probe envelope are emitted with image mode 0,
-/// keeping the tiled payload raw and uncompressed.
+/// keeping the tiled payload raw and uncompressed. Multi-band input supports no
+/// mask or one shared mask; per-band masks are available through
+/// [`encode_lerc2_tiled_raw_bands`].
 pub fn encode_lerc2_tiled_raw(
     spec: EncodeSpec,
     data: &[u8],
@@ -1599,6 +1629,21 @@ pub fn encode_lerc2_tiled_raw(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "raw tiled Lerc2 encode helper supports at most one shared mask",
+        )?;
+        return encode_lerc2_tiled_raw_bands(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            version,
+            micro_block_size,
+        );
+    }
     encode_lerc2_tiled_raw_band(
         spec,
         data,
@@ -1612,13 +1657,15 @@ pub fn encode_lerc2_tiled_raw(
     )
 }
 
-/// Encodes a single-band Lerc2 blob using simple bit-stuffed tiled payloads.
+/// Encodes one or more Lerc2 bands using simple bit-stuffed tiled payloads.
 ///
 /// This version 2+ helper ports the C++ quantized tile layout without the
 /// later LUT or depth-difference tile choices. Each tile/depth plane is
 /// quantized from its tile minimum using `2 * max_z_error` and written with
 /// [`BitStuffer2::encode_simple`]. Version 2 and 3 blobs are limited to
-/// `n_depth == 1` by the legacy header layout.
+/// `n_depth == 1` by the legacy header layout. Multi-band input supports no
+/// mask or one shared mask; per-band masks are available through
+/// [`encode_lerc2_tiled_simple_bands`].
 pub fn encode_lerc2_tiled_simple(
     spec: EncodeSpec,
     data: &[u8],
@@ -1627,6 +1674,21 @@ pub fn encode_lerc2_tiled_simple(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "simple tiled Lerc2 encode helper supports at most one shared mask",
+        )?;
+        return encode_lerc2_tiled_simple_bands(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            version,
+            micro_block_size,
+        );
+    }
     encode_lerc2_tiled_simple_band(
         spec,
         data,
@@ -1641,14 +1703,15 @@ pub fn encode_lerc2_tiled_simple(
     )
 }
 
-/// Encodes a single-band Lerc2 blob using LUT-capable bit-stuffed tiled payloads.
+/// Encodes one or more Lerc2 bands using LUT-capable bit-stuffed tiled payloads.
 ///
 /// This version 2+ helper uses the same tile quantization as
 /// [`encode_lerc2_tiled_simple`], but may write a `BitStuffer2` LUT stream for
 /// sparse quantized tile values when it is smaller than the simple stream.
 /// Tiles where LUT does not win are written with the simple bit-stuffed stream.
 /// Version 2 and 3 blobs are limited to `n_depth == 1` by the legacy header
-/// layout.
+/// layout. Multi-band input supports no mask or one shared mask; per-band masks
+/// are available through [`encode_lerc2_tiled_lut_bands`].
 pub fn encode_lerc2_tiled_lut(
     spec: EncodeSpec,
     data: &[u8],
@@ -1657,6 +1720,21 @@ pub fn encode_lerc2_tiled_lut(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "LUT tiled Lerc2 encode helper supports at most one shared mask",
+        )?;
+        return encode_lerc2_tiled_lut_bands(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            version,
+            micro_block_size,
+        );
+    }
     encode_lerc2_tiled_simple_band(
         spec,
         data,
@@ -1671,14 +1749,15 @@ pub fn encode_lerc2_tiled_lut(
     )
 }
 
-/// Encodes a single-band Lerc2 blob using LUT-capable tiled payloads with no-data metadata.
+/// Encodes one or more Lerc2 bands using LUT-capable tiled payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. It uses the same per-tile simple
 /// versus LUT bit-stuffer selection as [`encode_lerc2_tiled_lut`]. Single-depth
 /// inputs use mask filtering only and do not write no-data metadata; multi-depth
 /// mixed sentinel samples are remapped to an internal sentinel when needed and
-/// restored during decode.
+/// restored during decode. Multi-band input supports one shared no-data sentinel
+/// and either no mask or one shared mask.
 pub fn encode_lerc2_tiled_lut_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1688,6 +1767,24 @@ pub fn encode_lerc2_tiled_lut_with_no_data(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "LUT tiled Lerc2 no-data encode helper supports at most one shared mask",
+        )?;
+        let (uses_no_data, no_data_values) = repeated_no_data_vectors(spec.n_bands, no_data_value);
+        return encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            version,
+            micro_block_size,
+        );
+    }
     validate_single_band_encode_inputs(spec, data, mask, "LUT tiled Lerc2 no-data encode")?;
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if version < 6 {
@@ -1719,13 +1816,14 @@ pub fn encode_lerc2_tiled_lut_with_no_data(
     )
 }
 
-/// Encodes a single-band Lerc2 blob using simple bit-stuffed tiled payloads with no-data metadata.
+/// Encodes one or more Lerc2 bands using simple bit-stuffed tiled payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
 /// internal sentinel when needed and restored during decode. Single-depth inputs
-/// use mask filtering only and do not write no-data metadata.
+/// use mask filtering only and do not write no-data metadata. Multi-band input
+/// supports one shared no-data sentinel and either no mask or one shared mask.
 pub fn encode_lerc2_tiled_simple_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1735,6 +1833,24 @@ pub fn encode_lerc2_tiled_simple_with_no_data(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "simple tiled Lerc2 no-data encode helper supports at most one shared mask",
+        )?;
+        let (uses_no_data, no_data_values) = repeated_no_data_vectors(spec.n_bands, no_data_value);
+        return encode_lerc2_tiled_simple_bands_with_no_data(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            version,
+            micro_block_size,
+        );
+    }
     validate_single_band_encode_inputs(spec, data, mask, "simple tiled Lerc2 no-data encode")?;
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if version < 6 {
@@ -1766,13 +1882,14 @@ pub fn encode_lerc2_tiled_simple_with_no_data(
     )
 }
 
-/// Encodes a single-band Lerc2 blob using raw tiled payloads with no-data metadata.
+/// Encodes one or more Lerc2 bands using raw tiled payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
 /// internal sentinel when needed and restored during decode. Single-depth inputs
-/// use mask filtering only and do not write no-data metadata.
+/// use mask filtering only and do not write no-data metadata. Multi-band input
+/// supports one shared no-data sentinel and either no mask or one shared mask.
 pub fn encode_lerc2_tiled_raw_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1782,6 +1899,24 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
     version: i32,
     micro_block_size: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "raw tiled Lerc2 no-data encode helper supports at most one shared mask",
+        )?;
+        let (uses_no_data, no_data_values) = repeated_no_data_vectors(spec.n_bands, no_data_value);
+        return encode_lerc2_tiled_raw_bands_with_no_data(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            version,
+            micro_block_size,
+        );
+    }
     validate_single_band_encode_inputs(spec, data, mask, "raw tiled Lerc2 no-data encode")?;
     validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
     if version < 6 {
@@ -1812,12 +1947,18 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
     )
 }
 
-/// Encodes a single-band byte Lerc2 blob using integer Huffman payloads.
+fn repeated_no_data_vectors(n_bands: usize, no_data_value: f64) -> (Vec<u8>, Vec<f64>) {
+    (vec![1; n_bands], vec![no_data_value; n_bands])
+}
+
+/// Encodes one or more byte Lerc2 bands using integer Huffman payloads.
 ///
 /// This ports the lossless byte Huffman image modes used by the C++ encoder for
 /// `UChar` and `Char` data with `max_z_error == 0.5`. Version 4 and newer may
 /// choose either regular Huffman or delta Huffman, matching the C++ mode
-/// selection rule of using the smaller candidate. Constant inputs should use
+/// selection rule of using the smaller candidate. Multi-band input supports no
+/// mask or one shared mask; per-band masks are available through
+/// [`encode_lerc2_byte_huffman_bands`]. Constant inputs should use
 /// [`encode_lerc2_constant`] instead.
 pub fn encode_lerc2_byte_huffman(
     spec: EncodeSpec,
@@ -1825,16 +1966,27 @@ pub fn encode_lerc2_byte_huffman(
     mask: Option<&BitMask>,
     version: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "byte Huffman Lerc2 encode helper supports at most one shared mask",
+        )?;
+        return encode_lerc2_byte_huffman_bands(spec, data, mask_bytes.as_deref(), version);
+    }
     encode_lerc2_byte_huffman_band(spec, data, mask, version, 0, true, None)
 }
 
-/// Encodes a single-band byte Lerc2 blob using Huffman payloads with no-data metadata.
+/// Encodes one or more byte Lerc2 bands using Huffman payloads with no-data metadata.
 ///
 /// This version 6+ helper expects `data` to already contain `no_data_value`
 /// wherever no-data should be represented. Pixels whose every depth equals the
 /// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
 /// internal sentinel when needed and restored during decode. Single-depth inputs
-/// use mask filtering only and do not write no-data metadata.
+/// use mask filtering only and do not write no-data metadata. Multi-band input
+/// supports one shared no-data sentinel and either no mask or one shared mask;
+/// per-band masks and sentinels are available through
+/// [`encode_lerc2_byte_huffman_bands_with_no_data`].
 pub fn encode_lerc2_byte_huffman_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1842,6 +1994,22 @@ pub fn encode_lerc2_byte_huffman_with_no_data(
     no_data_value: f64,
     version: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "byte Huffman Lerc2 no-data encode helper supports at most one shared mask",
+        )?;
+        let (uses_no_data, no_data_values) = repeated_no_data_vectors(spec.n_bands, no_data_value);
+        return encode_lerc2_byte_huffman_bands_with_no_data(
+            spec,
+            data,
+            mask_bytes.as_deref(),
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            version,
+        );
+    }
     validate_single_band_encode_inputs(spec, data, mask, "byte Huffman Lerc2 no-data encode")?;
     if version < 6 {
         return Err(LercError::WrongParam(
@@ -8899,6 +9067,39 @@ mod tests {
     }
 
     #[test]
+    fn encodes_byte_huffman_lerc2_multi_band_blob_through_shared_mask_helper() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 16,
+            n_rows: 8,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let band_len = spec.n_cols * spec.n_rows * spec.n_depth;
+        let data = (0..spec.n_bands * band_len)
+            .map(|idx| ((idx * 7 + idx / 5) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let mask = BitMask::from_byte_mask(
+            &(0..spec.n_cols * spec.n_rows)
+                .map(|idx| u8::from(idx % 13 != 0))
+                .collect::<Vec<_>>(),
+            spec.n_cols,
+            spec.n_rows,
+        )
+        .unwrap();
+
+        let blob = encode_lerc2_byte_huffman(spec, &data, Some(&mask), 6).unwrap();
+        let expected =
+            encode_lerc2_byte_huffman_bands(spec, &data, Some(&mask.to_byte_mask()), 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(blob, expected);
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+    }
+
+    #[test]
     fn encodes_byte_huffman_lerc2_with_no_data_metadata() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -8965,6 +9166,48 @@ mod tests {
             n_pixels - (n_pixels + 16) / 17
         );
         assert_eq!(decoded.data, DecodedData::UChar(expected));
+    }
+
+    #[test]
+    fn encodes_byte_huffman_lerc2_multi_band_no_data_blob_through_shared_sentinel_helper() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 32,
+            n_rows: 8,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let band_len = spec.n_cols * spec.n_rows * spec.n_depth;
+        let mut data = Vec::with_capacity(band_len * spec.n_bands);
+        for band in 0..spec.n_bands {
+            for pixel in 0..(spec.n_cols * spec.n_rows) {
+                if pixel % 17 == 0 {
+                    data.extend_from_slice(&[255, 255]);
+                } else if pixel % 19 == 0 {
+                    data.extend_from_slice(&[7, 255]);
+                } else {
+                    let value = ((band * 31 + pixel) % 32) as u8;
+                    data.extend_from_slice(&[value, value.wrapping_add(5)]);
+                }
+            }
+        }
+
+        let blob = encode_lerc2_byte_huffman_with_no_data(spec, &data, None, 255.0, 6).unwrap();
+        let expected = encode_lerc2_byte_huffman_bands_with_no_data(
+            spec,
+            &data,
+            None,
+            Some(&[1, 1]),
+            Some(&[255.0, 255.0]),
+            6,
+        )
+        .unwrap();
+        let no_data = get_lerc2_no_data_info(&blob, 2).unwrap();
+
+        assert_eq!(blob, expected);
+        assert_eq!(no_data.uses_no_data, [1, 1]);
+        assert_eq!(no_data.no_data_values, [255.0, 255.0]);
     }
 
     #[test]
@@ -9899,6 +10142,59 @@ mod tests {
     }
 
     #[test]
+    fn encodes_tiled_lerc2_multi_band_blobs_through_shared_mask_helpers() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let mask_bytes = mask.to_byte_mask();
+
+        let raw = encode_lerc2_tiled_raw(spec, &data, 0.0, Some(&mask), 6, 2).unwrap();
+        let raw_expected =
+            encode_lerc2_tiled_raw_bands(spec, &data, 0.0, Some(&mask_bytes), 6, 2).unwrap();
+        assert_eq!(raw, raw_expected);
+
+        let simple = encode_lerc2_tiled_simple(spec, &data, 0.5, Some(&mask), 6, 2).unwrap();
+        let simple_expected =
+            encode_lerc2_tiled_simple_bands(spec, &data, 0.5, Some(&mask_bytes), 6, 2).unwrap();
+        assert_eq!(simple, simple_expected);
+
+        let lut_spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 4,
+            n_rows: 4,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let band0 =
+            (0..lut_spec.n_cols * lut_spec.n_rows)
+                .map(|idx| if idx % 3 == 0 { 100u16 } else { 10u16 });
+        let band1 =
+            (0..lut_spec.n_cols * lut_spec.n_rows)
+                .map(|idx| if idx % 4 == 0 { 250u16 } else { 25u16 });
+        let values = band0.chain(band1).collect::<Vec<_>>();
+        let lut_data = values
+            .iter()
+            .copied()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let lut_mask = BitMask::from_byte_mask(&[1u8; 16], 4, 4).unwrap();
+        let lut_mask_bytes = lut_mask.to_byte_mask();
+        let lut = encode_lerc2_tiled_lut(lut_spec, &lut_data, 0.5, Some(&lut_mask), 6, 4).unwrap();
+        let lut_expected =
+            encode_lerc2_tiled_lut_bands(lut_spec, &lut_data, 0.5, Some(&lut_mask_bytes), 6, 4)
+                .unwrap();
+        assert_eq!(lut, lut_expected);
+    }
+
+    #[test]
     fn encodes_pre_v4_raw_tiled_lerc2_bands_with_shared_mask() {
         let spec = EncodeSpec {
             data_type: DataType::UShort,
@@ -10131,6 +10427,85 @@ mod tests {
             decoded.data,
             DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
         );
+    }
+
+    #[test]
+    fn encodes_no_data_lerc2_multi_band_blobs_through_shared_sentinel_helpers() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let data = [
+            1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10, 11, 12, 255, 255, 13, 14, 15, 255, 17, 18,
+            19, 20,
+        ];
+        let uses_no_data = [1u8, 1];
+        let no_data_values = [255.0, 255.0];
+
+        let one_sweep =
+            encode_lerc2_one_sweep_with_no_data(spec, &data, 0.5, None, 255.0, 6).unwrap();
+        let one_sweep_expected = encode_lerc2_one_sweep_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        assert_eq!(one_sweep, one_sweep_expected);
+
+        let raw = encode_lerc2_tiled_raw_with_no_data(spec, &data, 0.5, None, 255.0, 6, 2).unwrap();
+        let raw_expected = encode_lerc2_tiled_raw_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+            2,
+        )
+        .unwrap();
+        assert_eq!(raw, raw_expected);
+
+        let simple =
+            encode_lerc2_tiled_simple_with_no_data(spec, &data, 0.5, None, 255.0, 6, 2).unwrap();
+        let simple_expected = encode_lerc2_tiled_simple_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+            2,
+        )
+        .unwrap();
+        assert_eq!(simple, simple_expected);
+
+        let lut = encode_lerc2_tiled_lut_with_no_data(spec, &data, 0.5, None, 255.0, 6, 2).unwrap();
+        let lut_expected = encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+            2,
+        )
+        .unwrap();
+        assert_eq!(lut, lut_expected);
+
+        let no_data = get_lerc2_no_data_info(&one_sweep, 2).unwrap();
+        assert_eq!(no_data.uses_no_data, uses_no_data);
+        assert_eq!(no_data.no_data_values, no_data_values);
     }
 
     #[test]
