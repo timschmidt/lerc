@@ -1438,12 +1438,11 @@ pub fn encode_lerc2_byte_huffman_bands_with_no_data(
 ///
 /// This ports the version 6 floating-point Huffman image-mode envelope used by
 /// the C++ decoder for `Float` and `Double` data with `max_z_error == 0`. The
-/// current Rust writer uses predictor-none byte planes, applies per-plane
-/// byte-delta selection, and chooses the smallest wrapped RLE, raw, or normal
-/// Huffman payload. It is still missing the C++ row/cross predictor selection
-/// path. Masks follow the public C API convention: no masks means all pixels
-/// are valid, one mask is shared by all bands, and `n_bands` masks provide one
-/// mask per band.
+/// current Rust writer selects among predictor-none, row-delta, and row/column
+/// cross-delta byte planes, applies per-plane byte-delta selection, and chooses
+/// the smallest wrapped RLE, raw, or normal Huffman payload. Masks follow the
+/// public C API convention: no masks means all pixels are valid, one mask is
+/// shared by all bands, and `n_bands` masks provide one mask per band.
 pub fn encode_lerc2_float_huffman_bands(
     spec: EncodeSpec,
     data: &[u8],
@@ -1545,8 +1544,9 @@ pub fn encode_lerc2_float_huffman_bands(
 ///
 /// Multi-band input supports no mask or one shared mask; per-band masks are
 /// available through [`encode_lerc2_float_huffman_bands`]. The current writer
-/// emits predictor-none byte planes with wrapped RLE, raw, or normal Huffman
-/// plane payloads inside image mode 3.
+/// selects among predictor-none, row-delta, and row/column cross-delta byte
+/// planes with wrapped RLE, raw, or normal Huffman plane payloads inside image
+/// mode 3.
 pub fn encode_lerc2_float_huffman(
     spec: EncodeSpec,
     data: &[u8],
@@ -6676,14 +6676,9 @@ fn write_fp_huffman_slice(
     data_type: DataType,
     cols: usize,
     rows: usize,
-    predictor: FpPredictor,
+    _predictor: FpPredictor,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    if predictor != FpPredictor::None {
-        return Err(LercError::Unsupported(
-            "floating-point Huffman predictor encode is not ported yet",
-        ));
-    }
     let value_size = match data_type {
         DataType::Float => 4,
         DataType::Double => 8,
@@ -6707,12 +6702,50 @@ fn write_fp_huffman_slice(
         ));
     }
 
-    out.push(predictor.code());
     let transformed = transform_fp_huffman_input_bytes(data, data_type)?;
+    let candidates = [
+        FpPredictor::None,
+        FpPredictor::Delta1,
+        FpPredictor::RowsCols,
+    ];
+    let mut best: Option<Vec<u8>> = None;
+    for predictor in candidates {
+        let candidate = encode_fp_huffman_slice_candidate(
+            &transformed,
+            data_type,
+            cols,
+            rows,
+            value_size,
+            sample_count,
+            predictor,
+        )?;
+        if best
+            .as_ref()
+            .is_none_or(|best| candidate.len() < best.len())
+        {
+            best = Some(candidate);
+        }
+    }
+    out.extend_from_slice(best.as_deref().unwrap_or(&[]));
+    Ok(())
+}
+
+fn encode_fp_huffman_slice_candidate(
+    transformed: &[u8],
+    data_type: DataType,
+    cols: usize,
+    rows: usize,
+    value_size: usize,
+    sample_count: usize,
+    predictor: FpPredictor,
+) -> Result<Vec<u8>> {
+    let predicted = apply_fp_predictor_for_encode(transformed, data_type, cols, rows, predictor)?;
+    let mut out = Vec::new();
+    out.push(predictor.code());
     for byte_index in 0..value_size {
         let mut plane = Vec::with_capacity(sample_count);
         for sample_idx in 0..sample_count {
-            plane.push(transformed[sample_idx * value_size + byte_index]);
+            plane.push(predicted[sample_idx * value_size + byte_index]);
         }
         let (byte_delta, compressed) =
             best_fpl_compressed_plane(&plane, predictor.max_byte_delta())?;
@@ -6723,7 +6756,116 @@ fn write_fp_huffman_slice(
         out.extend_from_slice(&compressed_size.to_le_bytes());
         out.extend_from_slice(&compressed);
     }
-    Ok(())
+    Ok(out)
+}
+
+fn apply_fp_predictor_for_encode(
+    transformed: &[u8],
+    data_type: DataType,
+    cols: usize,
+    rows: usize,
+    predictor: FpPredictor,
+) -> Result<Vec<u8>> {
+    match data_type {
+        DataType::Float => {
+            let mut values: Vec<u32> = transformed
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            match predictor {
+                FpPredictor::None => {}
+                FpPredictor::Delta1 => apply_fp_block_delta_u32(&mut values, cols, rows, 1),
+                FpPredictor::RowsCols => apply_fp_cross_delta_u32(&mut values, cols, rows),
+            }
+            let mut out = Vec::with_capacity(transformed.len());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(out)
+        }
+        DataType::Double => {
+            let mut values: Vec<u64> = transformed
+                .chunks_exact(8)
+                .map(|chunk| {
+                    u64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ])
+                })
+                .collect();
+            match predictor {
+                FpPredictor::None => {}
+                FpPredictor::Delta1 => apply_fp_block_delta_u64(&mut values, cols, rows, 1),
+                FpPredictor::RowsCols => apply_fp_cross_delta_u64(&mut values, cols, rows),
+            }
+            let mut out = Vec::with_capacity(transformed.len());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(out)
+        }
+        _ => Err(LercError::WrongParam(
+            "floating-point Huffman predictor requires float or double data",
+        )),
+    }
+}
+
+fn sub_fp32_bits(lhs: u32, rhs: u32) -> u32 {
+    let mantissa = lhs.wrapping_sub(rhs) & 0x007f_ffff;
+    let lhs_exp = ((lhs & 0xff80_0000) >> 23) & 0x1ff;
+    let rhs_exp = ((rhs & 0xff80_0000) >> 23) & 0x1ff;
+    mantissa | (((lhs_exp.wrapping_sub(rhs_exp)) & 0x1ff) << 23)
+}
+
+fn sub_fp64_bits(lhs: u64, rhs: u64) -> u64 {
+    let mantissa = lhs.wrapping_sub(rhs) & 0x000f_ffff_ffff_ffff;
+    let lhs_exp = ((lhs & 0xfff0_0000_0000_0000) >> 52) & 0xfff;
+    let rhs_exp = ((rhs & 0xfff0_0000_0000_0000) >> 52) & 0xfff;
+    mantissa | (((lhs_exp.wrapping_sub(rhs_exp)) & 0xfff) << 52)
+}
+
+fn apply_fp_block_delta_u32(values: &mut [u32], cols: usize, rows: usize, level: u8) {
+    for row in 0..rows {
+        let row_start = row * cols;
+        for order in 1..=level as usize {
+            for col in (order..cols).rev() {
+                let idx = row_start + col;
+                values[idx] = sub_fp32_bits(values[idx], values[idx - 1]);
+            }
+        }
+    }
+}
+
+fn apply_fp_block_delta_u64(values: &mut [u64], cols: usize, rows: usize, level: u8) {
+    for row in 0..rows {
+        let row_start = row * cols;
+        for order in 1..=level as usize {
+            for col in (order..cols).rev() {
+                let idx = row_start + col;
+                values[idx] = sub_fp64_bits(values[idx], values[idx - 1]);
+            }
+        }
+    }
+}
+
+fn apply_fp_cross_delta_u32(values: &mut [u32], cols: usize, rows: usize) {
+    apply_fp_block_delta_u32(values, cols, rows, 1);
+    for col in 0..cols {
+        for row in (1..rows).rev() {
+            let idx = row * cols + col;
+            values[idx] = sub_fp32_bits(values[idx], values[idx - cols]);
+        }
+    }
+}
+
+fn apply_fp_cross_delta_u64(values: &mut [u64], cols: usize, rows: usize) {
+    apply_fp_block_delta_u64(values, cols, rows, 1);
+    for col in 0..cols {
+        for row in (1..rows).rev() {
+            let idx = row * cols + col;
+            values[idx] = sub_fp64_bits(values[idx], values[idx - cols]);
+        }
+    }
 }
 
 fn best_fpl_compressed_plane(plane: &[u8], max_delta: u8) -> Result<(u8, Vec<u8>)> {
@@ -7884,19 +8026,19 @@ impl<'a> Writer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fp_byte_delta_sequence, best_fpl_compressed_plane, compute_checksum_fletcher32,
-        compute_huffman_encode_table, compute_lerc2_data_ranges_for_encode,
-        compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
-        compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-        compute_lerc2_tiled_raw_byte_len, decode_lerc2_bands_supported, decode_lerc2_supported,
-        decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
-        encode_fpl_compressed_buffer, encode_lerc2_auto, encode_lerc2_auto_with_no_data,
-        encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
-        encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
-        encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_float_huffman,
-        encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
-        encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+        apply_fp_byte_delta_sequence, apply_fp_predictor_for_encode, best_fpl_compressed_plane,
+        compute_checksum_fletcher32, compute_huffman_encode_table,
+        compute_lerc2_data_ranges_for_encode, compute_lerc2_header_byte_len,
+        compute_lerc2_mask_byte_len, compute_lerc2_min_max_ranges_byte_len,
+        compute_lerc2_one_sweep_byte_len, compute_lerc2_tiled_raw_byte_len,
+        decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+        decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_fpl_compressed_buffer,
+        encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
+        encode_lerc2_byte_huffman_bands, encode_lerc2_byte_huffman_bands_with_no_data,
+        encode_lerc2_byte_huffman_with_no_data, encode_lerc2_constant, encode_lerc2_constant_bands,
+        encode_lerc2_float_huffman, encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep,
+        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
+        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
         encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
@@ -7909,11 +8051,11 @@ mod tests {
         read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes,
-        try_lerc2_bit_plane_max_z_error, try_raise_lerc2_float_max_z_error,
-        validate_lerc2_checksum, write_huffman_code_table, write_lerc2_header, write_lerc2_mask,
-        write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec,
-        FpPredictor, HeaderInfo, HuffmanBitWriter, MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN,
-        BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        transform_fp_huffman_input_bytes, try_lerc2_bit_plane_max_z_error,
+        try_raise_lerc2_float_max_z_error, validate_lerc2_checksum, write_huffman_code_table,
+        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
+        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter,
+        MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -9370,6 +9512,36 @@ mod tests {
                 .unwrap_err(),
             LercError::CorruptInput("floating-point Huffman byte-plane count mismatch")
         );
+    }
+
+    #[test]
+    fn floating_point_huffman_predictor_encode_inverts_supported_restore_paths() {
+        let values = [1.0f32, 1.5, 2.0, 2.5, 3.0, 3.5];
+        let data = values
+            .iter()
+            .copied()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let transformed = transform_fp_huffman_input_bytes(&data, DataType::Float).unwrap();
+
+        for predictor in [FpPredictor::Delta1, FpPredictor::RowsCols] {
+            let predicted =
+                apply_fp_predictor_for_encode(&transformed, DataType::Float, 3, 2, predictor)
+                    .unwrap();
+            let mut planes = Vec::new();
+            for byte_index in 0..4 {
+                planes.push((
+                    byte_index,
+                    predicted
+                        .chunks_exact(4)
+                        .map(|chunk| chunk[byte_index])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            let restored =
+                restore_fp_bytes_from_planes(&planes, DataType::Float, 3, 2, predictor).unwrap();
+            assert_eq!(restored, data);
+        }
     }
 
     #[test]
