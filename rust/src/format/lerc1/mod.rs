@@ -354,7 +354,19 @@ pub fn decode_lerc1(blob: &[u8]) -> Result<DecodedLerc1> {
 /// and left as `0.0` in each returned band.
 pub fn decode_lerc1_bands(blob: &[u8]) -> Result<DecodedLerc1Bands> {
     let first = decode_lerc1(blob)?;
-    decode_lerc1_continuation_bands(blob, first, false)
+    decode_lerc1_continuation_bands(blob, first, None, false)
+}
+
+/// Decodes the requested prefix of legacy Lerc1 bands.
+///
+/// This mirrors the C++ decode loop, which only reads `nBands` bands from a
+/// legacy blob and ignores any later bytes.
+pub(crate) fn decode_lerc1_bands_prefix(blob: &[u8], n_bands: usize) -> Result<DecodedLerc1Bands> {
+    if n_bands == 0 {
+        return Err(LercError::WrongParam("Lerc1 band count must be positive"));
+    }
+    let first = decode_lerc1(blob)?;
+    decode_lerc1_continuation_bands(blob, first, Some(n_bands), false)
 }
 
 /// Decodes Lerc1 metadata while tolerating failed continuation bands.
@@ -364,12 +376,13 @@ pub fn decode_lerc1_bands(blob: &[u8]) -> Result<DecodedLerc1Bands> {
 /// remains strict through [`decode_lerc1_bands`].
 pub(crate) fn decode_lerc1_bands_for_metadata(blob: &[u8]) -> Result<DecodedLerc1Bands> {
     let first = decode_lerc1(blob)?;
-    decode_lerc1_continuation_bands(blob, first, true)
+    decode_lerc1_continuation_bands(blob, first, None, true)
 }
 
 fn decode_lerc1_continuation_bands(
     blob: &[u8],
     first: DecodedLerc1,
+    max_bands: Option<usize>,
     tolerate_failed_continuation: bool,
 ) -> Result<DecodedLerc1Bands> {
     let pixel_count = (first.header.n_cols as usize)
@@ -381,7 +394,7 @@ fn decode_lerc1_continuation_bands(
     let mut stats = vec![first_stats];
     let mut offset = first.bytes_consumed;
 
-    while offset < blob.len() {
+    while offset < blob.len() && max_bands.is_none_or(|max_bands| stats.len() < max_bands) {
         let (header, band_values, band_stats, consumed) =
             match decode_lerc1_z_only_band(&blob[offset..], &first.mask_info.mask) {
                 Ok(decoded) => decoded,
@@ -408,6 +421,10 @@ fn decode_lerc1_continuation_bands(
         values.extend_from_slice(&band_values);
         stats.push(band_stats);
         offset += consumed;
+    }
+
+    if max_bands.is_some_and(|max_bands| stats.len() < max_bands) {
+        return Err(LercError::BufferTooSmall);
     }
 
     Ok(DecodedLerc1Bands {
@@ -1033,6 +1050,41 @@ mod tests {
         assert_eq!(ranges.mins, [1.0, 10.0]);
         assert_eq!(ranges.maxs, [4.0, 40.0]);
         assert!(decode_lerc1_bands(&blob).is_err());
+    }
+
+    #[test]
+    fn lerc1_decode_reads_only_requested_prefix_bands() {
+        let mut blob = synthetic_lerc1_two_band_blob();
+        let valid_len = blob.len();
+        blob.extend_from_slice(&[0u8; 48]);
+        let spec = DecodeIntoSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let mut data = vec![0u8; spec.data_byte_len().unwrap()];
+        let mut mask = vec![0u8; spec.mask_byte_len().unwrap()];
+
+        let decoded = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(decoded.bytes_consumed, valid_len);
+        assert_eq!(decoded.data_bytes_written, 8 * std::mem::size_of::<f32>());
+        assert_eq!(decoded.mask_bytes_written, 4);
+        assert_eq!(mask, [1, 1, 1, 1]);
+        let expected = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(data, expected);
+
+        let mut too_many = spec;
+        too_many.n_bands = 3;
+        too_many.n_masks = 1;
+        let mut data = vec![0u8; too_many.data_byte_len().unwrap()];
+        assert!(decode_lerc_supported_into(&blob, too_many, &mut data, Some(&mut mask)).is_err());
     }
 
     #[test]

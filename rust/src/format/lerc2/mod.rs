@@ -10,9 +10,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 //! Lerc2 metadata readers and supported-subset decoders.
 
-use crate::format::lerc1::decode_lerc1_bands_for_metadata;
+use crate::format::lerc1::{decode_lerc1_bands_for_metadata, decode_lerc1_bands_prefix};
 use crate::types::{DataType, EncodeSpec, LercError, Result};
-use crate::{decode_lerc1_bands, decode_typed_values, DecodedData, CNT_Z_IMAGE_KEY};
+use crate::{decode_typed_values, DecodedData, CNT_Z_IMAGE_KEY};
 use crate::{BitMask, BitStuffer2, Rle};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -3861,10 +3861,11 @@ fn decode_lerc1_supported_into(
     data_output: &mut [u8],
     mask_output: Option<&mut [u8]>,
 ) -> Result<DecodeIntoResult> {
-    let decoded = decode_lerc1_bands(blob)?;
+    let decoded = decode_lerc1_bands_prefix(blob, spec.n_bands)?;
+    let metadata = decode_lerc1_bands_for_metadata(blob)?;
     if spec.data_type != DataType::Float
         || spec.n_depth != 1
-        || spec.n_bands > decoded.n_bands
+        || spec.n_bands > metadata.n_bands
         || spec.n_cols != decoded.header.n_cols as usize
         || spec.n_rows != decoded.header.n_rows as usize
     {
@@ -3904,7 +3905,7 @@ fn decode_lerc1_supported_into(
     };
 
     Ok(DecodeIntoResult {
-        bytes_consumed: decoded.bytes_consumed,
+        bytes_consumed: metadata.bytes_consumed,
         data_bytes_written,
         mask_bytes_written,
     })
