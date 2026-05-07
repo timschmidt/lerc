@@ -1039,13 +1039,13 @@ fn compute_lerc2_data_ranges_for_encode_with_mask(
     })
 }
 
-/// Encodes a single-band Lerc2 blob using the one-sweep payload layout.
+/// Encodes one or more Lerc2 bands using the one-sweep payload layout.
 ///
 /// This safe fallback encoder writes version 2 and newer blobs. Version 2 and
 /// 3 blobs are limited by the Lerc2 header layout to single-depth data. Version
-/// 4 and newer blobs also carry per-depth min/max ranges. The encoder computes
-/// ranges from the input bytes, writes the header, mask, optional range section,
-/// and uncompressed one-sweep payload, then finalizes the version 3+ checksum.
+/// 4 and newer blobs also carry per-depth min/max ranges. Multi-band output
+/// uses concatenated Lerc2 blobs and supports either no mask or one shared mask;
+/// callers with per-band masks can use [`encode_lerc2_one_sweep_bands`].
 pub fn encode_lerc2_one_sweep(
     spec: EncodeSpec,
     data: &[u8],
@@ -1053,7 +1053,45 @@ pub fn encode_lerc2_one_sweep(
     mask: Option<&BitMask>,
     version: i32,
 ) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = one_sweep_shared_mask_bytes(spec, mask)?;
+        return encode_lerc2_one_sweep_bands(
+            spec,
+            data,
+            max_z_error,
+            mask_bytes.as_deref(),
+            version,
+        );
+    }
     encode_lerc2_one_sweep_band(spec, data, max_z_error, mask, version, 0, true, None)
+}
+
+fn one_sweep_shared_mask_bytes(
+    spec: EncodeSpec,
+    mask: Option<&BitMask>,
+) -> Result<Option<Vec<u8>>> {
+    if spec.n_masks > 1 {
+        return Err(LercError::WrongParam(
+            "one-sweep Lerc2 encode helper supports at most one shared mask",
+        ));
+    }
+    match (spec.n_masks, mask) {
+        (0, None) => Ok(None),
+        (0, Some(_)) => Err(LercError::WrongParam(
+            "Lerc2 encode mask count must be nonzero when a mask is supplied",
+        )),
+        (_, None) => Err(LercError::WrongParam(
+            "Lerc2 encode masks are required when n_masks is nonzero",
+        )),
+        (_, Some(mask)) => {
+            if mask.cols() != spec.n_cols || mask.rows() != spec.n_rows {
+                return Err(LercError::WrongParam(
+                    "Lerc2 encode mask dimensions do not match spec",
+                ));
+            }
+            Ok(Some(mask.to_byte_mask()))
+        }
+    }
 }
 
 /// Encodes Lerc2 data using the current uncompressed fallback strategy.
@@ -9503,6 +9541,38 @@ mod tests {
     }
 
     #[test]
+    fn encodes_one_sweep_lerc2_multi_band_blob_through_shared_mask_helper() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let blob = encode_lerc2_one_sweep(spec, &data, 0.5, Some(&mask), 6).unwrap();
+        let expected =
+            encode_lerc2_one_sweep_bands(spec, &data, 0.5, Some(&mask.to_byte_mask()), 6).unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(blob, expected);
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 1);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert_eq!(decoded.bands[0].mask, decoded.bands[1].mask);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![1, 0, 3, 5, 7, 0])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(vec![10, 0, 30, 50, 70, 0])
+        );
+    }
+
+    #[test]
     fn encodes_pre_v4_one_sweep_lerc2_blob_for_supported_decode_round_trip() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -10523,6 +10593,21 @@ mod tests {
         assert_eq!(
             encode_lerc2_one_sweep(spec, &data, -0.01, None, 6).unwrap_err(),
             LercError::WrongParam("negative max_z_error bit-plane encode requires integer data")
+        );
+        assert_eq!(
+            encode_lerc2_one_sweep(
+                EncodeSpec {
+                    n_bands: 2,
+                    n_masks: 2,
+                    ..spec
+                },
+                &[0; 32],
+                0.0,
+                None,
+                6,
+            )
+            .unwrap_err(),
+            LercError::WrongParam("one-sweep Lerc2 encode helper supports at most one shared mask")
         );
 
         let no_data_spec = EncodeSpec { n_depth: 2, ..spec };
