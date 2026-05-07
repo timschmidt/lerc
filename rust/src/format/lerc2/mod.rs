@@ -1474,6 +1474,53 @@ pub fn encode_lerc2_tiled_simple(
         micro_block_size,
         0,
         true,
+        None,
+    )
+}
+
+/// Encodes a single-band Lerc2 blob using simple bit-stuffed tiled payloads with no-data metadata.
+///
+/// This version 6+ helper expects `data` to already contain `no_data_value`
+/// wherever no-data should be represented. Pixels whose every depth equals the
+/// sentinel are marked invalid; mixed-depth sentinel samples are remapped to an
+/// internal sentinel when needed and restored during decode. Single-depth inputs
+/// use mask filtering only and do not write no-data metadata.
+pub fn encode_lerc2_tiled_simple_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    mask: Option<&BitMask>,
+    no_data_value: f64,
+    version: i32,
+    micro_block_size: i32,
+) -> Result<Vec<u8>> {
+    validate_single_band_encode_inputs(spec, data, mask, "simple tiled Lerc2 no-data encode")?;
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
+    if version < 6 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires version 6 or newer",
+        ));
+    }
+    let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
+    let prepared_data = prepared.data.as_slice();
+    let prepared_mask = prepared.mask.as_ref().or(mask);
+    encode_lerc2_tiled_simple_band(
+        EncodeSpec {
+            n_masks: usize::from(prepared_mask.is_some()),
+            ..spec
+        },
+        prepared_data,
+        max_z_error,
+        prepared_mask,
+        version,
+        micro_block_size,
+        0,
+        true,
+        if spec.n_depth > 1 {
+            prepared.no_data.or(Some((no_data_value, no_data_value)))
+        } else {
+            None
+        },
     )
 }
 
@@ -1706,6 +1753,7 @@ fn encode_lerc2_tiled_simple_band(
     micro_block_size: i32,
     n_blobs_more: i32,
     encode_partial_mask: bool,
+    no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "simple tiled Lerc2 encode")?;
     if !(2..=CURRENT_VERSION).contains(&version) {
@@ -1721,6 +1769,16 @@ fn encode_lerc2_tiled_simple_band(
     if !(1..=32).contains(&micro_block_size) {
         return Err(LercError::WrongParam(
             "Lerc2 simple tiled micro block size must be 1 through 32",
+        ));
+    }
+    if no_data.is_some() && version < 6 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires version 6 or newer",
+        ));
+    }
+    if no_data.is_some() && spec.n_depth <= 1 {
+        return Err(LercError::WrongParam(
+            "Lerc2 no-data encode requires depth greater than 1",
         ));
     }
 
@@ -1751,7 +1809,7 @@ fn encode_lerc2_tiled_simple_band(
         micro_block_size,
         blob_size: 1,
         n_blobs_more,
-        b_pass_no_data_values: 0,
+        b_pass_no_data_values: u8::from(no_data.is_some()),
         b_is_int: u8::from(data_values_are_integer(spec.data_type, data)?),
         b_reserved_3: 0,
         b_reserved_4: 0,
@@ -1759,8 +1817,8 @@ fn encode_lerc2_tiled_simple_band(
         max_z_error,
         z_min: if has_valid { z_min } else { 0.0 },
         z_max: if has_valid { z_max } else { 0.0 },
-        no_data_val: 0.0,
-        no_data_val_orig: 0.0,
+        no_data_val: no_data.map(|values| values.0).unwrap_or(0.0),
+        no_data_val_orig: no_data.map(|values| values.1).unwrap_or(0.0),
         header_size,
     };
 
@@ -2044,9 +2102,151 @@ pub fn encode_lerc2_tiled_simple_bands(
             micro_block_size,
             n_blobs_more,
             encode_mask,
+            None,
         )?;
         blob.extend_from_slice(&band_blob);
         previous_mask = mask;
+    }
+
+    Ok(blob)
+}
+
+/// Encodes band-major data as concatenated simple bit-stuffed tiled Lerc2 blobs with no-data metadata.
+///
+/// This helper carries version 6+ no-data metadata for bands whose
+/// `uses_no_data` entry is nonzero. The source data is expected to already
+/// contain the per-band no-data sentinel value wherever no-data should be
+/// represented. Single-depth sentinel pixels and all-depth multi-depth
+/// sentinel pixels are moved into the mask; mixed-depth sentinel samples are
+/// remapped to an internal sentinel when needed and restored during decode.
+pub fn encode_lerc2_tiled_simple_bands_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+    micro_block_size: i32,
+) -> Result<Vec<u8>> {
+    validate_encode_bands_inputs(spec, data, masks, "simple tiled Lerc2 band encode")?;
+    validate_negative_max_z_error_for_encode(spec.data_type, max_z_error)?;
+    if !(2..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam(
+            "simple tiled Lerc2 encode requires version 2 or newer",
+        ));
+    }
+    if version < 4 && spec.n_depth != 1 {
+        return Err(LercError::WrongParam(
+            "pre-v4 Lerc2 encode can only store depth 1",
+        ));
+    }
+    if !(1..=32).contains(&micro_block_size) {
+        return Err(LercError::WrongParam(
+            "Lerc2 simple tiled micro block size must be 1 through 32",
+        ));
+    }
+    validate_encode_no_data_inputs(spec, uses_no_data, no_data_values, version)?;
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(spec.n_masks > 0),
+        ..spec
+    };
+    let band_data_len = band_spec.data_byte_len()?;
+    let mask_len = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam(
+            "Lerc2 encode mask byte count overflow",
+        ))?;
+    let mut blob = Vec::new();
+    let mut previous_mask: Option<BitMask> = None;
+
+    for band in 0..spec.n_bands {
+        let data_start = band
+            .checked_mul(band_data_len)
+            .ok_or(LercError::WrongParam("Lerc2 encode band offset overflow"))?;
+        let mask = match masks {
+            Some(mask_bytes) if spec.n_masks == 1 => Some(BitMask::from_byte_mask(
+                &mask_bytes[..mask_len],
+                spec.n_cols,
+                spec.n_rows,
+            )?),
+            Some(mask_bytes) => {
+                let mask_start = band
+                    .checked_mul(mask_len)
+                    .ok_or(LercError::WrongParam("Lerc2 encode mask offset overflow"))?;
+                Some(BitMask::from_byte_mask(
+                    &mask_bytes[mask_start..mask_start + mask_len],
+                    spec.n_cols,
+                    spec.n_rows,
+                )?)
+            }
+            None => None,
+        };
+        let n_blobs_more = if version >= 6 {
+            i32::try_from(spec.n_bands - 1 - band)
+                .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
+        } else {
+            0
+        };
+        let no_data = uses_no_data
+            .and_then(|uses| uses.get(band).copied())
+            .filter(|&uses| uses != 0)
+            .and_then(|_| no_data_values.and_then(|values| values.get(band).copied()))
+            .map(|value| (value, value));
+        let band_data = &data[data_start..data_start + band_data_len];
+        let prepared = if let Some((_, no_data_orig)) = no_data {
+            Some(prepare_no_data_band_for_encode(
+                band_spec,
+                band_data,
+                mask.as_ref(),
+                no_data_orig,
+                max_z_error,
+            )?)
+        } else {
+            None
+        };
+        let prepared_data = prepared
+            .as_ref()
+            .map(|prepared| prepared.data.as_slice())
+            .unwrap_or(band_data);
+        let prepared_mask = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.mask.as_ref())
+            .or(mask.as_ref());
+        let prepared_no_data = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.no_data)
+            .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
+        let encode_mask = if band == 0 {
+            true
+        } else if spec.n_masks == 1 && prepared.is_none() {
+            false
+        } else {
+            match (prepared_mask, &previous_mask) {
+                (Some(mask), Some(previous)) => mask != previous,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        };
+        let band_blob = encode_lerc2_tiled_simple_band(
+            EncodeSpec {
+                n_masks: usize::from(prepared_mask.is_some()),
+                ..band_spec
+            },
+            prepared_data,
+            max_z_error,
+            prepared_mask,
+            version,
+            micro_block_size,
+            n_blobs_more,
+            encode_mask,
+            prepared_no_data,
+        )?;
+        blob.extend_from_slice(&band_blob);
+        previous_mask = prepared_mask.cloned();
     }
 
     Ok(blob)
@@ -6475,18 +6675,20 @@ mod tests {
         encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
         encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
-        encode_lerc2_tiled_simple, encode_lerc2_tiled_simple_bands, encode_lerc2_uncompressed,
-        encode_lerc2_uncompressed_with_no_data, extract_fpl_compressed_buffer,
-        finalize_lerc2_checksum, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-        get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_fp_huffman_slice,
-        read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_mask_with_previous,
-        read_lerc2_min_max_ranges, read_lerc2_min_max_ranges_with_previous,
-        read_lerc2_tiled_payload, read_lerc2_tiled_raw, restore_fp_byte_delta_sequence,
-        restore_fp_bytes_from_planes, try_lerc2_bit_plane_max_z_error,
-        try_raise_lerc2_float_max_z_error, validate_lerc2_checksum, write_huffman_code_table,
-        write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
-        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter,
-        MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        encode_lerc2_tiled_simple, encode_lerc2_tiled_simple_bands,
+        encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
+        encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data,
+        extract_fpl_compressed_buffer, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_fp_huffman_slice, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+        restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes,
+        try_lerc2_bit_plane_max_z_error, try_raise_lerc2_float_max_z_error,
+        validate_lerc2_checksum, write_huffman_code_table, write_lerc2_header, write_lerc2_mask,
+        write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw, DecodeIntoSpec,
+        FpPredictor, HeaderInfo, HuffmanBitWriter, MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN,
+        BLOB_INFO_ARRAY_LEN, FILE_KEY,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -9001,6 +9203,68 @@ mod tests {
         let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
         let blob =
             encode_lerc2_tiled_raw_with_no_data(spec, &data, 0.5, None, 255.0, 6, 2).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.micro_block_size, 2);
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
+        );
+    }
+
+    #[test]
+    fn encodes_simple_tiled_lerc2_bands_with_no_data_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
+        let blob = encode_lerc2_tiled_simple_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[255.0]),
+            6,
+            2,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        let no_data = get_lerc2_no_data_info(&blob, 1).unwrap();
+
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.micro_block_size, 2);
+        assert_eq!(decoded.header.no_data_val, 255.0);
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(decoded.mask.count_valid_bits(), 5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 255, 7, 8, 9, 10])
+        );
+        assert_eq!(no_data.uses_no_data, [1]);
+        assert_eq!(no_data.no_data_values, [255.0]);
+    }
+
+    #[test]
+    fn encodes_simple_tiled_lerc2_single_band_with_no_data_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 255, 255, 3, 4, 5, 255, 7, 8, 9, 10];
+        let blob =
+            encode_lerc2_tiled_simple_with_no_data(spec, &data, 0.5, None, 255.0, 6, 2).unwrap();
         let decoded = decode_lerc2_supported(&blob).unwrap();
 
         assert!(decoded.header.has_no_data_values());
