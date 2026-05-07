@@ -3119,12 +3119,12 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
     Ok(blob)
 }
 
-/// Encodes a single-band constant Lerc2 blob.
+/// Encodes one or more constant Lerc2 bands.
 ///
-/// This is the first narrow encode path: all valid pixels and depths are
-/// represented by the same scalar value, so the blob contains only a header and
-/// mask section. The returned blob is finalized with a valid checksum for
-/// version 3 and newer.
+/// All valid pixels and depths are represented by the same scalar value, so
+/// each band blob contains only a header and mask section. Multi-band output
+/// uses concatenated Lerc2 blobs with optional shared-mask reuse. The returned
+/// blob is finalized with valid checksums for version 3 and newer.
 pub fn encode_lerc2_constant(
     spec: EncodeSpec,
     value: f64,
@@ -3132,7 +3132,10 @@ pub fn encode_lerc2_constant(
     mask: Option<&BitMask>,
     version: i32,
 ) -> Result<Vec<u8>> {
-    encode_lerc2_constant_band(spec, value, max_z_error, mask, version, 0, true)
+    if spec.n_bands == 1 {
+        return encode_lerc2_constant_band(spec, value, max_z_error, mask, version, 0, true);
+    }
+    encode_lerc2_constant_repeated_bands(spec, value, max_z_error, mask, version)
 }
 
 /// Encodes band-major data as concatenated constant Lerc2 blobs.
@@ -3223,6 +3226,61 @@ pub fn encode_lerc2_constant_bands(
         )?;
         blob.extend_from_slice(&band_blob);
         previous_mask = mask;
+    }
+
+    Ok(blob)
+}
+
+fn encode_lerc2_constant_repeated_bands(
+    spec: EncodeSpec,
+    value: f64,
+    max_z_error: f64,
+    mask: Option<&BitMask>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    spec.validate()?;
+    if spec.n_masks > 1 {
+        return Err(LercError::WrongParam(
+            "constant Lerc2 repeated-band encode supports at most one shared mask",
+        ));
+    }
+    if mask.is_some() && spec.n_masks == 0 {
+        return Err(LercError::WrongParam(
+            "constant Lerc2 encode mask count must be nonzero when a mask is supplied",
+        ));
+    }
+    if let Some(mask) = mask {
+        if mask.cols() != spec.n_cols || mask.rows() != spec.n_rows {
+            return Err(LercError::WrongParam(
+                "Lerc2 encode mask dimensions do not match spec",
+            ));
+        }
+    }
+
+    let band_spec = EncodeSpec {
+        n_bands: 1,
+        n_masks: usize::from(mask.is_some()),
+        ..spec
+    };
+    let mut blob = Vec::new();
+    for band in 0..spec.n_bands {
+        let n_blobs_more = if version >= 6 {
+            i32::try_from(spec.n_bands - 1 - band)
+                .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?
+        } else {
+            0
+        };
+        let encode_mask = band == 0 && mask.is_some();
+        let band_blob = encode_lerc2_constant_band(
+            band_spec,
+            value,
+            max_z_error,
+            mask,
+            version,
+            n_blobs_more,
+            encode_mask,
+        )?;
+        blob.extend_from_slice(&band_blob);
     }
 
     Ok(blob)
@@ -8619,6 +8677,38 @@ mod tests {
     }
 
     #[test]
+    fn encodes_constant_lerc2_repeated_multi_band_blob() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 1,
+        };
+        let mask = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let blob = encode_lerc2_constant(spec, 7.0, 0.0, Some(&mask), 6).unwrap();
+        let expected_data = [7u8; 12];
+        let expected =
+            encode_lerc2_constant_bands(spec, &expected_data, 0.0, Some(&mask.to_byte_mask()), 6)
+                .unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(blob, expected);
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].header.n_blobs_more, 1);
+        assert_eq!(decoded.bands[1].header.n_blobs_more, 0);
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![7, 0, 7, 7, 7, 0])
+        );
+        assert_eq!(
+            decoded.bands[1].data,
+            DecodedData::UChar(vec![7, 0, 7, 7, 7, 0])
+        );
+    }
+
+    #[test]
     fn rejects_invalid_constant_lerc2_encode_inputs() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -8648,12 +8738,14 @@ mod tests {
 
         let multi_band = EncodeSpec {
             n_bands: 2,
-            n_masks: 1,
+            n_masks: 2,
             ..spec
         };
         assert_eq!(
             encode_lerc2_constant(multi_band, 1.0, 0.0, None, 6).unwrap_err(),
-            LercError::WrongParam("constant Lerc2 encode currently supports one band")
+            LercError::WrongParam(
+                "constant Lerc2 repeated-band encode supports at most one shared mask"
+            )
         );
     }
 
