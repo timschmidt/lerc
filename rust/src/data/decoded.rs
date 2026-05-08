@@ -267,12 +267,19 @@ pub fn decode_typed_values(data_type: DataType, bytes: &[u8]) -> Result<DecodedD
 ///
 /// This is the safe Rust equivalent of the C++ `Lerc::ConvertToDouble` helper:
 /// `bytes` contains contiguous scalar values of `data_type`, and converted
-/// values are written into `output`.
+/// values are written into `output`. Like the C++ helper, this converts scalar
+/// types smaller than `Double`; callers that already have double values can use
+/// the decoded data directly.
 pub fn convert_typed_bytes_to_f64(
     data_type: DataType,
     bytes: &[u8],
     output: &mut [f64],
 ) -> Result<usize> {
+    if bytes.is_empty() || data_type == DataType::Double {
+        return Err(LercError::WrongParam(
+            "ConvertToDouble requires non-empty non-double input",
+        ));
+    }
     let decoded = decode_typed_values(data_type, bytes)?;
     decoded.write_f64_values(output)
 }
@@ -440,14 +447,8 @@ mod tests {
         convert_typed_bytes_to_f64(DataType::UInt, &uint_bytes, &mut output).unwrap();
         assert_eq!(output, [0.0, u32::MAX as f64]);
 
-        let mut double_bytes = Vec::new();
-        for value in [-1.25f64, 2.5] {
-            double_bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        let mut output = [0.0; 2];
-        convert_typed_bytes_to_f64(DataType::Double, &double_bytes, &mut output).unwrap();
-        assert_eq!(output, [-1.25, 2.5]);
-
+        assert!(convert_typed_bytes_to_f64(DataType::UChar, &[], &mut output).is_err());
+        assert!(convert_typed_bytes_to_f64(DataType::Double, &[0; 8], &mut output).is_err());
         assert!(convert_typed_bytes_to_f64(DataType::Short, &[1], &mut output).is_err());
         assert!(convert_typed_bytes_to_f64(DataType::UShort, &[0, 1], &mut []).is_err());
     }

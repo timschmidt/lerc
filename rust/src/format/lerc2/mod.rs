@@ -4798,8 +4798,8 @@ fn read_mask(
         }
         mask = previous.clone();
     } else {
-        return Err(LercError::Unsupported(
-            "Lerc2 partial mask omitted; previous-mask reuse is not supported yet",
+        return Err(LercError::WrongParam(
+            "Lerc2 partial mask omitted; previous mask is required",
         ));
     }
 
@@ -5953,7 +5953,7 @@ fn read_tile_payload(
     match tile_mode {
         0 => {
             if diff_encoded {
-                return Err(LercError::Unsupported(
+                return Err(LercError::CorruptInput(
                     "Lerc2 raw binary diff tiles are invalid",
                 ));
             }
@@ -8132,6 +8132,61 @@ mod tests {
         fs::read(path).unwrap()
     }
 
+    const CPP_FLOAT_HUFFMAN_V6_32X32: &[u8] = &[
+        76, 101, 114, 99, 50, 32, 6, 0, 0, 0, 244, 72, 33, 115, 32, 0, 0, 0, 32, 0, 0, 0, 1, 0, 0,
+        0, 0, 4, 0, 0, 8, 0, 0, 0, 118, 2, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 39, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 65, 0, 3, 2, 0, 0, 6, 0, 0, 0, 1, 0, 0,
+        4, 0, 0, 1, 0, 6, 0, 0, 0, 1, 0, 0, 4, 0, 0, 2, 0, 7, 1, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 127, 0, 0, 0, 131, 127, 1, 0, 0, 3, 0, 0, 5, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 5, 0, 0, 4, 48, 16,
+        70, 0, 136, 160, 0, 0, 192, 76, 8, 33, 0, 224, 16, 66, 8, 65, 146, 36, 41, 132, 128, 146,
+        36, 73, 191, 191, 124, 12, 143, 1, 240, 255, 252, 255, 247, 151, 253, 229, 99, 0, 1, 48,
+        255, 255, 255, 247, 151, 143, 47, 31, 197, 252, 197, 249, 255, 239, 255, 239, 47, 31, 95,
+        62, 196, 249, 196, 243, 255, 223, 255, 223, 95, 62, 251, 203, 195, 243, 60, 124, 254, 255,
+        231, 255, 191, 191, 255, 247, 151, 195, 127, 57, 252, 252, 195, 207, 255, 127, 249, 255,
+        239, 47, 255, 254, 50, 252, 95, 194, 159, 255, 252, 243, 255, 223, 255, 255, 253, 37, 255,
+        247, 215, 63, 239, 175, 255, 252, 95, 255, 249, 255, 254, 231, 255, 191, 207, 255, 127,
+        191, 255, 255, 125, 253, 255, 251, 250, 63, 239, 245, 127, 254, 235, 255, 249, 255, 255,
+        243, 255, 223, 207, 255, 127, 215, 255, 255, 174, 255, 255, 91, 255, 159, 183, 254, 127,
+        254, 253, 255, 252, 255, 255, 243, 255, 95, 231, 255, 191, 250, 255, 255, 244, 255, 0, 224,
+        255, 159, 0, 0, 0, 0, 3, 0, 226, 0, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0, 124, 0, 0, 0, 2, 1, 0,
+        0, 131, 134, 45, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 1, 0, 208, 68, 0,
+        255, 254, 189, 133, 255, 255, 0, 255, 116, 202, 254, 255, 223, 255, 159, 254, 244, 255,
+        255, 255, 255, 233, 79, 167, 255, 255, 63, 253, 253, 233, 244, 255, 255, 167, 255, 63, 157,
+        254, 255, 255, 244, 255, 167, 63, 255, 255, 255, 255, 255, 167, 63, 253, 255, 255, 255,
+        244, 167, 63, 253, 255, 255, 255, 244, 255, 63, 253, 255, 255, 255, 244, 255, 167, 253,
+        255, 255, 255, 244, 255, 167, 63, 255, 255, 255, 255, 255, 63, 253, 255, 255, 255, 255,
+        167, 255, 233, 255, 255, 255, 255, 63, 253, 79, 255, 255, 255, 255, 255, 233, 255, 250,
+        255, 255, 255, 255, 79, 255, 127, 255, 255, 255, 255, 127, 250, 255, 211, 255, 255, 255,
+        255, 211, 255, 159, 254, 255, 255, 255, 255, 254, 255, 244, 255, 255, 255, 255, 159, 0,
+        128, 255, 255, 0, 0, 0, 0,
+    ];
+
+    const CPP_DOUBLE_HUFFMAN_V6_8X8X2: &[u8] = &[
+        76, 101, 114, 99, 50, 32, 6, 0, 0, 0, 135, 91, 194, 75, 8, 0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0,
+        64, 0, 0, 0, 8, 0, 0, 0, 8, 2, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 41, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 64, 0, 0, 0, 0, 0,
+        0, 5, 64, 0, 0, 0, 0, 0, 64, 41, 64, 0, 3, 2, 0, 0, 6, 0, 0, 0, 1, 0, 128, 0, 0, 0, 1, 0,
+        6, 0, 0, 0, 1, 0, 128, 0, 0, 0, 2, 0, 6, 0, 0, 0, 1, 0, 128, 0, 0, 0, 3, 0, 6, 0, 0, 0, 1,
+        0, 128, 0, 0, 0, 4, 0, 6, 0, 0, 0, 1, 0, 128, 0, 0, 0, 5, 0, 84, 0, 0, 0, 0, 4, 0, 0, 0, 0,
+        1, 0, 0, 128, 0, 0, 0, 1, 1, 0, 0, 130, 129, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 24, 100, 73, 146, 228, 146,
+        100, 73, 146, 73, 146, 100, 73, 100, 73, 146, 100, 146, 100, 73, 146, 72, 146, 100, 73, 0,
+        0, 0, 0, 6, 0, 129, 0, 0, 0, 2, 0, 36, 208, 48, 16, 240, 8, 8, 24, 248, 4, 12, 4, 12, 4,
+        12, 212, 56, 24, 248, 28, 244, 8, 8, 22, 250, 4, 12, 4, 12, 4, 12, 226, 42, 16, 240, 8, 8,
+        24, 248, 4, 12, 4, 12, 4, 12, 20, 252, 216, 52, 28, 244, 8, 8, 22, 250, 4, 12, 4, 12, 4,
+        12, 19, 253, 239, 45, 8, 8, 24, 248, 4, 12, 4, 12, 4, 12, 20, 252, 2, 14, 226, 42, 8, 8,
+        22, 250, 4, 12, 4, 12, 4, 12, 19, 253, 2, 14, 229, 39, 24, 248, 4, 12, 4, 12, 4, 12, 20,
+        252, 2, 14, 2, 14, 232, 36, 22, 250, 4, 12, 4, 12, 4, 12, 19, 253, 2, 14, 2, 14, 7, 0, 100,
+        0, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0, 192, 0, 0, 0, 65, 1, 0, 0, 131, 129, 3, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 4, 0, 0, 4, 44, 221, 223, 27, 136, 255, 222, 253,
+        189, 247, 245, 239, 93, 119, 255, 190, 251, 247, 239, 190, 127, 0, 0, 0, 192, 0, 0, 0, 0,
+    ];
+
     fn header_for_write(version: i32) -> HeaderInfo {
         let header_size = compute_lerc2_header_byte_len(version).unwrap();
         HeaderInfo {
@@ -8811,6 +8866,10 @@ mod tests {
         let blob = blob_with_written_header_and_mask(&header, Some(&previous), false);
 
         assert_eq!(blob.len(), header.header_size + 4);
+        assert_eq!(
+            read_lerc2_mask(&blob).unwrap_err(),
+            LercError::WrongParam("Lerc2 partial mask omitted; previous mask is required")
+        );
         let (_, mask_info) = read_lerc2_mask_with_previous(&blob, Some(&previous)).unwrap();
         assert_eq!(mask_info.mask, previous);
         assert_eq!(mask_info.num_bytes_mask, 0);
@@ -9368,6 +9427,146 @@ mod tests {
         let decoded = decode_lerc2_supported(&blob).unwrap();
         assert_eq!(decoded.bytes_consumed, blob.len());
         assert_eq!(decoded.data, DecodedData::Float(vec![1.0, 2.5]));
+    }
+
+    #[test]
+    fn decodes_cpp_float_huffman_fixture_supported_subset() {
+        let info = get_lerc2_header_info(CPP_FLOAT_HUFFMAN_V6_32X32).unwrap();
+        let header = &info.header;
+        assert_eq!(header.version, 6);
+        assert_eq!(header.data_type, DataType::Float);
+        assert_eq!((header.n_cols, header.n_rows, header.n_depth), (32, 32, 1));
+        assert_eq!(header.num_valid_pixel, 1024);
+        assert_eq!(header.max_z_error, 0.0);
+        assert_eq!(header.z_min, 0.0);
+
+        let payload_offset = CPP_FLOAT_HUFFMAN_V6_32X32
+            .windows(2)
+            .enumerate()
+            .skip(header.header_size)
+            .find_map(|(idx, bytes)| (bytes == [0, 3]).then_some(idx))
+            .unwrap();
+        assert_eq!(CPP_FLOAT_HUFFMAN_V6_32X32[payload_offset], 0);
+        assert_eq!(CPP_FLOAT_HUFFMAN_V6_32X32[payload_offset + 1], 3);
+
+        let decoded = decode_lerc2_supported(CPP_FLOAT_HUFFMAN_V6_32X32).unwrap();
+        let DecodedData::Float(values) = decoded.data else {
+            panic!("expected float decoded data");
+        };
+        assert_eq!(decoded.bytes_consumed, CPP_FLOAT_HUFFMAN_V6_32X32.len());
+        let ranges = decoded.ranges.as_ref().unwrap();
+        assert_eq!(ranges.mins, [0.0]);
+        assert_eq!(ranges.maxs, [11.625]);
+        assert_eq!(values.len(), 1024);
+        for (idx, expected) in [
+            (0, 0.0),
+            (1, 0.25),
+            (31, 7.75),
+            (32, 0.125),
+            (511, 9.625),
+            (512, 2.0),
+            (1023, 11.625),
+        ] {
+            assert_eq!(values[idx], expected);
+        }
+    }
+
+    #[test]
+    fn decodes_cpp_double_multi_depth_huffman_fixture_supported_subset() {
+        let info = get_lerc2_header_info(CPP_DOUBLE_HUFFMAN_V6_8X8X2).unwrap();
+        let header = &info.header;
+        assert_eq!(header.version, 6);
+        assert_eq!(header.data_type, DataType::Double);
+        assert_eq!((header.n_cols, header.n_rows, header.n_depth), (8, 8, 2));
+        assert_eq!(header.num_valid_pixel, 64);
+        assert_eq!(header.max_z_error, 0.0);
+        assert_eq!(header.z_min, 0.0);
+
+        let payload_offset = CPP_DOUBLE_HUFFMAN_V6_8X8X2
+            .windows(2)
+            .enumerate()
+            .skip(header.header_size)
+            .find_map(|(idx, bytes)| (bytes == [0, 3]).then_some(idx))
+            .unwrap();
+        assert_eq!(CPP_DOUBLE_HUFFMAN_V6_8X8X2[payload_offset], 0);
+        assert_eq!(CPP_DOUBLE_HUFFMAN_V6_8X8X2[payload_offset + 1], 3);
+
+        let decoded = decode_lerc2_supported(CPP_DOUBLE_HUFFMAN_V6_8X8X2).unwrap();
+        let DecodedData::Double(values) = decoded.data else {
+            panic!("expected double decoded data");
+        };
+        assert_eq!(decoded.bytes_consumed, CPP_DOUBLE_HUFFMAN_V6_8X8X2.len());
+        let ranges = decoded.ranges.as_ref().unwrap();
+        assert_eq!(ranges.mins, [0.0, 10.0]);
+        assert_eq!(ranges.maxs, [2.625, 12.625]);
+        assert_eq!(values.len(), 128);
+        for (idx, expected) in [
+            (0, 0.0),
+            (1, 10.0),
+            (2, 0.25),
+            (3, 10.25),
+            (14, 1.75),
+            (15, 11.75),
+            (16, 0.125),
+            (17, 10.125),
+            (126, 2.625),
+            (127, 12.625),
+        ] {
+            assert_eq!(values[idx], expected);
+        }
+    }
+
+    #[test]
+    fn c_abi_decodes_cpp_double_multi_depth_huffman_fixture() {
+        let mut data = vec![0.0f64; 8 * 8 * 2];
+        let mut mask = vec![0u8; 8 * 8];
+        let status = unsafe {
+            crate::ffi::lerc_decode_4D(
+                CPP_DOUBLE_HUFFMAN_V6_8X8X2.as_ptr(),
+                CPP_DOUBLE_HUFFMAN_V6_8X8X2.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                2,
+                8,
+                8,
+                1,
+                DataType::Double as u32,
+                data.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, crate::ErrCode::Ok as u32);
+        assert!(mask.iter().all(|&valid| valid == 1));
+
+        let mut as_double = vec![0.0f64; 8 * 8 * 2];
+        let status = unsafe {
+            crate::ffi::lerc_decodeToDouble_4D(
+                CPP_DOUBLE_HUFFMAN_V6_8X8X2.as_ptr(),
+                CPP_DOUBLE_HUFFMAN_V6_8X8X2.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                2,
+                8,
+                8,
+                1,
+                as_double.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, crate::ErrCode::Ok as u32);
+        assert_eq!(data, as_double);
+        for (idx, expected) in [
+            (0, 0.0),
+            (1, 10.0),
+            (16, 0.125),
+            (17, 10.125),
+            (126, 2.625),
+            (127, 12.625),
+        ] {
+            assert_eq!(data[idx], expected);
+        }
     }
 
     #[test]
@@ -13090,6 +13289,26 @@ mod tests {
                 other => panic!("expected byte decoded data, got {other:?}"),
             }
         }
+        for (idx, expected) in [
+            (0, [1, 4, 19]),
+            (1, [1, 4, 19]),
+            (255, [1, 4, 19]),
+            (256, [2, 5, 20]),
+            (32_768, [2, 5, 20]),
+            (43_008, [0, 0, 0]),
+            (65_535, [0, 0, 0]),
+        ] {
+            assert_eq!(
+                decoded.bands[0].mask.is_valid(idx).unwrap(),
+                expected != [0, 0, 0]
+            );
+            for (band, &value) in decoded.bands.iter().zip(expected.iter()) {
+                match &band.data {
+                    DecodedData::UChar(values) => assert_eq!(values[idx], value),
+                    other => panic!("expected byte decoded data, got {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -13189,6 +13408,16 @@ mod tests {
         blob[tile_start] = 6;
 
         assert!(read_lerc2_tiled_payload(&blob).is_err());
+    }
+
+    #[test]
+    fn rejects_v5_raw_binary_diff_tile_as_corrupt() {
+        let blob = synthetic_v5_diff_tiled_blob(vec![4]);
+
+        assert_eq!(
+            read_lerc2_tiled_payload(&blob).unwrap_err(),
+            LercError::CorruptInput("Lerc2 raw binary diff tiles are invalid")
+        );
     }
 
     #[test]

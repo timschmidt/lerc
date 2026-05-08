@@ -121,7 +121,7 @@ pub enum LercError {
     HasNoData,
     /// Encoded input is malformed or internally inconsistent.
     CorruptInput(&'static str),
-    /// The input requires a codec feature not ported yet.
+    /// The requested safe helper does not support this blob or payload mode.
     Unsupported(&'static str),
 }
 

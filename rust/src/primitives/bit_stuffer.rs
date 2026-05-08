@@ -538,6 +538,46 @@ mod tests {
     }
 
     #[test]
+    fn simple_bit_stuffing_matches_cpp_streams() {
+        let data = [3, 1, 4, 1, 5, 9, 2, 6];
+
+        let v3 = BitStuffer2::encode_simple(&data, 3).unwrap();
+        assert_eq!(v3, [132, 8, 19, 20, 149, 98]);
+        let (decoded, consumed) = BitStuffer2::decode(&v3, data.len(), 3).unwrap();
+        assert_eq!(consumed, v3.len());
+        assert_eq!(decoded, data);
+
+        let v2 = BitStuffer2::encode_simple(&data, 2).unwrap();
+        assert_eq!(v2, [132, 8, 38, 89, 65, 49]);
+        let (decoded, consumed) = BitStuffer2::decode(&v2, data.len(), 2).unwrap();
+        assert_eq!(consumed, v2.len());
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn simple_bit_stuffing_matches_cpp_cross_word_streams() {
+        let data = [0, 1, 31, 7, 12, 29, 3, 16, 18, 5, 24, 11, 30, 2, 14, 21, 9];
+
+        let v3 = BitStuffer2::encode_simple(&data, 3).unwrap();
+        assert_eq!(
+            v3,
+            [133, 17, 32, 252, 195, 250, 128, 178, 224, 229, 133, 171, 9]
+        );
+        let (decoded, consumed) = BitStuffer2::decode(&v3, data.len(), 3).unwrap();
+        assert_eq!(consumed, v3.len());
+        assert_eq!(decoded, data);
+
+        let v2 = BitStuffer2::encode_simple(&data, 2).unwrap();
+        assert_eq!(
+            v2,
+            [133, 17, 116, 118, 126, 0, 191, 112, 145, 112, 72, 213, 9]
+        );
+        let (decoded, consumed) = BitStuffer2::decode(&v2, data.len(), 2).unwrap();
+        assert_eq!(consumed, v2.len());
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
     fn lut_round_trips_sparse_values() {
         let data = [0, 0, 9, 42, 9, 0, 42, 1000, 9, 1000];
         let mut sorted: Vec<(u32, u32)> = data
@@ -566,6 +606,29 @@ mod tests {
         let encoded = BitStuffer2::encode_lut(&sorted, 2).unwrap();
         let (decoded, consumed) = BitStuffer2::decode(&encoded, data.len(), 2).unwrap();
         assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn lut_bit_stuffing_matches_cpp_streams() {
+        let data = [0, 0, 9, 42, 9, 0, 42, 1000, 9, 1000];
+        let mut sorted: Vec<(u32, u32)> = data
+            .iter()
+            .enumerate()
+            .map(|(idx, &value)| (value, idx as u32))
+            .collect();
+        sorted.sort_unstable();
+
+        let v3 = BitStuffer2::encode_lut(&sorted, 3).unwrap();
+        assert_eq!(v3, [170, 10, 4, 9, 168, 128, 62, 144, 225, 13]);
+        let (decoded, consumed) = BitStuffer2::decode(&v3, data.len(), 3).unwrap();
+        assert_eq!(consumed, v3.len());
+        assert_eq!(decoded, data);
+
+        let v2 = BitStuffer2::encode_lut(&sorted, 2).unwrap();
+        assert_eq!(v2, [170, 10, 4, 160, 175, 66, 2, 112, 75, 6]);
+        let (decoded, consumed) = BitStuffer2::decode(&v2, data.len(), 2).unwrap();
+        assert_eq!(consumed, v2.len());
         assert_eq!(decoded, data);
     }
 

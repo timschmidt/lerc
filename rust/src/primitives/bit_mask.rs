@@ -242,6 +242,29 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpp_larger_bit_mask_conversions_with_padding() {
+        let bytes = [
+            1, 0, 2, 0, 3, 4, 0, 5, 0, 0, 6, 7, 0, 8, 0, 9, 10, 0, 11, 0, 12,
+        ];
+        let mask = BitMask::from_byte_mask(&bytes, 7, 3).unwrap();
+
+        assert_eq!(mask.bits(), &[173, 53, 175]);
+        assert_eq!(mask.count_valid_bits(), 12);
+        assert_eq!(
+            mask.to_byte_mask(),
+            [1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1]
+        );
+
+        let mut raw = BitMask::new(7, 3).unwrap();
+        raw.bits_mut().copy_from_slice(&[170, 85, 227]);
+        assert_eq!(raw.count_valid_bits(), 11);
+        assert_eq!(
+            raw.to_byte_mask(),
+            [1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0]
+        );
+    }
+
+    #[test]
     fn rejects_invalid_dimensions_and_indexes() {
         assert!(BitMask::new(0, 3).is_err());
         assert!(BitMask::from_byte_mask(&[1, 0], 3, 1).is_err());

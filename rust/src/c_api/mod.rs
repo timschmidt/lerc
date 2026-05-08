@@ -1477,6 +1477,80 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_metadata_matches_cpp_fixture_expectations() {
+        for (
+            fixture_name,
+            expected_info,
+            expected_ranges,
+            n_depth,
+            n_bands,
+            expected_mins,
+            expected_maxs,
+        ) in [
+            (
+                "california_400_400_1_float.lerc2",
+                [3, 6, 1, 400, 400, 1, 58515, 176451, 1, 1, 0],
+                [-82.972_091_674_804_69, 4080.613_769_531_25, 0.000_075],
+                1,
+                1,
+                vec![-82.972_091_674_804_69],
+                vec![4080.613_769_531_25],
+            ),
+            (
+                "bluemarble_256_256_3_byte.lerc2",
+                [3, 1, 1, 256, 256, 3, 43008, 56389, 1, 1, 0],
+                [0.0, 255.0, 0.5],
+                1,
+                3,
+                vec![0.0, 0.0, 0.0],
+                vec![255.0, 255.0, 255.0],
+            ),
+            (
+                "world.lerc1",
+                [0, 6, 1, 257, 257, 1, 65025, 63518, 1, 1, 0],
+                [-27.458_635_330_200_195, 5474.172_851_562_5, 0.1],
+                1,
+                1,
+                vec![-27.458_635_330_200_195],
+                vec![5474.172_851_562_5],
+            ),
+        ] {
+            let blob = fixture(fixture_name);
+            let mut info = [0u32; BLOB_INFO_ARRAY_LEN];
+            let mut ranges = [0.0f64; BLOB_DATA_RANGE_ARRAY_LEN];
+            let status = unsafe {
+                lerc_getBlobInfo(
+                    blob.as_ptr(),
+                    blob.len() as u32,
+                    info.as_mut_ptr(),
+                    ranges.as_mut_ptr(),
+                    info.len() as i32,
+                    ranges.len() as i32,
+                )
+            };
+            assert_eq!(status, ErrCode::Ok as u32, "{fixture_name}");
+            assert_eq!(info, expected_info, "{fixture_name}");
+            assert_eq!(ranges, expected_ranges, "{fixture_name}");
+
+            let mut mins = vec![123.0; expected_mins.len()];
+            let mut maxs = vec![123.0; expected_maxs.len()];
+            let status = unsafe {
+                lerc_getDataRanges(
+                    blob.as_ptr(),
+                    blob.len() as u32,
+                    n_depth,
+                    n_bands,
+                    mins.as_mut_ptr(),
+                    maxs.as_mut_ptr(),
+                )
+            };
+            assert_eq!(status, ErrCode::Ok as u32, "{fixture_name}");
+            assert_eq!(mins, expected_mins, "{fixture_name}");
+            assert_eq!(maxs, expected_maxs, "{fixture_name}");
+        }
+    }
+
+    #[test]
     fn c_abi_get_blob_info_rejects_invalid_arguments() {
         let blob = fixture("bluemarble_256_256_3_byte.lerc2");
         let mut info = [0u32; BLOB_INFO_ARRAY_LEN];
@@ -3285,6 +3359,21 @@ mod tests {
         assert_eq!(status, ErrCode::Ok as u32);
         assert_eq!(mask.iter().filter(|&&value| value != 0).count(), 43_008);
         assert_eq!(data, expected_data);
+        for (idx, expected) in [
+            (0, [1, 4, 19]),
+            (1, [1, 4, 19]),
+            (255, [1, 4, 19]),
+            (256, [2, 5, 20]),
+            (32_768, [2, 5, 20]),
+            (43_008, [0, 0, 0]),
+            (65_535, [0, 0, 0]),
+        ] {
+            assert_eq!(mask[idx], u8::from(expected != [0, 0, 0]));
+            assert_eq!(
+                [data[idx], data[256 * 256 + idx], data[2 * 256 * 256 + idx]],
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3315,6 +3404,20 @@ mod tests {
         let (z_min, z_max) = min_max_valid_f32(&data, &mask);
         assert_eq!(z_min, -27.458_635);
         assert_eq!(z_max, 5474.173);
+        for (idx, valid, expected) in [
+            (0, 0, 0.0),
+            (1, 0, 0.0),
+            (257, 0, 0.0),
+            (1024, 1, 0.0),
+            (33_025, 1, 0.0),
+            (40_000, 1, 0.0),
+            (24_838, 1, -27.458_635),
+            (26_400, 1, 5474.173),
+            (66_048, 0, 0.0),
+        ] {
+            assert_eq!(mask[idx], valid);
+            assert!((data[idx] - expected).abs() < 0.000_5);
+        }
     }
 
     #[test]

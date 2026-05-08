@@ -311,6 +311,37 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpp_mixed_literal_and_repeated_run_stream() {
+        let input = [1, 2, 2, 2, 2, 2, 3, 4, 4, 4, 4, 4, 5];
+        let cpp_encoded = [
+            1, 0, // one literal byte
+            1, 251, 255, // five repeated bytes: value 2
+            2, 1, 0, // one literal byte
+            3, 251, 255, // five repeated bytes: value 4
+            4, 1, 0, // one literal byte
+            5, 0, 128, // EOF count
+        ];
+
+        assert_eq!(Rle::compute_num_bytes(&input), cpp_encoded.len());
+        assert_eq!(Rle::compress(&input).unwrap(), cpp_encoded);
+        assert_eq!(Rle::decompress(&cpp_encoded).unwrap(), input);
+    }
+
+    #[test]
+    fn matches_cpp_repeated_run_short_counter_split() {
+        let input = vec![42; 32770];
+        let cpp_encoded = [
+            1, 128, // repeated count: -32767i16
+            42, 253, 255, // repeated count: -3i16
+            42, 0, 128, // EOF count
+        ];
+
+        assert_eq!(Rle::compute_num_bytes(&input), cpp_encoded.len());
+        assert_eq!(Rle::compress(&input).unwrap(), cpp_encoded);
+        assert_eq!(Rle::decompress(&cpp_encoded).unwrap(), input);
+    }
+
+    #[test]
     fn round_trips_counter_boundaries() {
         let mut input = vec![42; 32770];
         input.extend((0..512).map(|i| (i & 0xff) as u8));
