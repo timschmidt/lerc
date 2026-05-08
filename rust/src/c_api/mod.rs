@@ -714,6 +714,10 @@ fn normalize_encode_version(codec_version: i32) -> core::result::Result<i32, Err
     }
 }
 
+fn c_api_float_bit_plane_cheat_should_fail(spec: EncodeSpec, max_z_err: f64) -> bool {
+    max_z_err == 777.0 && matches!(spec.data_type, DataType::Float | DataType::Double)
+}
+
 unsafe fn try_encode_supported_blob(
     p_data: *const c_void,
     spec: EncodeSpec,
@@ -760,6 +764,9 @@ unsafe fn try_encode_supported_blob(
                     "active no-data encode requires version 6 or newer",
                 ));
             }
+            if c_api_float_bit_plane_cheat_should_fail(spec, max_z_err) {
+                return Ok(None);
+            }
             let prepared_nan = prepare_active_no_data_nan_encode_inputs(
                 spec,
                 data,
@@ -787,6 +794,10 @@ unsafe fn try_encode_supported_blob(
             )
             .map(Some);
         }
+    }
+
+    if c_api_float_bit_plane_cheat_should_fail(spec, max_z_err) {
+        return Ok(None);
     }
 
     let prepared_nan = prepare_nan_encode_inputs(spec, data, mask_bytes)?;
@@ -3105,6 +3116,165 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_integer_encode_honors_cpp_bit_plane_cheat_max_z_error() {
+        let values = [12u16; 4];
+        let data = values
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut computed_size = 0u32;
+        let mut out = [0u8; 256];
+        let mut written = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UShort as u32,
+                1,
+                2,
+                2,
+                1,
+                0,
+                std::ptr::null(),
+                777.0,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UShort as u32,
+                1,
+                2,
+                2,
+                1,
+                0,
+                std::ptr::null(),
+                777.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        let header = crate::get_lerc2_header_info(&out[..written as usize])
+            .unwrap()
+            .header;
+        assert_eq!(header.max_z_error, 0.5);
+    }
+
+    #[test]
+    fn c_abi_float_encode_returns_failed_for_cpp_bit_plane_cheat_max_z_error() {
+        let values = [1.0f32, 2.0, 3.0, 4.0];
+        let data = values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut computed_size = 123u32;
+        let mut out = [99u8; 128];
+        let mut written = 123u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                2,
+                2,
+                1,
+                0,
+                ptr::null(),
+                777.0,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                2,
+                2,
+                1,
+                0,
+                ptr::null(),
+                777.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Failed as u32);
+        assert_eq!(computed_size, 0);
+        assert_eq!(encode_status, ErrCode::Failed as u32);
+        assert_eq!(written, 0);
+        assert!(out.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn c_abi_active_no_data_float_encode_returns_failed_for_cpp_bit_plane_cheat_max_z_error() {
+        let values = [1.0f32, -9999.0, 3.0, 4.0];
+        let data = values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let uses_no_data = [1u8];
+        let no_data_values = [-9999.0f64];
+        let mut computed_size = 123u32;
+        let mut out = [99u8; 128];
+        let mut written = 123u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                2,
+                2,
+                1,
+                1,
+                0,
+                ptr::null(),
+                777.0,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                2,
+                2,
+                1,
+                1,
+                0,
+                ptr::null(),
+                777.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Failed as u32);
+        assert_eq!(computed_size, 0);
+        assert_eq!(encode_status, ErrCode::Failed as u32);
+        assert_eq!(written, 0);
+        assert!(out.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
     fn c_abi_encode_rejects_float_negative_max_z_error() {
         let data = [1.0f32, 1.25, 1.5, 1.75]
             .into_iter()
@@ -3879,6 +4049,47 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_decode_legacy_lerc1_shape_mismatch_returns_failed_like_cpp() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![0u8; 256 * 257 * 4];
+        let mut mask = vec![0u8; 256 * 257];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                256,
+                257,
+                1,
+                DataType::Float as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                256,
+                257,
+                1,
+                DataType::Float as u32,
+                data.as_mut_ptr().cast(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+    }
+
+    #[test]
     fn c_abi_decode_to_double_writes_data_and_mask() {
         let blob = synthetic_v4_const_blob();
         let mut data = [0.0f64; 6];
@@ -3985,6 +4196,45 @@ mod tests {
                 1,
                 2,
                 2,
+                1,
+                data.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_legacy_lerc1_shape_mismatch_returns_failed_like_cpp() {
+        let blob = fixture("world.lerc1");
+        let mut data = vec![0.0f64; 256 * 257];
+        let mut mask = vec![0u8; 256 * 257];
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                256,
+                257,
+                1,
+                data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+
+        let status = unsafe {
+            lerc_decodeToDouble_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                256,
+                257,
                 1,
                 data.as_mut_ptr(),
                 ptr::null_mut(),

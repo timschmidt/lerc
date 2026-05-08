@@ -27,6 +27,8 @@ pub const BLOB_INFO_ARRAY_LEN: usize = 11;
 /// Number of doubles currently produced by the C API data-range summary array.
 pub const BLOB_DATA_RANGE_ARRAY_LEN: usize = 3;
 const CHECKSUM_START_OFFSET: usize = FILE_KEY.len() + 4 + 4;
+const BIT_PLANE_CHEAT_MAX_Z_ERROR: f64 = 777.0;
+const BIT_PLANE_CHEAT_EPSILON: f64 = -0.01;
 #[allow(dead_code)]
 const FP_MAX_DELTA: u8 = 5;
 #[allow(dead_code)]
@@ -3917,8 +3919,10 @@ fn encode_lerc2_constant_band(
         ));
     }
     max_z_error = normalize_constant_lerc2_max_z_error_for_encode(spec.data_type, max_z_error)?;
-    if !(0..=CURRENT_VERSION).contains(&version) {
-        return Err(LercError::WrongParam("unsupported Lerc2 encode version"));
+    if !(2..=CURRENT_VERSION).contains(&version) {
+        return Err(LercError::WrongParam(
+            "constant Lerc2 encode requires version 2 or newer",
+        ));
     }
     if version < 4 && spec.n_depth != 1 {
         return Err(LercError::WrongParam(
@@ -5267,8 +5271,11 @@ fn normalize_lerc2_max_z_error_for_encode(
     spec: EncodeSpec,
     data: &[u8],
     mask: &BitMask,
-    max_z_error: f64,
+    mut max_z_error: f64,
 ) -> Result<f64> {
+    if max_z_error == BIT_PLANE_CHEAT_MAX_Z_ERROR {
+        max_z_error = BIT_PLANE_CHEAT_EPSILON;
+    }
     if max_z_error >= 0.0 {
         if is_integer_data_type(spec.data_type) {
             return Ok(max_z_error.floor().max(0.5));
@@ -5288,8 +5295,11 @@ fn normalize_lerc2_max_z_error_for_encode(
 
 fn normalize_constant_lerc2_max_z_error_for_encode(
     data_type: DataType,
-    max_z_error: f64,
+    mut max_z_error: f64,
 ) -> Result<f64> {
+    if max_z_error == BIT_PLANE_CHEAT_MAX_Z_ERROR {
+        max_z_error = BIT_PLANE_CHEAT_EPSILON;
+    }
     if is_integer_data_type(data_type) {
         return Ok(max_z_error.floor().max(0.5));
     }
@@ -10540,6 +10550,33 @@ mod tests {
     }
 
     #[test]
+    fn integer_encode_honors_cpp_bit_plane_cheat_max_z_error() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let constant = encode_lerc2_constant(spec, 12.0, 777.0, None, 6).unwrap();
+        assert_eq!(
+            get_lerc2_header_info(&constant).unwrap().header.max_z_error,
+            0.5
+        );
+
+        let values = [1u16, 2, 3, 4]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let tiled = encode_lerc2_tiled_raw(spec, &values, 777.0, None, 6, 2).unwrap();
+        assert_eq!(
+            get_lerc2_header_info(&tiled).unwrap().header.max_z_error,
+            0.5
+        );
+    }
+
+    #[test]
     fn rejects_invalid_constant_lerc2_encode_inputs() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
@@ -10553,6 +10590,10 @@ mod tests {
         assert_eq!(
             get_lerc2_header_info(&negative).unwrap().header.max_z_error,
             0.5
+        );
+        assert_eq!(
+            encode_lerc2_constant(spec, 1.0, 0.0, None, 1).unwrap_err(),
+            LercError::WrongParam("constant Lerc2 encode requires version 2 or newer")
         );
         assert_eq!(
             encode_lerc2_constant(spec, 1.0, 0.0, None, 3).unwrap_err(),
