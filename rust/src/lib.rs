@@ -64,13 +64,14 @@ pub mod primitives;
 mod support;
 
 pub use api::{
-    blob_info, compute_compressed_size, compute_compressed_size_4d,
-    compute_compressed_size_4d_for_version, compute_compressed_size_for_version, convert_to_double,
-    convert_to_double_into, data_ranges, decode, decode_4d_into, decode_4d_into_buffers,
-    decode_4d_to_f64, decode_4d_to_f64_into, decode_into, decode_into_buffers, decode_to_f64,
-    decode_to_f64_into, encode, encode_4d, encode_4d_for_version, encode_4d_into,
-    encode_4d_into_for_version, encode_for_version, encode_into, encode_into_for_version,
-    no_data_info, Decoded4DBuffer, DecodedBuffer, DecodedLerc, DEFAULT_CODEC_VERSION,
+    blob_info, blob_info_arrays_into, blob_info_with_ranges_into, compute_compressed_size,
+    compute_compressed_size_4d, compute_compressed_size_4d_for_version,
+    compute_compressed_size_for_version, convert_to_double, convert_to_double_into, data_ranges,
+    data_ranges_into, decode, decode_4d_into, decode_4d_into_buffers, decode_4d_to_f64,
+    decode_4d_to_f64_into, decode_into, decode_into_buffers, decode_to_f64, decode_to_f64_into,
+    encode, encode_4d, encode_4d_for_version, encode_4d_into, encode_4d_into_for_version,
+    encode_for_version, encode_into, encode_into_for_version, no_data_info, Decoded4DBuffer,
+    DecodedBuffer, DecodedLerc, DEFAULT_CODEC_VERSION,
 };
 pub use c_api as ffi;
 pub use data::decoded;
@@ -92,9 +93,9 @@ pub use lerc2::{
     decode_lerc_supported_to_f64, encode_lerc2_auto, encode_lerc2_auto_with_no_data,
     encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
     encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
-    encode_lerc2_constant, encode_lerc2_float_huffman, encode_lerc2_float_huffman_bands,
-    encode_lerc2_float_huffman_bands_with_no_data, encode_lerc2_float_huffman_with_no_data,
-    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+    encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_float_huffman,
+    encode_lerc2_float_huffman_bands, encode_lerc2_float_huffman_bands_with_no_data,
+    encode_lerc2_float_huffman_with_no_data, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
     encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
     encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
     encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,

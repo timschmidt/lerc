@@ -2,20 +2,21 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    blob_info, compute_checksum_fletcher32, compute_compressed_size, compute_compressed_size_4d,
-    compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
-    compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-    compute_lerc2_tiled_raw_byte_len, convert_to_double_into, convert_typed_bytes_to_f64,
-    data_ranges, decode, decode_4d_into, decode_4d_into_buffers, decode_4d_to_f64,
-    decode_4d_to_f64_into, decode_into, decode_into_buffers, decode_lerc1,
-    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_to_f64, decode_to_f64_into,
-    decode_typed_values, encode, encode_4d, encode_4d_into, encode_into, encode_lerc2_auto,
-    encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_constant,
-    encode_lerc2_float_huffman, encode_lerc2_float_huffman_with_no_data, encode_lerc2_one_sweep,
-    encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut,
-    encode_lerc2_tiled_lut_bands, encode_lerc2_tiled_lut_bands_with_no_data,
-    encode_lerc2_tiled_lut_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+    blob_info, blob_info_arrays_into, blob_info_with_ranges_into, compute_checksum_fletcher32,
+    compute_compressed_size, compute_compressed_size_4d, compute_lerc2_header_byte_len,
+    compute_lerc2_mask_byte_len, compute_lerc2_min_max_ranges_byte_len,
+    compute_lerc2_one_sweep_byte_len, compute_lerc2_tiled_raw_byte_len, convert_to_double_into,
+    convert_typed_bytes_to_f64, data_ranges, data_ranges_into, decode, decode_4d_into,
+    decode_4d_into_buffers, decode_4d_to_f64, decode_4d_to_f64_into, decode_into,
+    decode_into_buffers, decode_lerc1, decode_lerc2_bands_supported, decode_lerc2_supported,
+    decode_lerc2_supported_into, decode_lerc_supported_into, decode_lerc_supported_to_f64,
+    decode_to_f64, decode_to_f64_into, decode_typed_values, encode, encode_4d, encode_4d_into,
+    encode_into, encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
+    encode_lerc2_constant, encode_lerc2_float_huffman, encode_lerc2_float_huffman_with_no_data,
+    encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data,
+    encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+    encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
+    encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
     encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
     encode_lerc2_tiled_simple, encode_lerc2_tiled_simple_bands,
     encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
@@ -73,8 +74,8 @@ fn main() {
     .unwrap();
     let mut blob_info_array = [0u32; 11];
     let mut blob_range_array = [0.0f64; 3];
-    let mut data_range_mins = [0.0f64; 3];
-    let mut data_range_maxs = [0.0f64; 3];
+    let mut data_range_mins = [0.0f64; 4];
+    let mut data_range_maxs = [0.0f64; 4];
     let min_max_blob = synthetic_v4_min_max_blob();
     let one_sweep_blob = synthetic_v4_one_sweep_blob();
     let mut one_sweep_bands_blob = one_sweep_blob.clone();
@@ -547,6 +548,18 @@ fn main() {
     bench("lerc2-info-aggregate-3-band", 50_000, || {
         black_box(get_lerc_info(black_box(&lerc2_blob)).unwrap());
     });
+    let lerc2_info = get_lerc_info(&lerc2_blob).unwrap();
+    bench("lerc2-info-allocation-helpers-3-band", 100_000, || {
+        black_box(lerc2_info.range_count().unwrap());
+        black_box(lerc2_info.value_count().unwrap());
+        black_box(lerc2_info.native_data_byte_len().unwrap());
+        black_box(lerc2_info.mask_byte_len().unwrap());
+        black_box(
+            lerc2_info
+                .decode_spec(DataType::UChar, lerc2_info.n_masks as usize)
+                .unwrap(),
+        );
+    });
     bench("lerc2-blob-info-arrays-3-band", 50_000, || {
         black_box(
             get_lerc2_blob_info_arrays(
@@ -624,8 +637,42 @@ fn main() {
     bench("api-blob-info-v4-synthetic", 100_000, || {
         black_box(blob_info(black_box(&one_sweep_bands_blob)).unwrap());
     });
+    bench("api-blob-info-arrays-v4-synthetic", 100_000, || {
+        black_box(
+            blob_info_arrays_into(
+                black_box(&one_sweep_bands_blob),
+                Some(black_box(&mut blob_info_array)),
+                Some(black_box(&mut blob_range_array)),
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-blob-info-with-ranges-v4-synthetic", 100_000, || {
+        black_box(
+            blob_info_with_ranges_into(
+                black_box(&one_sweep_bands_blob),
+                2,
+                2,
+                black_box(&mut data_range_mins),
+                black_box(&mut data_range_maxs),
+            )
+            .unwrap(),
+        );
+    });
     bench("api-data-ranges-v4-synthetic", 100_000, || {
         black_box(data_ranges(black_box(&one_sweep_bands_blob)).unwrap());
+    });
+    bench("api-data-ranges-into-v4-synthetic", 100_000, || {
+        black_box(
+            data_ranges_into(
+                black_box(&one_sweep_bands_blob),
+                2,
+                2,
+                black_box(&mut data_range_mins),
+                black_box(&mut data_range_maxs),
+            )
+            .unwrap(),
+        );
     });
     bench("api-no-data-info-v6-synthetic", 100_000, || {
         black_box(no_data_info(black_box(&one_sweep_no_data_blob), 1).unwrap());

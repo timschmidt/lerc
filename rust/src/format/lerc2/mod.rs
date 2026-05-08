@@ -239,6 +239,105 @@ pub struct LercInfo {
     pub max_z_error: f64,
 }
 
+impl LercInfo {
+    /// Returns the number of per-band/per-depth range entries.
+    ///
+    /// This is the size required by `lerc_getDataRanges`-style min/max arrays:
+    /// `n_depth * n_bands`.
+    pub fn range_count(&self) -> Result<usize> {
+        let n_depth = positive_i32_to_usize(self.n_depth, "LERC info depth must be positive")?;
+        let n_bands = positive_i32_to_usize(self.n_bands, "LERC info band count must be positive")?;
+        n_depth
+            .checked_mul(n_bands)
+            .ok_or(LercError::WrongParam("LERC info range count overflow"))
+    }
+
+    /// Returns the number of decoded scalar values described by this metadata.
+    ///
+    /// The returned count is `n_depth * n_cols * n_rows * n_bands`.
+    pub fn value_count(&self) -> Result<usize> {
+        let n_depth = positive_i32_to_usize(self.n_depth, "LERC info depth must be positive")?;
+        let n_cols = positive_i32_to_usize(self.n_cols, "LERC info column count must be positive")?;
+        let n_rows = positive_i32_to_usize(self.n_rows, "LERC info row count must be positive")?;
+        let n_bands = positive_i32_to_usize(self.n_bands, "LERC info band count must be positive")?;
+
+        n_depth
+            .checked_mul(n_cols)
+            .and_then(|count| count.checked_mul(n_rows))
+            .and_then(|count| count.checked_mul(n_bands))
+            .ok_or(LercError::WrongParam("LERC info value count overflow"))
+    }
+
+    /// Returns the decoded byte count for the native blob data type.
+    pub fn native_data_byte_len(&self) -> Result<usize> {
+        self.data_byte_len_as(self.data_type)
+    }
+
+    /// Returns the decoded byte count for a caller-requested output data type.
+    pub fn data_byte_len_as(&self, data_type: DataType) -> Result<usize> {
+        self.value_count()?
+            .checked_mul(data_type.size_in_bytes())
+            .ok_or(LercError::WrongParam("LERC info data byte count overflow"))
+    }
+
+    /// Returns the byte count for `n_masks` row-major byte masks.
+    ///
+    /// Pass this metadata object's [`Self::n_masks`] to allocate the mask output
+    /// requested by the blob, or pass a smaller C API-compatible request such
+    /// as `0` when masks are not needed.
+    pub fn mask_byte_len_for(&self, n_masks: usize) -> Result<usize> {
+        positive_i32_to_usize(self.n_cols, "LERC info column count must be positive")?
+            .checked_mul(positive_i32_to_usize(
+                self.n_rows,
+                "LERC info row count must be positive",
+            )?)
+            .and_then(|count| count.checked_mul(n_masks))
+            .ok_or(LercError::WrongParam("LERC info mask byte count overflow"))
+    }
+
+    /// Returns the byte count for the masks reported by this metadata object.
+    pub fn mask_byte_len(&self) -> Result<usize> {
+        let n_masks = nonnegative_i32_to_usize(self.n_masks, "LERC info mask count is negative")?;
+        self.mask_byte_len_for(n_masks)
+    }
+
+    /// Builds a decode request from this metadata.
+    ///
+    /// `data_type` selects the caller-requested output scalar type. `n_masks`
+    /// is the number of masks the caller wants returned: `0`, `1`, or
+    /// `self.n_bands`, matching the public C API decode contract.
+    pub fn decode_spec(&self, data_type: DataType, n_masks: usize) -> Result<DecodeIntoSpec> {
+        let n_bands = positive_i32_to_usize(self.n_bands, "LERC info band count must be positive")?;
+        if !(n_masks == 0 || n_masks == 1 || n_masks == n_bands) {
+            return Err(LercError::WrongParam(
+                "decode mask count must be 0, 1, or n_bands",
+            ));
+        }
+        Ok(DecodeIntoSpec {
+            data_type,
+            n_depth: positive_i32_to_usize(self.n_depth, "LERC info depth must be positive")?,
+            n_cols: positive_i32_to_usize(self.n_cols, "LERC info column count must be positive")?,
+            n_rows: positive_i32_to_usize(self.n_rows, "LERC info row count must be positive")?,
+            n_bands,
+            n_masks,
+        })
+    }
+}
+
+fn positive_i32_to_usize(value: i32, message: &'static str) -> Result<usize> {
+    if value <= 0 {
+        return Err(LercError::WrongParam(message));
+    }
+    Ok(value as usize)
+}
+
+fn nonnegative_i32_to_usize(value: i32, message: &'static str) -> Result<usize> {
+    if value < 0 {
+        return Err(LercError::WrongParam(message));
+    }
+    Ok(value as usize)
+}
+
 /// Supported-subset single-band Lerc2 decode result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedLerc2 {
@@ -8527,7 +8626,7 @@ mod tests {
         transform_fp_huffman_input_bytes, try_lerc2_bit_plane_max_z_error,
         try_raise_lerc2_float_max_z_error, validate_lerc2_checksum, write_huffman_code_table,
         write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
-        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter,
+        write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter, LercInfo,
         MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
         FPL_HUFFMAN_PACKBITS,
     };
@@ -9349,6 +9448,99 @@ mod tests {
         assert_eq!(info.max_z_error, 0.5);
         assert_eq!(info.z_min, 0.0);
         assert_eq!(info.z_max, 255.0);
+    }
+
+    #[test]
+    fn lerc_info_reports_decode_allocation_sizes_and_specs() {
+        let blob = fixture("bluemarble_256_256_3_byte.lerc2");
+        let info = get_lerc_info(&blob).unwrap();
+
+        assert_eq!(info.range_count().unwrap(), 3);
+        assert_eq!(info.value_count().unwrap(), 256 * 256 * 3);
+        assert_eq!(info.native_data_byte_len().unwrap(), 256 * 256 * 3);
+        assert_eq!(
+            info.data_byte_len_as(DataType::Double).unwrap(),
+            256 * 256 * 3 * 8
+        );
+        assert_eq!(info.mask_byte_len().unwrap(), 256 * 256);
+        assert_eq!(info.mask_byte_len_for(0).unwrap(), 0);
+        assert_eq!(info.mask_byte_len_for(3).unwrap(), 256 * 256 * 3);
+
+        assert_eq!(
+            info.decode_spec(DataType::Float, info.n_masks as usize)
+                .unwrap(),
+            DecodeIntoSpec {
+                data_type: DataType::Float,
+                n_depth: 1,
+                n_cols: 256,
+                n_rows: 256,
+                n_bands: 3,
+                n_masks: 1,
+            }
+        );
+        assert_eq!(
+            info.decode_spec(DataType::UChar, 2).unwrap_err(),
+            LercError::WrongParam("decode mask count must be 0, 1, or n_bands")
+        );
+    }
+
+    #[test]
+    fn lerc_info_sizing_helpers_validate_adversarial_metadata() {
+        let bad_depth = LercInfo {
+            version: 6,
+            n_depth: 0,
+            n_cols: 1,
+            n_rows: 1,
+            num_valid_pixel: 1,
+            n_bands: 1,
+            blob_size: 1,
+            n_masks: 0,
+            n_uses_no_data_value: 0,
+            data_type: DataType::UChar,
+            z_min: 0.0,
+            z_max: 0.0,
+            max_z_error: 0.0,
+        };
+        assert_eq!(
+            bad_depth.range_count().unwrap_err(),
+            LercError::WrongParam("LERC info depth must be positive")
+        );
+        assert_eq!(
+            bad_depth.decode_spec(DataType::UChar, 0).unwrap_err(),
+            LercError::WrongParam("LERC info depth must be positive")
+        );
+        let bad_rows = LercInfo {
+            n_depth: 1,
+            n_rows: -1,
+            ..bad_depth.clone()
+        };
+        assert_eq!(
+            bad_rows.value_count().unwrap_err(),
+            LercError::WrongParam("LERC info row count must be positive")
+        );
+
+        let overflow = LercInfo {
+            n_depth: i32::MAX,
+            n_cols: i32::MAX,
+            n_rows: i32::MAX,
+            n_bands: i32::MAX,
+            ..bad_depth
+        };
+        assert_eq!(
+            overflow.value_count().unwrap_err(),
+            LercError::WrongParam("LERC info value count overflow")
+        );
+
+        let bad_masks = LercInfo {
+            n_depth: 1,
+            n_bands: 1,
+            n_masks: -1,
+            ..overflow
+        };
+        assert_eq!(
+            bad_masks.mask_byte_len().unwrap_err(),
+            LercError::WrongParam("LERC info mask count is negative")
+        );
     }
 
     #[test]
