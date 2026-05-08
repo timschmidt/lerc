@@ -1440,7 +1440,7 @@ pub fn encode_lerc2_byte_huffman_bands_with_no_data(
 /// the C++ decoder for `Float` and `Double` data with `max_z_error == 0`. The
 /// current Rust writer selects among predictor-none, row-delta, and row/column
 /// cross-delta byte planes, applies per-plane byte-delta selection, and chooses
-/// the smallest wrapped RLE, raw, or normal Huffman payload. Masks follow the
+/// the smallest wrapped RLE, raw, PackBits, or normal Huffman payload. Masks follow the
 /// public C API convention: no masks means all pixels are valid, one mask is
 /// shared by all bands, and `n_bands` masks provide one mask per band.
 pub fn encode_lerc2_float_huffman_bands(
@@ -1545,7 +1545,7 @@ pub fn encode_lerc2_float_huffman_bands(
 /// Multi-band input supports no mask or one shared mask; per-band masks are
 /// available through [`encode_lerc2_float_huffman_bands`]. The current writer
 /// selects among predictor-none, row-delta, and row/column cross-delta byte
-/// planes with wrapped RLE, raw, or normal Huffman plane payloads inside image
+/// planes with wrapped RLE, raw, PackBits, or normal Huffman plane payloads inside image
 /// mode 3.
 pub fn encode_lerc2_float_huffman(
     spec: EncodeSpec,
@@ -6935,7 +6935,67 @@ fn encode_fpl_compressed_buffer(data: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
+    let packbits_payload = encode_fpl_packbits(data)?;
+    if packbits_payload.len() + 1 < best.len() {
+        best.clear();
+        best.push(FPL_HUFFMAN_PACKBITS);
+        best.extend_from_slice(&packbits_payload);
+    }
+
     Ok(best)
+}
+
+fn encode_fpl_packbits(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len().saturating_add(data.len() / 128 + 1));
+    let mut literal_start: Option<usize> = None;
+    let mut literal_count = 0usize;
+    let mut i = 0usize;
+
+    while i <= data.len() {
+        let b = if i == data.len() { None } else { Some(data[i]) };
+        let mut repeat_count = 0usize;
+        while i + 1 < data.len()
+            && Some(data[i]) == b
+            && data[i] == data[i + 1]
+            && repeat_count < 128
+        {
+            i += 1;
+            repeat_count += 1;
+        }
+        i += 1;
+
+        if repeat_count == 0 {
+            if let Some(value) = b {
+                if literal_start.is_none() {
+                    literal_start = Some(out.len());
+                    out.push(0);
+                }
+                out.push(value);
+                literal_count += 1;
+                if literal_count == 128 {
+                    let len_pos = literal_start.take().unwrap();
+                    out[len_pos] = (literal_count - 1) as u8;
+                    literal_count = 0;
+                }
+            }
+        } else {
+            if literal_count > 0 {
+                let len_pos = literal_start.take().unwrap();
+                out[len_pos] = (literal_count - 1) as u8;
+                literal_count = 0;
+            }
+            if let Some(value) = b {
+                out.push((127 + repeat_count) as u8);
+                out.push(value);
+            }
+        }
+    }
+    if literal_count > 0 {
+        let len_pos = literal_start.take().unwrap();
+        out[len_pos] = (literal_count - 1) as u8;
+    }
+
+    Ok(out)
 }
 
 fn transform_fp_huffman_input_bytes(data: &[u8], data_type: DataType) -> Result<Vec<u8>> {
@@ -7017,7 +7077,7 @@ fn extract_fpl_packbits(payload: &[u8], expected_len: usize) -> Result<Vec<u8>> 
             }
             out.extend_from_slice(literal);
         } else {
-            let count = control as usize - 127;
+            let count = control as usize - 126;
             let value = reader.read_bytes(1)?[0];
             if out.len().saturating_add(count) > expected_len {
                 return Err(LercError::CorruptInput(
@@ -8033,22 +8093,23 @@ mod tests {
         compute_lerc2_one_sweep_byte_len, compute_lerc2_tiled_raw_byte_len,
         decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
         decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_fpl_compressed_buffer,
-        encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
-        encode_lerc2_byte_huffman_bands, encode_lerc2_byte_huffman_bands_with_no_data,
-        encode_lerc2_byte_huffman_with_no_data, encode_lerc2_constant, encode_lerc2_constant_bands,
-        encode_lerc2_float_huffman, encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep,
-        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
-        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+        encode_fpl_packbits, encode_lerc2_auto, encode_lerc2_auto_with_no_data,
+        encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
+        encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
+        encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_float_huffman,
+        encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
+        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
+        encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
         encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
         encode_lerc2_tiled_simple, encode_lerc2_tiled_simple_bands,
         encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
         encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data,
-        extract_fpl_compressed_buffer, finalize_lerc2_checksum, get_lerc2_blob_info_arrays,
-        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
-        read_fp_huffman_slice, read_lerc2_data_one_sweep, read_lerc2_mask,
-        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        extract_fpl_compressed_buffer, extract_fpl_packbits, finalize_lerc2_checksum,
+        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
+        get_lerc2_no_data_info, get_lerc_info, read_fp_huffman_slice, read_lerc2_data_one_sweep,
+        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes,
         transform_fp_huffman_input_bytes, try_lerc2_bit_plane_max_z_error,
@@ -8056,6 +8117,7 @@ mod tests {
         write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep,
         write_lerc2_tiled_raw, DecodeIntoSpec, FpPredictor, HeaderInfo, HuffmanBitWriter,
         MinMaxRanges, Reader, BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN, FILE_KEY,
+        FPL_HUFFMAN_PACKBITS,
     };
     use crate::{BitMask, BitStuffer2, DataType, DecodedData, EncodeSpec, LercError, Rle};
     use std::fs;
@@ -9136,10 +9198,53 @@ mod tests {
             [9, 8, 7, 6]
         );
 
-        let packbits = [3, 2, 1, 2, 3, 130, 4, 0, 5];
+        let packbits = [3, 2, 1, 2, 3, 129, 4, 0, 5];
         assert_eq!(
             extract_fpl_compressed_buffer(&packbits, 7).unwrap(),
             [1, 2, 3, 4, 4, 4, 5]
+        );
+    }
+
+    #[test]
+    fn encodes_floating_point_huffman_wrapped_packbits_payloads() {
+        let data = [1, 2, 3, 4, 4, 4, 5];
+        assert_eq!(
+            encode_fpl_packbits(&data).unwrap(),
+            [2, 1, 2, 3, 129, 4, 0, 5]
+        );
+
+        let mut literal = (0u8..128).collect::<Vec<_>>();
+        literal.extend_from_slice(&[9, 9]);
+        let encoded_literal = encode_fpl_packbits(&literal).unwrap();
+        assert_eq!(encoded_literal[0], 127);
+        assert_eq!(&encoded_literal[1..129], &(0u8..128).collect::<Vec<_>>());
+        assert_eq!(&encoded_literal[129..], &[128, 9]);
+
+        let repeated = vec![7u8; 130];
+        let encoded_repeated = encode_fpl_packbits(&repeated).unwrap();
+        assert_eq!(encoded_repeated, [255, 7, 0, 7]);
+        assert_eq!(
+            extract_fpl_packbits(&encoded_repeated, repeated.len()).unwrap(),
+            repeated
+        );
+    }
+
+    #[test]
+    fn selects_floating_point_huffman_packbits_when_smallest_wrapped_payload() {
+        let mut data = Vec::new();
+        for value in 0u8..12 {
+            data.push(value);
+        }
+        data.extend(vec![77; 64]);
+        for value in 12u8..24 {
+            data.push(value);
+        }
+
+        let encoded = encode_fpl_compressed_buffer(&data).unwrap();
+        assert_eq!(encoded[0], FPL_HUFFMAN_PACKBITS);
+        assert_eq!(
+            extract_fpl_compressed_buffer(&encoded, data.len()).unwrap(),
+            data
         );
     }
 
