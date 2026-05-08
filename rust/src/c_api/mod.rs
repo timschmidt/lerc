@@ -766,6 +766,22 @@ unsafe fn try_encode_supported_blob(
                     "active no-data encode requires version 6 or newer",
                 ));
             }
+            let prepared_nan = prepare_active_no_data_nan_encode_inputs(
+                spec,
+                data,
+                mask_bytes,
+                uses_no_data,
+                no_data_values,
+            )?;
+            let (spec, data, mask_bytes) = if let Some(prepared) = prepared_nan.as_ref() {
+                (
+                    prepared.spec,
+                    prepared.data.as_slice(),
+                    Some(prepared.masks.as_slice()),
+                )
+            } else {
+                (spec, data, mask_bytes)
+            };
             return encode_lerc2_auto_with_no_data(
                 spec,
                 data,
@@ -886,6 +902,104 @@ fn prepare_nan_encode_inputs(
     }))
 }
 
+fn prepare_active_no_data_nan_encode_inputs(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask_bytes: Option<&[u8]>,
+    uses_no_data: &[u8],
+    no_data_values: Option<&[f64]>,
+) -> crate::Result<Option<PreparedNanEncode>> {
+    if spec.data_type != DataType::Float && spec.data_type != DataType::Double {
+        return Ok(None);
+    }
+    let Some(no_data_values) = no_data_values else {
+        return Ok(None);
+    };
+
+    let n_pixels = spec
+        .n_cols
+        .checked_mul(spec.n_rows)
+        .ok_or(LercError::WrongParam("encode pixel count overflow"))?;
+    let value_size = spec.data_type.size_in_bytes();
+    let band_value_bytes = n_pixels
+        .checked_mul(spec.n_depth)
+        .and_then(|count| count.checked_mul(value_size))
+        .ok_or(LercError::WrongParam("encode band byte count overflow"))?;
+
+    let mut prepared_data = data.to_vec();
+    let mut prepared_masks = vec![1u8; n_pixels * spec.n_bands];
+    let mut found_nan = false;
+
+    for i_band in 0..spec.n_bands {
+        let data_band_offset = i_band * band_value_bytes;
+        let mask_band_offset = i_band * n_pixels;
+        let band_uses_no_data = uses_no_data.get(i_band).copied().unwrap_or(0) != 0;
+        let no_data_value = no_data_values.get(i_band).copied().unwrap_or(0.0);
+        if band_uses_no_data {
+            validate_float_no_data_value_for_encode(spec.data_type, no_data_value)?;
+        }
+        let input_mask = match (spec.n_masks, mask_bytes) {
+            (0, _) => None,
+            (1, Some(masks)) => Some(&masks[..n_pixels]),
+            (_, Some(masks)) => {
+                let offset = i_band * n_pixels;
+                Some(&masks[offset..offset + n_pixels])
+            }
+            (_, None) => None,
+        };
+
+        for i_pixel in 0..n_pixels {
+            let input_valid = input_mask.is_none_or(|mask| mask[i_pixel] != 0);
+            if !input_valid {
+                prepared_masks[mask_band_offset + i_pixel] = 0;
+                continue;
+            }
+
+            let pixel_offset = data_band_offset + i_pixel * spec.n_depth * value_size;
+            let mut nan_count = 0usize;
+            for i_depth in 0..spec.n_depth {
+                let value_offset = pixel_offset + i_depth * value_size;
+                let value = read_float_value_for_nan(spec.data_type, &data[value_offset..]);
+                if value.is_nan() {
+                    nan_count += 1;
+                    found_nan = true;
+                    if band_uses_no_data && spec.n_depth > 1 {
+                        write_float_value_for_encode(
+                            spec.data_type,
+                            no_data_value,
+                            &mut prepared_data[value_offset..],
+                        );
+                    } else {
+                        write_zero_float_value(spec.data_type, &mut prepared_data[value_offset..]);
+                    }
+                }
+            }
+
+            if nan_count == 0 {
+                continue;
+            }
+            if nan_count == spec.n_depth {
+                prepared_masks[mask_band_offset + i_pixel] = 0;
+            } else if spec.n_depth > 1 && !band_uses_no_data {
+                return Err(LercError::NaN);
+            }
+        }
+    }
+
+    if !found_nan {
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedNanEncode {
+        spec: EncodeSpec {
+            n_masks: if spec.n_bands == 1 { 1 } else { spec.n_bands },
+            ..spec
+        },
+        data: prepared_data,
+        masks: prepared_masks,
+    }))
+}
+
 fn read_float_value_for_nan(data_type: DataType, bytes: &[u8]) -> f64 {
     match data_type {
         DataType::Float => f32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
@@ -900,6 +1014,23 @@ fn write_zero_float_value(data_type: DataType, bytes: &mut [u8]) {
         DataType::Double => bytes[..8].copy_from_slice(&0.0f64.to_le_bytes()),
         _ => unreachable!("NaN filtering only handles float and double"),
     }
+}
+
+fn write_float_value_for_encode(data_type: DataType, value: f64, bytes: &mut [u8]) {
+    match data_type {
+        DataType::Float => bytes[..4].copy_from_slice(&(value as f32).to_le_bytes()),
+        DataType::Double => bytes[..8].copy_from_slice(&value.to_le_bytes()),
+        _ => unreachable!("float writer only handles float and double"),
+    }
+}
+
+fn validate_float_no_data_value_for_encode(data_type: DataType, value: f64) -> crate::Result<()> {
+    if data_type == DataType::Float && (value < f32::MIN as f64 || value > f32::MAX as f64) {
+        return Err(LercError::WrongParam(
+            "active no-data value is outside the data type range",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_no_data_inputs(
@@ -3102,6 +3233,46 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_4d_encode_keeps_near_range_integer_no_data_sentinel() {
+        let data = [1u8, 2, 5, 5, 3, 4, 5, 6, 7, 8, 9, 10];
+        let uses_no_data = [1u8];
+        let no_data_values = [5.0f64];
+        let mut out = [0u8; 192];
+        let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                3.7,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.header.max_z_error, 0.5);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 5.0);
+        assert_eq!(decoded.header.no_data_val_orig, 5.0);
+        assert_eq!(decoded.mask.count_valid_bits(), 5);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 9, 10])
+        );
+    }
+
+    #[test]
     fn c_abi_decode_writes_data_and_mask() {
         let blob = synthetic_v4_const_blob();
         let mut data = [0u8; 6];
@@ -3983,7 +4154,101 @@ mod tests {
         assert_eq!(decoded_mask, vec![1u8; n_cols * n_rows]);
         assert_eq!(decoded_uses_no_data, uses_no_data);
         assert_eq!(decoded_no_data, no_data_values);
-        assert_eq!(decoded, data);
+        for (&actual, &expected) in decoded.iter().zip(data.iter()) {
+            if expected == no_data {
+                assert_eq!(actual, no_data);
+            } else {
+                assert!((actual - expected).abs() <= 0.0011);
+            }
+        }
+    }
+
+    #[test]
+    fn c_abi_active_no_data_replaces_mixed_depth_nan_with_sentinel() {
+        let data = [1.0f32, 2.0, f32::NAN, 3.0, f32::NAN, f32::NAN];
+        let uses_no_data = [1u8];
+        let no_data_values = [-9999.0f64];
+        let mut blob = [0u8; 256];
+        let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                2,
+                3,
+                1,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
+
+        let mut decoded = [0.0f32; 6];
+        let mut decoded_mask = [0u8; 3];
+        let mut decoded_uses_no_data = [0u8; 1];
+        let mut decoded_no_data = [0.0f64; 1];
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                written,
+                1,
+                decoded_mask.as_mut_ptr(),
+                2,
+                3,
+                1,
+                1,
+                DataType::Float as u32,
+                decoded.as_mut_ptr().cast(),
+                decoded_uses_no_data.as_mut_ptr(),
+                decoded_no_data.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(decoded_mask, [1, 1, 0]);
+        assert_eq!(decoded_uses_no_data, uses_no_data);
+        assert_eq!(decoded_no_data, no_data_values);
+        assert_eq!(decoded, [1.0, 2.0, -9999.0, 3.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn c_abi_active_no_data_still_rejects_inactive_band_mixed_depth_nan() {
+        let data = [1.0f32, -9999.0, 2.0, 3.0, 10.0, 11.0, f32::NAN, 12.0];
+        let uses_no_data = [1u8, 0];
+        let no_data_values = [-9999.0f64, 0.0];
+        let mut blob = [0u8; 256];
+        let mut written = 123u32;
+
+        let status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                2,
+                2,
+                1,
+                2,
+                0,
+                ptr::null(),
+                0.0,
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::NaN as u32);
+        assert_eq!(written, 0);
+        assert_eq!(blob, [0; 256]);
     }
 
     #[test]

@@ -1735,13 +1735,14 @@ pub fn encode_lerc2_one_sweep_with_no_data(
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
     let prepared_data = prepared.data.as_slice();
     let prepared_mask = prepared.mask.as_ref().or(mask);
+    let prepared_max_z_error = prepared.max_z_error;
     encode_lerc2_one_sweep_band(
         EncodeSpec {
             n_masks: usize::from(prepared_mask.is_some()),
             ..spec
         },
         prepared_data,
-        max_z_error,
+        prepared_max_z_error,
         prepared_mask,
         version,
         0,
@@ -1937,13 +1938,14 @@ pub fn encode_lerc2_tiled_lut_with_no_data(
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
     let prepared_data = prepared.data.as_slice();
     let prepared_mask = prepared.mask.as_ref().or(mask);
+    let prepared_max_z_error = prepared.max_z_error;
     encode_lerc2_tiled_simple_band(
         EncodeSpec {
             n_masks: usize::from(prepared_mask.is_some()),
             ..spec
         },
         prepared_data,
-        max_z_error,
+        prepared_max_z_error,
         prepared_mask,
         version,
         micro_block_size,
@@ -2003,13 +2005,14 @@ pub fn encode_lerc2_tiled_simple_with_no_data(
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
     let prepared_data = prepared.data.as_slice();
     let prepared_mask = prepared.mask.as_ref().or(mask);
+    let prepared_max_z_error = prepared.max_z_error;
     encode_lerc2_tiled_simple_band(
         EncodeSpec {
             n_masks: usize::from(prepared_mask.is_some()),
             ..spec
         },
         prepared_data,
-        max_z_error,
+        prepared_max_z_error,
         prepared_mask,
         version,
         micro_block_size,
@@ -2069,13 +2072,14 @@ pub fn encode_lerc2_tiled_raw_with_no_data(
     let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, max_z_error)?;
     let prepared_data = prepared.data.as_slice();
     let prepared_mask = prepared.mask.as_ref().or(mask);
+    let prepared_max_z_error = prepared.max_z_error;
     encode_lerc2_tiled_raw_band(
         EncodeSpec {
             n_masks: usize::from(prepared_mask.is_some()),
             ..spec
         },
         prepared_data,
-        max_z_error,
+        prepared_max_z_error,
         prepared_mask,
         version,
         micro_block_size,
@@ -2984,6 +2988,10 @@ pub fn encode_lerc2_tiled_lut_bands_with_no_data(
             .as_ref()
             .and_then(|prepared| prepared.no_data)
             .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
+        let prepared_max_z_error = prepared
+            .as_ref()
+            .map(|prepared| prepared.max_z_error)
+            .unwrap_or(max_z_error);
         let encode_mask = if band == 0 {
             true
         } else if spec.n_masks == 1 && prepared.is_none() {
@@ -3001,7 +3009,7 @@ pub fn encode_lerc2_tiled_lut_bands_with_no_data(
                 ..band_spec
             },
             prepared_data,
-            max_z_error,
+            prepared_max_z_error,
             prepared_mask,
             version,
             micro_block_size,
@@ -3126,6 +3134,10 @@ pub fn encode_lerc2_tiled_simple_bands_with_no_data(
             .as_ref()
             .and_then(|prepared| prepared.no_data)
             .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
+        let prepared_max_z_error = prepared
+            .as_ref()
+            .map(|prepared| prepared.max_z_error)
+            .unwrap_or(max_z_error);
         let encode_mask = if band == 0 {
             true
         } else if spec.n_masks == 1 && prepared.is_none() {
@@ -3143,7 +3155,7 @@ pub fn encode_lerc2_tiled_simple_bands_with_no_data(
                 ..band_spec
             },
             prepared_data,
-            max_z_error,
+            prepared_max_z_error,
             prepared_mask,
             version,
             micro_block_size,
@@ -3268,6 +3280,10 @@ pub fn encode_lerc2_tiled_raw_bands_with_no_data(
             .as_ref()
             .and_then(|prepared| prepared.no_data)
             .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
+        let prepared_max_z_error = prepared
+            .as_ref()
+            .map(|prepared| prepared.max_z_error)
+            .unwrap_or(max_z_error);
         let encode_mask = if band == 0 {
             true
         } else if spec.n_masks == 1 && prepared.is_none() {
@@ -3285,7 +3301,7 @@ pub fn encode_lerc2_tiled_raw_bands_with_no_data(
                 ..band_spec
             },
             prepared_data,
-            max_z_error,
+            prepared_max_z_error,
             prepared_mask,
             version,
             micro_block_size,
@@ -3523,6 +3539,10 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
             .as_ref()
             .and_then(|prepared| prepared.no_data)
             .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
+        let prepared_max_z_error = prepared
+            .as_ref()
+            .map(|prepared| prepared.max_z_error)
+            .unwrap_or(max_z_error);
         let encode_mask = if band == 0 {
             true
         } else if spec.n_masks == 1 && prepared.is_none() {
@@ -3542,7 +3562,7 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
         let band_blob = encode_lerc2_one_sweep_band(
             encode_band_spec,
             prepared_data,
-            max_z_error,
+            prepared_max_z_error,
             prepared_mask,
             version,
             n_blobs_more,
@@ -3785,7 +3805,7 @@ fn encode_lerc2_constant_band(
         blob_size: 1,
         n_blobs_more,
         b_pass_no_data_values: 0,
-        b_is_int: u8::from(value.fract() == 0.0),
+        b_is_int: u8::from(float_value_is_cpp_integer(spec.data_type, value)),
         b_reserved_3: 0,
         b_reserved_4: 0,
         data_type: spec.data_type,
@@ -5437,13 +5457,25 @@ fn data_values_are_integer(data_type: DataType, data: &[u8]) -> Result<bool> {
         if value.is_nan() {
             return Err(LercError::WrongParam("Lerc2 encode input contains NaN"));
         }
-        if value.fract() != 0.0 {
+        if !float_value_is_cpp_integer(data_type, value) {
             return Ok(false);
         }
         offset += value_size;
     }
 
     Ok(true)
+}
+
+fn float_value_is_cpp_integer(data_type: DataType, value: f64) -> bool {
+    if value.fract() != 0.0 {
+        return false;
+    }
+
+    match data_type {
+        DataType::Float => (-(1i64 << 23) as f64..=(1i64 << 23) as f64).contains(&value),
+        DataType::Double => (-(1i64 << 53) as f64..=(1i64 << 53) as f64).contains(&value),
+        _ => true,
+    }
 }
 
 fn constant_value_for_uncompressed_encode(data_type: DataType, data: &[u8]) -> Result<Option<f64>> {
@@ -5493,6 +5525,7 @@ struct PreparedNoDataBand {
     data: Vec<u8>,
     mask: Option<BitMask>,
     no_data: Option<(f64, f64)>,
+    max_z_error: f64,
 }
 
 fn prepare_no_data_band_for_encode(
@@ -5510,6 +5543,7 @@ fn prepare_no_data_band_for_encode(
     let mut max_valid = f64::NEG_INFINITY;
     let mut need_no_data = false;
     let mut modified_mask = false;
+    let mut all_valid_values_cpp_integer = true;
 
     for row in 0..spec.n_rows {
         for col in 0..spec.n_cols {
@@ -5528,6 +5562,11 @@ fn prepare_no_data_band_for_encode(
                 } else {
                     min_valid = min_valid.min(value);
                     max_valid = max_valid.max(value);
+                    if all_valid_values_cpp_integer
+                        && !float_value_is_cpp_integer(spec.data_type, value)
+                    {
+                        all_valid_values_cpp_integer = false;
+                    }
                 }
             }
 
@@ -5540,11 +5579,22 @@ fn prepare_no_data_band_for_encode(
         }
     }
 
+    let prepared_max_z_error = choose_no_data_max_z_error(
+        spec.data_type,
+        no_data_orig,
+        min_valid,
+        max_valid,
+        max_z_error,
+        need_no_data,
+        all_valid_values_cpp_integer,
+    );
+
     if !need_no_data {
         return Ok(PreparedNoDataBand {
             data,
             mask: Some(mask).filter(|_| modified_mask),
             no_data: None,
+            max_z_error: prepared_max_z_error,
         });
     }
 
@@ -5554,6 +5604,7 @@ fn prepare_no_data_band_for_encode(
         min_valid,
         max_valid,
         max_z_error,
+        all_valid_values_cpp_integer,
     )?;
     if !values_equal_for_no_data(spec.data_type, no_data_internal, no_data_orig) {
         replace_no_data_value(spec, &mut data, &mask, no_data_orig, no_data_internal)?;
@@ -5563,6 +5614,7 @@ fn prepare_no_data_band_for_encode(
         data,
         mask: Some(mask),
         no_data: Some((no_data_internal, no_data_orig)),
+        max_z_error: prepared_max_z_error,
     })
 }
 
@@ -5600,6 +5652,7 @@ fn choose_internal_no_data_value(
     min_valid: f64,
     max_valid: f64,
     max_z_error: f64,
+    all_valid_values_cpp_integer: bool,
 ) -> Result<f64> {
     if !min_valid.is_finite() || !max_valid.is_finite() {
         return Ok(no_data_orig);
@@ -5607,28 +5660,217 @@ fn choose_internal_no_data_value(
 
     let (type_min, type_max) = data_type_range(data_type);
     let int_type = (data_type as i32) < (DataType::Float as i32);
-    let dist = if int_type {
-        max_z_error.max(0.5).floor() + 1.0
-    } else {
-        (2.0 * max_z_error).max(0.0001)
-    };
-    if no_data_orig < min_valid - dist || no_data_orig > max_valid + dist {
+    if int_type {
+        let max_z_error = max_z_error.max(0.5).floor();
+        let range_dist = max_z_error.floor();
+        if no_data_orig >= min_valid - range_dist && no_data_orig <= max_valid + range_dist {
+            return Ok(no_data_orig);
+        }
+
+        let below = min_valid - (max_z_error.floor() + 1.0);
+        if below >= type_min {
+            return cast_no_data_value(data_type, below);
+        }
+
+        let lossless_below = min_valid - 1.0;
+        if lossless_below >= type_min {
+            return cast_no_data_value(data_type, lossless_below);
+        }
+
+        let above = max_valid + 1.0;
+        if above <= type_max && above < no_data_orig {
+            return cast_no_data_value(data_type, above);
+        }
+
         return Ok(no_data_orig);
     }
 
-    let below = min_valid - dist;
-    if below >= type_min {
-        return cast_no_data_value(data_type, below);
+    let float_all_int = floating_point_no_data_uses_integer_semantics(
+        data_type,
+        no_data_orig,
+        min_valid,
+        max_valid,
+        true,
+        all_valid_values_cpp_integer,
+    );
+    let max_z_error = if float_all_int {
+        max_z_error.max(0.5).floor()
+    } else {
+        max_z_error
+    };
+    if max_z_error == 0.0 {
+        return Ok(no_data_orig);
     }
 
-    let above = max_valid + dist;
-    if above <= type_max {
-        return cast_no_data_value(data_type, above);
+    let dist = if float_all_int {
+        max_z_error.floor()
+    } else {
+        2.0 * max_z_error
+    };
+    if no_data_orig >= min_valid - dist && no_data_orig <= max_valid + dist {
+        return Ok(no_data_orig);
     }
 
-    Err(LercError::Unsupported(
-        "Lerc2 no-data encode could not find an internal sentinel",
-    ))
+    if let Some(remap) =
+        find_new_float_no_data_below_valid_min(data_type, min_valid, max_z_error, float_all_int)?
+    {
+        return Ok(remap);
+    }
+
+    Ok(no_data_orig)
+}
+
+fn choose_no_data_max_z_error(
+    data_type: DataType,
+    no_data_orig: f64,
+    min_valid: f64,
+    max_valid: f64,
+    max_z_error: f64,
+    need_no_data: bool,
+    all_valid_values_cpp_integer: bool,
+) -> f64 {
+    let integer_semantics = is_integer_data_type(data_type)
+        || floating_point_no_data_uses_integer_semantics(
+            data_type,
+            no_data_orig,
+            min_valid,
+            max_valid,
+            need_no_data,
+            all_valid_values_cpp_integer,
+        );
+    let max_z_error_lossy = if integer_semantics {
+        max_z_error.max(0.5).floor()
+    } else {
+        max_z_error
+    };
+    if !min_valid.is_finite() || !max_valid.is_finite() {
+        return max_z_error_lossy;
+    }
+
+    if max_z_error_lossy == 0.0 {
+        return max_z_error_lossy;
+    }
+
+    let dist = if integer_semantics {
+        max_z_error_lossy.floor()
+    } else {
+        2.0 * max_z_error_lossy
+    };
+    if no_data_orig >= min_valid - dist && no_data_orig <= max_valid + dist {
+        return if integer_semantics { 0.5 } else { 0.0 };
+    }
+
+    if !need_no_data {
+        return max_z_error_lossy;
+    }
+
+    if is_integer_data_type(data_type) {
+        let (type_min, _) = data_type_range(data_type);
+        let lossy_below = min_valid - (max_z_error_lossy.floor() + 1.0);
+        return if lossy_below >= type_min {
+            max_z_error_lossy
+        } else {
+            0.5
+        };
+    }
+
+    match find_new_float_no_data_below_valid_min(
+        data_type,
+        min_valid,
+        max_z_error_lossy,
+        integer_semantics,
+    ) {
+        Ok(Some(_)) => max_z_error_lossy,
+        _ if no_data_orig >= min_valid => {
+            if integer_semantics {
+                0.5
+            } else {
+                0.0
+            }
+        }
+        _ => max_z_error_lossy,
+    }
+}
+
+fn floating_point_no_data_uses_integer_semantics(
+    data_type: DataType,
+    no_data_orig: f64,
+    min_valid: f64,
+    max_valid: f64,
+    need_no_data: bool,
+    all_valid_values_cpp_integer: bool,
+) -> bool {
+    if !is_floating_point_data_type(data_type)
+        || !all_valid_values_cpp_integer
+        || !float_value_is_cpp_integer(data_type, min_valid)
+        || !float_value_is_cpp_integer(data_type, max_valid)
+    {
+        return false;
+    }
+
+    !need_no_data || float_value_is_cpp_integer(data_type, no_data_orig)
+}
+
+fn find_new_float_no_data_below_valid_min(
+    data_type: DataType,
+    min_valid: f64,
+    max_z_error: f64,
+    integer_semantics: bool,
+) -> Result<Option<f64>> {
+    let low_limit = if integer_semantics {
+        match data_type {
+            DataType::Float => -((1i64 << 23) as f64),
+            DataType::Double => -((1i64 << 53) as f64),
+            _ => return Ok(None),
+        }
+    } else {
+        data_type_range(data_type).0
+    };
+    let mut candidates = if integer_semantics {
+        vec![
+            min_valid - 4.0 * max_z_error,
+            min_valid - 1.0,
+            min_valid - 10.0,
+            min_valid - 100.0,
+            min_valid - 1000.0,
+            min_valid - 10000.0,
+        ]
+    } else {
+        vec![
+            min_valid - 4.0 * max_z_error,
+            min_valid - 0.0001,
+            min_valid - 0.001,
+            min_valid - 0.01,
+            min_valid - 0.1,
+            min_valid - 1.0,
+            min_valid - 10.0,
+            min_valid - 100.0,
+            min_valid - 1000.0,
+            min_valid - 10000.0,
+        ]
+    };
+    candidates.push(if min_valid > 0.0 {
+        min_valid / 2.0
+    } else {
+        min_valid * 2.0
+    });
+
+    for candidate in &mut candidates {
+        *candidate = cast_no_data_value(data_type, *candidate)?;
+    }
+    candidates.sort_by(|left, right| right.total_cmp(left));
+
+    let upper = cast_no_data_value(data_type, min_valid - 2.0 * max_z_error)?;
+    for candidate in candidates {
+        if candidate > low_limit
+            && candidate < upper
+            && (!integer_semantics || float_value_is_cpp_integer(data_type, candidate))
+        {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
 }
 
 fn cast_no_data_value(data_type: DataType, value: f64) -> Result<f64> {
@@ -11493,7 +11735,7 @@ mod tests {
 
         assert!(decoded.header.has_no_data_values());
         assert_eq!(decoded.header.micro_block_size, 2);
-        assert_eq!(decoded.header.no_data_val, 255.0);
+        assert_eq!(decoded.header.no_data_val, 0.0);
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
         assert_eq!(decoded.mask.count_valid_bits(), 5);
         assert_eq!(
@@ -11634,7 +11876,7 @@ mod tests {
 
         assert!(decoded.header.has_no_data_values());
         assert_eq!(decoded.header.micro_block_size, 2);
-        assert_eq!(decoded.header.no_data_val, 255.0);
+        assert_eq!(decoded.header.no_data_val, 0.0);
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
         assert_eq!(decoded.mask.count_valid_bits(), 5);
         assert_eq!(
@@ -11953,7 +12195,7 @@ mod tests {
         let no_data = get_lerc2_no_data_info(&blob, 1).unwrap();
 
         assert!(decoded.header.has_no_data_values());
-        assert_eq!(decoded.header.no_data_val, 255.0);
+        assert_eq!(decoded.header.no_data_val, 0.0);
         assert_eq!(decoded.header.no_data_val_orig, 255.0);
         assert_eq!(decoded.mask.count_valid_bits(), 5);
         assert_eq!(
@@ -11991,7 +12233,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_one_sweep_lerc2_no_data_with_internal_sentinel_remap() {
+    fn encodes_one_sweep_lerc2_no_data_without_remap_when_sentinel_is_near_range() {
         let spec = EncodeSpec {
             data_type: DataType::UChar,
             n_depth: 2,
@@ -12014,12 +12256,161 @@ mod tests {
         let decoded = decode_lerc2_supported(&blob).unwrap();
 
         assert!(decoded.header.has_no_data_values());
-        assert_eq!(decoded.header.no_data_val, 0.0);
+        assert_eq!(decoded.header.no_data_val, 5.0);
         assert_eq!(decoded.header.no_data_val_orig, 5.0);
         assert_eq!(decoded.mask.count_valid_bits(), 5);
         assert_eq!(
             decoded.data,
             DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 9, 10])
+        );
+    }
+
+    #[test]
+    fn integer_no_data_near_range_falls_back_to_lossless_max_z_error() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 2, 5, 5, 3, 4, 5, 6, 7, 8, 9, 10];
+        let blob = encode_lerc2_one_sweep_with_no_data(spec, &data, 3.7, None, 5.0, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.max_z_error, 0.5);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 5.0);
+        assert_eq!(decoded.header.no_data_val_orig, 5.0);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 9, 10])
+        );
+    }
+
+    #[test]
+    fn integer_no_data_far_range_keeps_floored_lossy_max_z_error_after_remap() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [10u8, 12, 255, 255, 13, 14, 15, 255, 17, 18, 19, 20];
+        let blob = encode_lerc2_one_sweep_with_no_data(spec, &data, 3.7, None, 255.0, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.max_z_error, 3.0);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 6.0);
+        assert_eq!(decoded.header.no_data_val_orig, 255.0);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![10, 12, 0, 0, 13, 14, 15, 255, 17, 18, 19, 20])
+        );
+    }
+
+    #[test]
+    fn single_depth_integer_no_data_near_range_uses_lossless_max_z_error_without_metadata() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 4,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1u8, 5, 3, 4, 5, 6, 7, 8];
+        let blob = encode_lerc2_tiled_raw_with_no_data(spec, &data, 3.7, None, 5.0, 6, 2).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.max_z_error, 0.5);
+        assert!(!decoded.header.has_no_data_values());
+        assert_eq!(decoded.mask.count_valid_bits(), 6);
+        assert_eq!(
+            decoded.data,
+            DecodedData::UChar(vec![1, 0, 3, 4, 0, 6, 7, 8])
+        );
+    }
+
+    #[test]
+    fn float_no_data_near_range_falls_back_to_lossless_max_z_error() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1.25f32, 2.0, 2.0, 3.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let blob = encode_lerc2_one_sweep_with_no_data(spec, &data, 0.25, None, 2.0, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.max_z_error, 0.0);
+        assert_eq!(decoded.header.b_is_int, 0);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 2.0);
+        assert_eq!(decoded.header.no_data_val_orig, 2.0);
+        assert_eq!(decoded.data, DecodedData::Float(vec![1.25, 2.0, 2.0, 3.5]));
+    }
+
+    #[test]
+    fn float_no_data_all_int_near_range_falls_back_to_integer_lossless_error() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1.0f32, 2.0, 5.0, 6.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let blob = encode_lerc2_one_sweep_with_no_data(spec, &data, 3.7, None, 5.0, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.max_z_error, 0.5);
+        assert_eq!(decoded.header.b_is_int, 1);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 5.0);
+        assert_eq!(decoded.header.no_data_val_orig, 5.0);
+        assert_eq!(decoded.data, DecodedData::Float(vec![1.0, 2.0, 5.0, 6.0]));
+    }
+
+    #[test]
+    fn float_no_data_remap_uses_cpp_below_min_candidate() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let data = [1.25f32, 2.5, 100.0, 4.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let blob = encode_lerc2_one_sweep_with_no_data(spec, &data, 0.1, None, 100.0, 6).unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+
+        assert_eq!(decoded.header.max_z_error, 0.1);
+        assert_eq!(decoded.header.b_is_int, 0);
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val, 0.85f32 as f64);
+        assert_eq!(decoded.header.no_data_val_orig, 100.0);
+        assert_eq!(
+            decoded.data,
+            DecodedData::Float(vec![1.25, 2.5, 100.0, 4.5])
         );
     }
 
@@ -12229,6 +12620,61 @@ mod tests {
         assert_eq!(
             decoded.data,
             DecodedData::Float(vec![1.0, 1.5, 2.0, 2.5, -3.0, -2.5, 0.0, 4.5])
+        );
+    }
+
+    #[test]
+    fn float_integer_header_flag_uses_cpp_exact_integer_limit() {
+        let spec = EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let small_integer_data = [1.0f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let small_blob = encode_lerc2_one_sweep(spec, &small_integer_data, 0.0, None, 6).unwrap();
+        assert_eq!(
+            get_lerc2_header_info(&small_blob).unwrap().header.b_is_int,
+            1
+        );
+
+        let large_integer_data = [20_000_000.0f32, 20_000_002.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let large_blob = encode_lerc2_one_sweep(spec, &large_integer_data, 0.0, None, 6).unwrap();
+        assert_eq!(
+            get_lerc2_header_info(&large_blob).unwrap().header.b_is_int,
+            0
+        );
+    }
+
+    #[test]
+    fn double_integer_header_flag_uses_cpp_exact_integer_limit_for_constants() {
+        let spec = EncodeSpec {
+            data_type: DataType::Double,
+            n_depth: 1,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let small_blob = encode_lerc2_constant(spec, 42.0, 0.0, None, 6).unwrap();
+        assert_eq!(
+            get_lerc2_header_info(&small_blob).unwrap().header.b_is_int,
+            1
+        );
+
+        let large_blob =
+            encode_lerc2_constant(spec, 10_000_000_000_000_000.0, 0.0, None, 6).unwrap();
+        assert_eq!(
+            get_lerc2_header_info(&large_blob).unwrap().header.b_is_int,
+            0
         );
     }
 
