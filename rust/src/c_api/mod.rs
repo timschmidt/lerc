@@ -681,7 +681,6 @@ fn validate_encode_shape(
         || n_cols <= 0
         || n_rows <= 0
         || n_bands <= 0
-        || max_z_err < 0.0
         || (n_masks > 0 && p_valid_bytes.is_null())
     {
         return Err(ErrCode::WrongParam);
@@ -696,6 +695,9 @@ fn validate_encode_shape(
                 Err(ErrCode::WrongParam)
             }
         })?;
+    if max_z_err < 0.0 && (parsed_type == DataType::Float || parsed_type == DataType::Double) {
+        return Err(ErrCode::WrongParam);
+    }
     let spec = EncodeSpec {
         data_type: parsed_type,
         n_depth: n_depth as usize,
@@ -2503,6 +2505,108 @@ mod tests {
             decoded_bands.bands[1].data,
             DecodedData::UShort(vec![10, 0, 30, 50, 70, 0])
         );
+    }
+
+    #[test]
+    fn c_abi_encode_accepts_integer_negative_max_z_error() {
+        let values = [100u16, 101, 103, 106, 110, 115, 121, 128];
+        let data = values
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut computed_size = 0u32;
+        let mut out = [0u8; 512];
+        let mut written = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UShort as u32,
+                1,
+                4,
+                2,
+                1,
+                0,
+                std::ptr::null(),
+                -0.2,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::UShort as u32,
+                1,
+                4,
+                2,
+                1,
+                0,
+                std::ptr::null(),
+                -0.2,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size, written);
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert_eq!(decoded.header.data_type, DataType::UShort);
+        assert_eq!(decoded.header.max_z_error, 0.5);
+        assert_eq!(decoded.data, DecodedData::UShort(values.to_vec()));
+    }
+
+    #[test]
+    fn c_abi_encode_rejects_float_negative_max_z_error() {
+        let data = [1.0f32, 1.25, 1.5, 1.75]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut computed_size = 123u32;
+        let mut out = [0u8; 128];
+        let mut written = 123u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSizeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                2,
+                2,
+                1,
+                0,
+                std::ptr::null(),
+                -0.2,
+                &mut computed_size,
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encodeForVersion(
+                data.as_ptr().cast(),
+                6,
+                DataType::Float as u32,
+                1,
+                2,
+                2,
+                1,
+                0,
+                std::ptr::null(),
+                -0.2,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::WrongParam as u32);
+        assert_eq!(encode_status, ErrCode::WrongParam as u32);
+        assert_eq!(computed_size, 0);
+        assert_eq!(written, 0);
     }
 
     #[test]
