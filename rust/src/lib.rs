@@ -36,7 +36,7 @@ mod support;
 
 pub use c_api as ffi;
 pub use data::decoded;
-pub use data::decoded::{decode_typed_values, DecodedData};
+pub use data::decoded::{convert_typed_bytes_to_f64, decode_typed_values, DecodedData};
 pub use data::types;
 pub use format::lerc1;
 pub use format::lerc2;

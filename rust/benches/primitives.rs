@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 use lerc::{
     compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
     compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-    compute_lerc2_tiled_raw_byte_len, decode_lerc1, decode_lerc2_bands_supported,
-    decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_typed_values, encode_lerc2_auto,
-    encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_constant,
-    encode_lerc2_float_huffman, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-    encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
-    encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
-    encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
+    compute_lerc2_tiled_raw_byte_len, convert_typed_bytes_to_f64, decode_lerc1,
+    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_typed_values,
+    encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
+    encode_lerc2_constant, encode_lerc2_float_huffman, encode_lerc2_one_sweep,
+    encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut,
+    encode_lerc2_tiled_lut_bands, encode_lerc2_tiled_lut_bands_with_no_data,
+    encode_lerc2_tiled_lut_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
     encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
     encode_lerc2_tiled_simple, encode_lerc2_tiled_simple_bands,
     encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
@@ -374,6 +374,7 @@ fn main() {
     let float_bytes: Vec<u8> = (0..250_000)
         .flat_map(|idx| ((idx as f32) * 0.25).to_le_bytes())
         .collect();
+    let mut converted_float_values = vec![0.0f64; 250_000];
 
     bench("rle-compress-1mb", 50, || {
         black_box(Rle::compress(black_box(&byte_data)).unwrap());
@@ -406,6 +407,16 @@ fn main() {
     });
     bench("typed-float-decode-250k", 1000, || {
         black_box(decode_typed_values(DataType::Float, black_box(&float_bytes)).unwrap());
+    });
+    bench("typed-float-convert-to-f64-250k", 1000, || {
+        black_box(
+            convert_typed_bytes_to_f64(
+                DataType::Float,
+                black_box(&float_bytes),
+                black_box(&mut converted_float_values),
+            )
+            .unwrap(),
+        );
     });
     bench("lerc1-header-parse", 100_000, || {
         black_box(get_lerc1_header_info(black_box(&lerc1_blob)).unwrap());

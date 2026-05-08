@@ -97,6 +97,45 @@ impl DecodedData {
         Ok(byte_len)
     }
 
+    /// Writes the scalar values converted to `data_type` as little-endian bytes.
+    ///
+    /// This mirrors the templated C++ decode behavior where callers choose the
+    /// output scalar type independently from the blob's native scalar type.
+    pub fn write_as_type_le_bytes(&self, data_type: DataType, output: &mut [u8]) -> Result<usize> {
+        let byte_len = self.len() * data_type.size_in_bytes();
+        if output.len() < byte_len {
+            return Err(LercError::BufferTooSmall);
+        }
+        if data_type == self.data_type() {
+            return self.write_le_bytes(output);
+        }
+
+        match data_type {
+            DataType::Char => write_converted_values(output, self, |value| (value as i8) as u8),
+            DataType::UChar => write_converted_values(output, self, |value| value as u8),
+            DataType::Short => {
+                write_converted_native_values(output, self, |value| (value as i16).to_le_bytes())
+            }
+            DataType::UShort => {
+                write_converted_native_values(output, self, |value| (value as u16).to_le_bytes())
+            }
+            DataType::Int => {
+                write_converted_native_values(output, self, |value| (value as i32).to_le_bytes())
+            }
+            DataType::UInt => {
+                write_converted_native_values(output, self, |value| (value as u32).to_le_bytes())
+            }
+            DataType::Float => {
+                write_converted_native_values(output, self, |value| (value as f32).to_le_bytes())
+            }
+            DataType::Double => {
+                write_converted_native_values(output, self, |value| value.to_le_bytes())
+            }
+        }
+
+        Ok(byte_len)
+    }
+
     /// Writes the scalar values to `output` as 64-bit floating point values.
     pub fn write_f64_values(&self, output: &mut [f64]) -> Result<usize> {
         let len = self.len();
@@ -117,6 +156,39 @@ impl DecodedData {
 
         Ok(len)
     }
+}
+
+fn for_each_as_f64(values: &DecodedData, mut f: impl FnMut(f64)) {
+    match values {
+        DecodedData::Char(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::UChar(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::Short(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::UShort(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::Int(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::UInt(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::Float(values) => values.iter().for_each(|&value| f(value as f64)),
+        DecodedData::Double(values) => values.iter().for_each(|&value| f(value)),
+    }
+}
+
+fn write_converted_values(output: &mut [u8], values: &DecodedData, convert: fn(f64) -> u8) {
+    let mut idx = 0usize;
+    for_each_as_f64(values, |value| {
+        output[idx] = convert(value);
+        idx += 1;
+    });
+}
+
+fn write_converted_native_values<const N: usize>(
+    output: &mut [u8],
+    values: &DecodedData,
+    convert: fn(f64) -> [u8; N],
+) {
+    let mut idx = 0usize;
+    for_each_as_f64(values, |value| {
+        output[idx..idx + N].copy_from_slice(&convert(value));
+        idx += N;
+    });
 }
 
 fn write_native_values<T, const N: usize>(
@@ -191,9 +263,23 @@ pub fn decode_typed_values(data_type: DataType, bytes: &[u8]) -> Result<DecodedD
     })
 }
 
+/// Converts little-endian typed LERC scalar bytes into 64-bit floating point values.
+///
+/// This is the safe Rust equivalent of the C++ `Lerc::ConvertToDouble` helper:
+/// `bytes` contains contiguous scalar values of `data_type`, and converted
+/// values are written into `output`.
+pub fn convert_typed_bytes_to_f64(
+    data_type: DataType,
+    bytes: &[u8],
+    output: &mut [f64],
+) -> Result<usize> {
+    let decoded = decode_typed_values(data_type, bytes)?;
+    decoded.write_f64_values(output)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode_typed_values, DecodedData};
+    use super::{convert_typed_bytes_to_f64, decode_typed_values, DecodedData};
     use crate::DataType;
 
     #[test]
@@ -292,6 +378,29 @@ mod tests {
     }
 
     #[test]
+    fn writes_decoded_values_as_requested_lerc_type() {
+        let data = DecodedData::UChar(vec![1, 2, 255]);
+        let mut output = [0u8; 6];
+        let written = data
+            .write_as_type_le_bytes(DataType::UShort, &mut output)
+            .unwrap();
+        assert_eq!(written, 6);
+        assert_eq!(output, [1, 0, 2, 0, 255, 0]);
+
+        let data = DecodedData::Float(vec![1.25, -2.5]);
+        let mut output = [0u8; 16];
+        data.write_as_type_le_bytes(DataType::Double, &mut output)
+            .unwrap();
+        assert_eq!(f64::from_le_bytes(output[..8].try_into().unwrap()), 1.25);
+        assert_eq!(f64::from_le_bytes(output[8..].try_into().unwrap()), -2.5);
+
+        let mut too_small = [0u8; 1];
+        assert!(DecodedData::Int(vec![1])
+            .write_as_type_le_bytes(DataType::Double, &mut too_small)
+            .is_err());
+    }
+
+    #[test]
     fn writes_decoded_values_as_f64() {
         let mut output = [0.0; 3];
         let written = DecodedData::Short(vec![-2, 0, 300])
@@ -309,5 +418,37 @@ mod tests {
         assert!(DecodedData::Double(vec![1.0])
             .write_f64_values(&mut [])
             .is_err());
+    }
+
+    #[test]
+    fn converts_typed_bytes_to_f64_like_cpp_convert_to_double() {
+        let mut short_bytes = Vec::new();
+        for value in [-2i16, 0, 300] {
+            short_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut output = [0.0; 3];
+        let written =
+            convert_typed_bytes_to_f64(DataType::Short, &short_bytes, &mut output).unwrap();
+        assert_eq!(written, 3);
+        assert_eq!(output, [-2.0, 0.0, 300.0]);
+
+        let mut uint_bytes = Vec::new();
+        for value in [0u32, u32::MAX] {
+            uint_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut output = [0.0; 2];
+        convert_typed_bytes_to_f64(DataType::UInt, &uint_bytes, &mut output).unwrap();
+        assert_eq!(output, [0.0, u32::MAX as f64]);
+
+        let mut double_bytes = Vec::new();
+        for value in [-1.25f64, 2.5] {
+            double_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut output = [0.0; 2];
+        convert_typed_bytes_to_f64(DataType::Double, &double_bytes, &mut output).unwrap();
+        assert_eq!(output, [-1.25, 2.5]);
+
+        assert!(convert_typed_bytes_to_f64(DataType::Short, &[1], &mut output).is_err());
+        assert!(convert_typed_bytes_to_f64(DataType::UShort, &[0, 1], &mut []).is_err());
     }
 }

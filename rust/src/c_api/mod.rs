@@ -681,6 +681,7 @@ fn validate_encode_shape(
         || n_cols <= 0
         || n_rows <= 0
         || n_bands <= 0
+        || max_z_err < 0.0
         || (n_masks > 0 && p_valid_bytes.is_null())
     {
         return Err(ErrCode::WrongParam);
@@ -695,9 +696,6 @@ fn validate_encode_shape(
                 Err(ErrCode::WrongParam)
             }
         })?;
-    if max_z_err < 0.0 && (parsed_type == DataType::Float || parsed_type == DataType::Double) {
-        return Err(ErrCode::WrongParam);
-    }
     let spec = EncodeSpec {
         data_type: parsed_type,
         n_depth: n_depth as usize,
@@ -741,6 +739,11 @@ unsafe fn try_encode_supported_blob(
     let has_active_no_data = uses_no_data
         .as_ref()
         .is_some_and(|uses| uses.iter().any(|&v| v != 0));
+    if has_active_no_data && max_z_err < 0.0 {
+        return Err(LercError::WrongParam(
+            "active no-data encode requires nonnegative max_z_error",
+        ));
+    }
     let no_data_values = if has_active_no_data {
         match no_data_values {
             Some(ptr) if !ptr.is_null() => {
@@ -759,7 +762,9 @@ unsafe fn try_encode_supported_blob(
     if let Some(uses_no_data) = uses_no_data.as_ref() {
         if has_active_no_data {
             if version < 6 {
-                return Ok(None);
+                return Err(LercError::WrongParam(
+                    "active no-data encode requires version 6 or newer",
+                ));
             }
             return encode_lerc2_auto_with_no_data(
                 spec,
@@ -1320,7 +1325,7 @@ mod tests {
         lerc_computeCompressedSize, lerc_computeCompressedSizeForVersion,
         lerc_computeCompressedSize_4D, lerc_decode, lerc_decodeToDouble, lerc_decodeToDouble_4D,
         lerc_decode_4D, lerc_encode, lerc_encodeForVersion, lerc_encode_4D, lerc_getBlobInfo,
-        lerc_getDataRanges,
+        lerc_getDataRanges, try_encode_supported_blob,
     };
     use crate::{
         compute_checksum_fletcher32, decode_lerc2_bands_supported, decode_lerc2_supported,
@@ -2508,15 +2513,15 @@ mod tests {
     }
 
     #[test]
-    fn c_abi_encode_accepts_integer_negative_max_z_error() {
+    fn c_abi_encode_rejects_integer_negative_max_z_error() {
         let values = [100u16, 101, 103, 106, 110, 115, 121, 128];
         let data = values
             .into_iter()
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
-        let mut computed_size = 0u32;
+        let mut computed_size = 123u32;
         let mut out = [0u8; 512];
-        let mut written = 0u32;
+        let mut written = 123u32;
 
         let size_status = unsafe {
             lerc_computeCompressedSizeForVersion(
@@ -2551,13 +2556,10 @@ mod tests {
             )
         };
 
-        assert_eq!(size_status, ErrCode::Ok as u32);
-        assert_eq!(encode_status, ErrCode::Ok as u32);
-        assert_eq!(computed_size, written);
-        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
-        assert_eq!(decoded.header.data_type, DataType::UShort);
-        assert_eq!(decoded.header.max_z_error, 0.5);
-        assert_eq!(decoded.data, DecodedData::UShort(values.to_vec()));
+        assert_eq!(size_status, ErrCode::WrongParam as u32);
+        assert_eq!(encode_status, ErrCode::WrongParam as u32);
+        assert_eq!(computed_size, 0);
+        assert_eq!(written, 0);
     }
 
     #[test]
@@ -2807,6 +2809,102 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_4d_encode_rejects_active_no_data_negative_max_z_error() {
+        let data = [1u8, 255, 3, 4, 5, 255, 7, 8, 9, 10, 11, 12];
+        let uses_no_data = [1u8];
+        let no_data_values = [255.0f64];
+        let mut num_bytes = 123u32;
+        let mut out = [0u8; 256];
+        let mut written = 123u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                -0.2,
+                &mut num_bytes,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::UChar as u32,
+                2,
+                3,
+                2,
+                1,
+                0,
+                ptr::null(),
+                -0.2,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::WrongParam as u32);
+        assert_eq!(encode_status, ErrCode::WrongParam as u32);
+        assert_eq!(num_bytes, 0);
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn c_abi_4d_encode_rejects_active_no_data_pre_v6_version() {
+        let data = [1u8, 255, 3, 4, 5, 255];
+        let uses_no_data = [1u8];
+        let no_data_values = [255.0f64];
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 0,
+        };
+
+        let err = unsafe {
+            try_encode_supported_blob(
+                data.as_ptr().cast(),
+                spec,
+                ptr::null(),
+                0.5,
+                5,
+                Some(uses_no_data.as_ptr()),
+                Some(no_data_values.as_ptr()),
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err.err_code(), ErrCode::WrongParam);
+
+        let blob = unsafe {
+            try_encode_supported_blob(
+                data.as_ptr().cast(),
+                spec,
+                ptr::null(),
+                0.5,
+                6,
+                Some(uses_no_data.as_ptr()),
+                Some(no_data_values.as_ptr()),
+            )
+        }
+        .unwrap()
+        .unwrap();
+        let decoded = decode_lerc2_supported(&blob).unwrap();
+        assert_eq!(decoded.header.version, 6);
+        assert_eq!(decoded.data, DecodedData::UChar(vec![1, 0, 3, 4, 5, 0]));
+    }
+
+    #[test]
     fn c_abi_4d_encode_supports_no_active_no_data() {
         let data = [1u8, 99, 3, 5, 7, 0, 10, 99, 30, 50, 70, 0];
         let valid = [1u8, 0, 1, 1, 1, 0];
@@ -2946,6 +3044,32 @@ mod tests {
                 2,
                 1,
                 DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(data, [7; 6]);
+        assert_eq!(mask, [1; 6]);
+    }
+
+    #[test]
+    fn c_abi_decode_converts_lerc2_to_requested_output_type() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0u16; 6];
+        let mut mask = [0u8; 6];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                3,
+                2,
+                1,
+                DataType::UShort as u32,
                 data.as_mut_ptr().cast(),
             )
         };

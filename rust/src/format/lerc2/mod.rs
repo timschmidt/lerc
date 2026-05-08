@@ -4273,8 +4273,7 @@ pub fn decode_lerc2_supported_into(
 
     let selected_bands = &decoded.bands[..spec.n_bands];
     for band in selected_bands {
-        if band.header.data_type != spec.data_type
-            || band.header.n_depth as usize != spec.n_depth
+        if band.header.n_depth as usize != spec.n_depth
             || band.header.n_cols as usize != spec.n_cols
             || band.header.n_rows as usize != spec.n_rows
         {
@@ -4298,7 +4297,9 @@ pub fn decode_lerc2_supported_into(
 
     let mut data_offset = 0usize;
     for band in selected_bands {
-        data_offset += band.write_data_le_bytes(&mut data_output[data_offset..])?;
+        data_offset += band
+            .data
+            .write_as_type_le_bytes(spec.data_type, &mut data_output[data_offset..])?;
     }
 
     let mask_bytes_written = match (spec.n_masks, mask_output) {
@@ -4557,7 +4558,7 @@ pub fn decode_lerc2_supported_with_previous(
                     read_huffman_float_payload(&mut reader, &header)?
                 } else {
                     return Err(LercError::Unsupported(
-                        "Lerc2 floating-point Huffman image modes are not ported yet",
+                        "unsupported Lerc2 floating-point Huffman image mode",
                     ));
                 }
             } else {
@@ -9370,6 +9371,52 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_floating_point_huffman_image_modes() {
+        let header_size = compute_lerc2_header_byte_len(6).unwrap();
+        let mut header = HeaderInfo {
+            version: 6,
+            checksum: 0,
+            n_rows: 1,
+            n_cols: 2,
+            n_depth: 1,
+            num_valid_pixel: 2,
+            micro_block_size: 8,
+            blob_size: 0,
+            n_blobs_more: 0,
+            b_pass_no_data_values: 0,
+            b_is_int: 0,
+            b_reserved_3: 0,
+            b_reserved_4: 0,
+            data_type: DataType::Float,
+            max_z_error: 0.0,
+            z_min: 1.0,
+            z_max: 2.5,
+            no_data_val: 0.0,
+            no_data_val_orig: 0.0,
+            header_size,
+        };
+        let mask_len = compute_lerc2_mask_byte_len(&header, None, true).unwrap();
+        let ranges = MinMaxRanges {
+            mins: vec![1.0],
+            maxs: vec![2.5],
+            bytes_consumed: 8,
+            min_max_equal: false,
+        };
+        let ranges_len = compute_lerc2_min_max_ranges_byte_len(&header).unwrap();
+        let payload = [0, 1];
+        header.blob_size = (header_size + mask_len + ranges_len + payload.len()) as i32;
+        let mut blob = blob_with_written_header_mask_and_ranges(&header, None, true, &ranges);
+        blob.extend_from_slice(&payload);
+        finalize_lerc2_checksum(&mut blob).unwrap();
+
+        let err = decode_lerc2_supported(&blob).unwrap_err();
+        assert!(matches!(
+            err,
+            LercError::Unsupported("unsupported Lerc2 floating-point Huffman image mode")
+        ));
+    }
+
+    #[test]
     fn encodes_float_huffman_blob_with_raw_wrapped_byte_planes() {
         let spec = EncodeSpec {
             n_cols: 3,
@@ -12763,6 +12810,35 @@ mod tests {
     }
 
     #[test]
+    fn decodes_lerc2_into_requested_output_type() {
+        let valid = [1, 0, 1, 1, 0, 1];
+        let ranges = [1u8, 20];
+        let payload = [1u8, 2, 3, 4];
+        let blob = synthetic_v4_one_sweep_blob(DataType::UChar, 1, &valid, &ranges, &payload);
+        let spec = DecodeIntoSpec {
+            data_type: DataType::UShort,
+            n_depth: 1,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let mut data = [0u8; 12];
+        let mut mask = [0u8; 6];
+
+        let result = decode_lerc_supported_into(&blob, spec, &mut data, Some(&mut mask)).unwrap();
+
+        assert_eq!(result.data_bytes_written, 12);
+        assert_eq!(result.mask_bytes_written, 6);
+        assert_eq!(mask, valid);
+        let values = data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [1, 0, 2, 3, 0, 4]);
+    }
+
+    #[test]
     fn decodes_supported_lerc_dispatches_lerc1_into_c_api_style_buffers() {
         let blob = fixture("world.lerc1");
         let spec = DecodeIntoSpec {
@@ -12916,15 +12992,6 @@ mod tests {
         let mut mask = [0u8; 6];
         let mut spec_with_mask = spec;
         spec_with_mask.n_masks = 1;
-        let mut bad_type = spec;
-        bad_type.data_type = DataType::UInt;
-        let err =
-            decode_lerc2_supported_into(&blob, bad_type, &mut data, Some(&mut mask)).unwrap_err();
-        assert_eq!(
-            err,
-            LercError::WrongParam("decode output shape does not match the Lerc2 blob")
-        );
-
         let mut bad_shape = spec;
         bad_shape.n_cols = 2;
         let err =
