@@ -803,6 +803,36 @@ mod tests {
         blob
     }
 
+    fn synthetic_lerc1_with_count_and_z_parts(
+        n_cols: i32,
+        n_rows: i32,
+        count_tiles: (i32, i32),
+        count_payload: &[u8],
+        count_max: f32,
+        z_tiles: (i32, i32),
+        z_payload: &[u8],
+        z_max: f32,
+    ) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(super::CNT_Z_IMAGE_KEY);
+        blob.extend_from_slice(&11i32.to_le_bytes());
+        blob.extend_from_slice(&8i32.to_le_bytes());
+        blob.extend_from_slice(&n_rows.to_le_bytes());
+        blob.extend_from_slice(&n_cols.to_le_bytes());
+        blob.extend_from_slice(&0.1f64.to_le_bytes());
+        blob.extend_from_slice(&count_tiles.0.to_le_bytes());
+        blob.extend_from_slice(&count_tiles.1.to_le_bytes());
+        blob.extend_from_slice(&(count_payload.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&count_max.to_le_bytes());
+        blob.extend_from_slice(count_payload);
+        blob.extend_from_slice(&z_tiles.0.to_le_bytes());
+        blob.extend_from_slice(&z_tiles.1.to_le_bytes());
+        blob.extend_from_slice(&(z_payload.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&z_max.to_le_bytes());
+        blob.extend_from_slice(z_payload);
+        blob
+    }
+
     fn raw_z_tile(values: &[f32]) -> Vec<u8> {
         let mut payload = vec![0u8];
         for value in values {
@@ -922,6 +952,80 @@ mod tests {
         assert_eq!(stats.bytes_consumed, blob.len());
         assert_eq!(stats.z_min, -27.458_635);
         assert_eq!(stats.z_max, 5474.173);
+    }
+
+    #[test]
+    fn decodes_lerc1_constant_z_tiles() {
+        let count_payload = [];
+        let zero_z_payload = [2u8];
+        let zero_blob = synthetic_lerc1_with_count_and_z_parts(
+            2,
+            2,
+            (0, 0),
+            &count_payload,
+            1.0,
+            (1, 1),
+            &zero_z_payload,
+            0.0,
+        );
+
+        let zero_decoded = decode_lerc1(&zero_blob).unwrap();
+        assert_eq!(zero_decoded.mask_info.mask.to_byte_mask(), [1, 1, 1, 1]);
+        assert_eq!(zero_decoded.values, [0.0, 0.0, 0.0, 0.0]);
+
+        let mut offset_z_payload = Vec::new();
+        offset_z_payload.push(3); // constant offset tile with 4-byte offset
+        offset_z_payload.extend_from_slice(&7.5f32.to_le_bytes());
+        let offset_blob = synthetic_lerc1_with_count_and_z_parts(
+            2,
+            2,
+            (0, 0),
+            &count_payload,
+            1.0,
+            (1, 1),
+            &offset_z_payload,
+            7.5,
+        );
+
+        let (_, _, stats) = read_lerc1_z_stats(&offset_blob).unwrap();
+        assert_eq!(stats.z_min, 7.5);
+        assert_eq!(stats.z_max, 7.5);
+        assert_eq!(stats.num_valid_pixels, 4);
+        let offset_decoded = decode_lerc1(&offset_blob).unwrap();
+        assert_eq!(offset_decoded.values, [7.5, 7.5, 7.5, 7.5]);
+    }
+
+    #[test]
+    fn decodes_lerc1_bit_stuffed_z_tile_with_partial_mask() {
+        let mut count_payload = Vec::new();
+        count_payload.push(0); // raw float counts
+        for value in [1.0f32, 0.0, 1.0, 1.0] {
+            count_payload.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut z_payload = Vec::new();
+        z_payload.push(0b1000_0001); // one-byte offset plus bit-stuffed deltas
+        z_payload.push(10); // offset
+        z_payload.extend_from_slice(&BitStuffer2::encode_simple(&[0, 2, 4], 2).unwrap());
+        let blob = synthetic_lerc1_with_count_and_z_parts(
+            2,
+            2,
+            (1, 1),
+            &count_payload,
+            1.0,
+            (1, 1),
+            &z_payload,
+            10.8,
+        );
+
+        let decoded = decode_lerc1(&blob).unwrap();
+        assert_eq!(decoded.mask_info.mask.to_byte_mask(), [1, 0, 1, 1]);
+        assert_eq!(decoded.values, [10.0, 0.0, 10.4, 10.8]);
+
+        let (_, _, stats) = read_lerc1_z_stats(&blob).unwrap();
+        assert_eq!(stats.z_min, 10.0);
+        assert_eq!(stats.z_max, 10.8);
+        assert_eq!(stats.num_valid_pixels, 3);
     }
 
     #[test]

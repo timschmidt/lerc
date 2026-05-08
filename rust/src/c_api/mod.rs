@@ -299,10 +299,9 @@ pub unsafe extern "C" fn lerc_encode_4D(
 
 /// C ABI equivalent of `lerc_getBlobInfo`.
 ///
-/// This function currently supports Lerc2 blobs handled by the Rust metadata
-/// parser and the checked-in legacy Lerc1 metadata path. It fills the
-/// caller-provided arrays using the same order and partial-fill behavior as
-/// the C++ API.
+/// This function supports Lerc2 blobs handled by the Rust metadata parser and
+/// the checked-in legacy Lerc1 metadata path. It fills the caller-provided
+/// arrays using the same order and partial-fill behavior as the C++ API.
 ///
 /// # Safety
 ///
@@ -334,9 +333,9 @@ pub unsafe extern "C" fn lerc_getBlobInfo(
 
 /// C ABI equivalent of `lerc_getDataRanges`.
 ///
-/// This function currently supports Lerc2 blobs handled by the Rust metadata
-/// parser and the checked-in legacy Lerc1 metadata path. It writes minima and
-/// maxima in band-major, depth-minor order.
+/// This function supports Lerc2 blobs handled by the Rust metadata parser and
+/// the checked-in legacy Lerc1 metadata path. It writes minima and maxima in
+/// band-major, depth-minor order.
 ///
 /// # Safety
 ///
@@ -1499,6 +1498,19 @@ mod tests {
             }
         }
         (z_min, z_max)
+    }
+
+    fn append_test_value(bytes: &mut Vec<u8>, data_type: DataType, value: f64) {
+        match data_type {
+            DataType::Char => bytes.push(value as i8 as u8),
+            DataType::UChar => bytes.push(value as u8),
+            DataType::Short => bytes.extend_from_slice(&(value as i16).to_le_bytes()),
+            DataType::UShort => bytes.extend_from_slice(&(value as u16).to_le_bytes()),
+            DataType::Int => bytes.extend_from_slice(&(value as i32).to_le_bytes()),
+            DataType::UInt => bytes.extend_from_slice(&(value as u32).to_le_bytes()),
+            DataType::Float => bytes.extend_from_slice(&(value as f32).to_le_bytes()),
+            DataType::Double => bytes.extend_from_slice(&value.to_le_bytes()),
+        }
     }
 
     #[test]
@@ -3273,6 +3285,110 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_4d_encode_restores_no_data_for_all_native_data_types() {
+        let cases = [
+            (DataType::Char, -128.0),
+            (DataType::UChar, u8::MAX as f64),
+            (DataType::Short, i16::MIN as f64),
+            (DataType::UShort, u16::MAX as f64),
+            (DataType::Int, i32::MIN as f64),
+            (DataType::UInt, u32::MAX as f64),
+            (DataType::Float, -9999.0),
+            (DataType::Double, -9999.0),
+        ];
+
+        for (data_type, no_data_value) in cases {
+            let mut data = Vec::new();
+            for value in [1.0, 2.0, no_data_value, no_data_value, no_data_value, 3.0] {
+                append_test_value(&mut data, data_type, value);
+            }
+            let uses_no_data = [1u8];
+            let no_data_values = [no_data_value];
+            let max_z_err = if matches!(data_type, DataType::Float | DataType::Double) {
+                0.0
+            } else {
+                0.5
+            };
+            let mut computed_size = 0u32;
+            let mut out = [0u8; 512];
+            let mut written = 0u32;
+
+            let status = unsafe {
+                lerc_computeCompressedSize_4D(
+                    data.as_ptr().cast(),
+                    data_type as u32,
+                    2,
+                    3,
+                    1,
+                    1,
+                    0,
+                    ptr::null(),
+                    max_z_err,
+                    &mut computed_size,
+                    uses_no_data.as_ptr(),
+                    no_data_values.as_ptr(),
+                )
+            };
+
+            assert_eq!(status, ErrCode::Ok as u32, "{data_type:?}");
+
+            let status = unsafe {
+                lerc_encode_4D(
+                    data.as_ptr().cast(),
+                    data_type as u32,
+                    2,
+                    3,
+                    1,
+                    1,
+                    0,
+                    ptr::null(),
+                    max_z_err,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    &mut written,
+                    uses_no_data.as_ptr(),
+                    no_data_values.as_ptr(),
+                )
+            };
+
+            assert_eq!(status, ErrCode::Ok as u32, "{data_type:?}");
+            assert_eq!(written, computed_size, "{data_type:?}");
+            let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+            assert!(decoded.header.has_no_data_values(), "{data_type:?}");
+            assert_eq!(decoded.header.no_data_val_orig, no_data_value);
+            assert_eq!(decoded.mask.count_valid_bits(), 2, "{data_type:?}");
+
+            match (data_type, decoded.data) {
+                (DataType::Char, DecodedData::Char(values)) => {
+                    assert_eq!(values, vec![1, 2, 0, 0, no_data_value as i8, 3]);
+                }
+                (DataType::UChar, DecodedData::UChar(values)) => {
+                    assert_eq!(values, vec![1, 2, 0, 0, no_data_value as u8, 3]);
+                }
+                (DataType::Short, DecodedData::Short(values)) => {
+                    assert_eq!(values, vec![1, 2, 0, 0, no_data_value as i16, 3]);
+                }
+                (DataType::UShort, DecodedData::UShort(values)) => {
+                    assert_eq!(values, vec![1, 2, 0, 0, no_data_value as u16, 3]);
+                }
+                (DataType::Int, DecodedData::Int(values)) => {
+                    assert_eq!(values, vec![1, 2, 0, 0, no_data_value as i32, 3]);
+                }
+                (DataType::UInt, DecodedData::UInt(values)) => {
+                    assert_eq!(values, vec![1, 2, 0, 0, no_data_value as u32, 3]);
+                }
+                (DataType::Float, DecodedData::Float(values)) => {
+                    assert_eq!(values, vec![1.0, 2.0, 0.0, 0.0, no_data_value as f32, 3.0]);
+                }
+                (DataType::Double, DecodedData::Double(values)) => {
+                    assert_eq!(values, vec![1.0, 2.0, 0.0, 0.0, no_data_value, 3.0]);
+                }
+                (_, data) => panic!("unexpected decoded data for {data_type:?}: {data:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn c_abi_decode_writes_data_and_mask() {
         let blob = synthetic_v4_const_blob();
         let mut data = [0u8; 6];
@@ -4168,8 +4284,27 @@ mod tests {
         let data = [1.0f32, 2.0, f32::NAN, 3.0, f32::NAN, f32::NAN];
         let uses_no_data = [1u8];
         let no_data_values = [-9999.0f64];
+        let mut computed_size = 0u32;
         let mut blob = [0u8; 256];
         let mut written = 0u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                2,
+                3,
+                1,
+                1,
+                0,
+                ptr::null(),
+                0.0,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Ok as u32);
 
         let status = unsafe {
             lerc_encode_4D(
@@ -4190,6 +4325,7 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::Ok as u32);
+        assert_eq!(written, computed_size);
 
         let mut decoded = [0.0f32; 6];
         let mut decoded_mask = [0u8; 3];
@@ -4224,8 +4360,29 @@ mod tests {
         let data = [1.0f32, -9999.0, 2.0, 3.0, 10.0, 11.0, f32::NAN, 12.0];
         let uses_no_data = [1u8, 0];
         let no_data_values = [-9999.0f64, 0.0];
+        let mut computed_size = 123u32;
         let mut blob = [0u8; 256];
         let mut written = 123u32;
+
+        let status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                2,
+                2,
+                1,
+                2,
+                0,
+                ptr::null(),
+                0.0,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::NaN as u32);
+        assert_eq!(computed_size, 0);
 
         let status = unsafe {
             lerc_encode_4D(

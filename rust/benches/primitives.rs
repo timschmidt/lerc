@@ -2,11 +2,13 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lerc::{
-    compute_checksum_fletcher32, compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
+    blob_info, compute_checksum_fletcher32, compute_compressed_size, compute_compressed_size_4d,
+    compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
     compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-    compute_lerc2_tiled_raw_byte_len, convert_typed_bytes_to_f64, decode_lerc1,
-    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
-    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_typed_values,
+    compute_lerc2_tiled_raw_byte_len, convert_typed_bytes_to_f64, data_ranges, decode,
+    decode_4d_into, decode_4d_to_f64, decode_into, decode_lerc1, decode_lerc2_bands_supported,
+    decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
+    decode_lerc_supported_to_f64, decode_to_f64, decode_typed_values, encode, encode_4d,
     encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
     encode_lerc2_constant, encode_lerc2_float_huffman, encode_lerc2_one_sweep,
     encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut,
@@ -17,11 +19,12 @@ use lerc::{
     encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
     encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
     get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
-    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, read_lerc1_count_mask,
-    read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask, read_lerc2_min_max_ranges,
-    read_lerc2_tiled_payload, read_lerc2_tiled_raw, validate_lerc2_checksum, write_lerc2_header,
-    write_lerc2_mask, write_lerc2_min_max_ranges, write_lerc2_one_sweep, write_lerc2_tiled_raw,
-    BitMask, BitStuffer2, DataType, DecodeIntoSpec, EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
+    get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, no_data_info,
+    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
+    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
+    write_lerc2_one_sweep, write_lerc2_tiled_raw, BitMask, BitStuffer2, DataType, DecodeIntoSpec,
+    EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
 };
 
 fn bench<F: FnMut()>(name: &str, iterations: u32, mut f: F) {
@@ -569,6 +572,21 @@ fn main() {
     bench("lerc2-no-data-info-v6-synthetic", 100_000, || {
         black_box(get_lerc2_no_data_info(black_box(&one_sweep_no_data_blob), 1).unwrap());
     });
+    bench("api-blob-info-v4-synthetic", 100_000, || {
+        black_box(blob_info(black_box(&one_sweep_bands_blob)).unwrap());
+    });
+    bench("api-data-ranges-v4-synthetic", 100_000, || {
+        black_box(data_ranges(black_box(&one_sweep_bands_blob)).unwrap());
+    });
+    bench("api-no-data-info-v6-synthetic", 100_000, || {
+        black_box(no_data_info(black_box(&one_sweep_no_data_blob), 1).unwrap());
+    });
+    bench("api-decode-v4-synthetic", 100_000, || {
+        black_box(decode(black_box(&one_sweep_bands_blob)).unwrap());
+    });
+    bench("api-decode-no-data-v6-synthetic", 100_000, || {
+        black_box(decode(black_box(&one_sweep_no_data_blob)).unwrap());
+    });
     bench("lerc2-supported-decode-float-fixture", 100, || {
         black_box(decode_lerc2_supported(black_box(&float_fixture_blob)).unwrap());
     });
@@ -893,6 +911,15 @@ fn main() {
             encode_lerc2_auto(lut_encode_spec, black_box(&lut_encode_data), 0.5, None, 6).unwrap(),
         );
     });
+    bench("api-compute-size-lut-tiled-encode-v6", 100_000, || {
+        black_box(
+            compute_compressed_size(lut_encode_spec, black_box(&lut_encode_data), 0.5, None)
+                .unwrap(),
+        );
+    });
+    bench("api-encode-lut-tiled-v6", 100_000, || {
+        black_box(encode(lut_encode_spec, black_box(&lut_encode_data), 0.5, None).unwrap());
+    });
     bench("lerc2-auto-byte-huffman-bands-encode-v6", 10_000, || {
         black_box(
             encode_lerc2_auto(
@@ -929,6 +956,32 @@ fn main() {
                 Some(black_box(&lut_no_data_uses)),
                 Some(black_box(&lut_no_data_values)),
                 6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-compute-size-4d-no-data-v6", 100_000, || {
+        black_box(
+            compute_compressed_size_4d(
+                lut_diff_encode_spec,
+                black_box(&lut_no_data_encode_data),
+                0.5,
+                None,
+                Some(black_box(&lut_no_data_uses)),
+                Some(black_box(&lut_no_data_values)),
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-encode-4d-no-data-v6", 100_000, || {
+        black_box(
+            encode_4d(
+                lut_diff_encode_spec,
+                black_box(&lut_no_data_encode_data),
+                0.5,
+                None,
+                Some(black_box(&lut_no_data_uses)),
+                Some(black_box(&lut_no_data_values)),
             )
             .unwrap(),
         );
@@ -1251,6 +1304,44 @@ fn main() {
                 decode_into_spec,
                 black_box(&mut decode_to_f64_data),
                 Some(black_box(&mut decode_to_f64_mask)),
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-decode-into-v4-synthetic", 100_000, || {
+        black_box(decode_into(black_box(&one_sweep_bands_blob), decode_into_spec).unwrap());
+    });
+    bench("api-decode-to-f64-v4-synthetic", 100_000, || {
+        black_box(decode_to_f64(black_box(&one_sweep_bands_blob), decode_into_spec).unwrap());
+    });
+    bench("api-decode-4d-into-v6-no-data-synthetic", 100_000, || {
+        black_box(
+            decode_4d_into(
+                black_box(&one_sweep_no_data_blob),
+                DecodeIntoSpec {
+                    data_type: DataType::UChar,
+                    n_depth: 2,
+                    n_cols: 3,
+                    n_rows: 2,
+                    n_bands: 1,
+                    n_masks: 1,
+                },
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-decode-4d-to-f64-v6-no-data-synthetic", 100_000, || {
+        black_box(
+            decode_4d_to_f64(
+                black_box(&one_sweep_no_data_blob),
+                DecodeIntoSpec {
+                    data_type: DataType::UChar,
+                    n_depth: 2,
+                    n_cols: 3,
+                    n_rows: 2,
+                    n_bands: 1,
+                    n_masks: 1,
+                },
             )
             .unwrap(),
         );

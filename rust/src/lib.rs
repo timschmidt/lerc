@@ -16,11 +16,11 @@ limitations under the License.
 
 #![deny(missing_docs)]
 
-//! Native Rust port of selected LERC codec components.
+//! Native Rust port of LERC codec components.
 //!
-//! This crate currently contains safe Rust ports of low-level codec primitives.
-//! The full LERC image encoder/decoder will be layered on these modules as the
-//! port progresses.
+//! This crate contains reusable codec primitives, supported Lerc1/Lerc2
+//! decoders and encoders, allocation-friendly safe workflow helpers, and C ABI
+//! entry points for the ported public surface.
 
 /// Safe Rust API facade modules.
 pub mod api;
@@ -34,6 +34,13 @@ pub mod format;
 pub mod primitives;
 mod support;
 
+pub use api::{
+    blob_info, compute_compressed_size, compute_compressed_size_4d,
+    compute_compressed_size_4d_for_version, compute_compressed_size_for_version, data_ranges,
+    decode, decode_4d_into, decode_4d_to_f64, decode_into, decode_to_f64, encode, encode_4d,
+    encode_4d_for_version, encode_for_version, no_data_info, Decoded4DBuffer, DecodedBuffer,
+    DecodedLerc, DEFAULT_CODEC_VERSION,
+};
 pub use c_api as ffi;
 pub use data::decoded;
 pub use data::decoded::{convert_typed_bytes_to_f64, decode_typed_values, DecodedData};
