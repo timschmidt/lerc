@@ -1181,10 +1181,12 @@ pub fn encode_lerc2_uncompressed_with_no_data(
 ///
 /// This is the no-data-aware variant of [`encode_lerc2_auto`]. It keeps
 /// [`encode_lerc2_uncompressed_with_no_data`] as the baseline, tries the
-/// LUT-capable tiled encoder, and for version 6+ `UChar`/`Char` data with
-/// `max_z_error == 0.5`, also tries byte Huffman after applying the same
-/// no-data mask filtering and internal-sentinel remap as the uncompressed
-/// no-data helpers. The smallest valid blob is returned.
+/// LUT-capable tiled encoder, tries version 6 floating-point Huffman for
+/// lossless `Float`/`Double` data when it clears the C++ 10% margin, and for
+/// version 6+ `UChar`/`Char` data with `max_z_error == 0.5`, also tries byte
+/// Huffman after applying the same no-data mask filtering and internal-sentinel
+/// remap as the uncompressed no-data helpers. The smallest valid blob is
+/// returned, subject to the floating-point Huffman margin.
 pub fn encode_lerc2_auto_with_no_data(
     spec: EncodeSpec,
     data: &[u8],
@@ -1210,18 +1212,52 @@ pub fn encode_lerc2_auto_with_no_data(
         no_data_values,
         version,
     )?;
+    let mut float_huffman_margin_len = None;
     if version >= 2 {
-        match encode_lerc2_tiled_lut_bands_with_no_data(
+        for micro_block_size in [8, 16] {
+            match encode_lerc2_tiled_lut_bands_with_no_data(
+                spec,
+                data,
+                max_z_error,
+                masks,
+                uses_no_data,
+                no_data_values,
+                version,
+                micro_block_size,
+            ) {
+                Ok(tiled) => {
+                    if float_huffman_margin_len.is_none() {
+                        float_huffman_margin_len = Some(tiled.len());
+                    }
+                    if tiled.len() < best.len() {
+                        best = tiled;
+                    }
+                }
+                Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    if matches!(spec.data_type, DataType::Float | DataType::Double)
+        && version == 6
+        && max_z_error == 0.0
+    {
+        match encode_lerc2_float_huffman_bands_with_no_data(
             spec,
             data,
-            max_z_error,
             masks,
             uses_no_data,
             no_data_values,
             version,
-            8,
         ) {
-            Ok(tiled) if tiled.len() < best.len() => best = tiled,
+            Ok(huffman)
+                if floating_point_huffman_beats_non_huffman_like_cpp(
+                    huffman.len(),
+                    float_huffman_margin_len.unwrap_or(best.len()),
+                ) =>
+            {
+                best = huffman;
+            }
             Ok(_) => {}
             Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
             Err(err) => return Err(err),
@@ -1259,9 +1295,11 @@ pub fn encode_lerc2_auto_with_no_data(
 ///
 /// The selector keeps [`encode_lerc2_uncompressed`] as the baseline, tries the
 /// LUT-capable tiled encoder, for version 6 `Float`/`Double` data with
-/// `max_z_error == 0`, tries floating-point Huffman, and for `UChar`/`Char`
+/// `max_z_error == 0`, tries floating-point Huffman when it beats the
+/// non-Huffman baseline by the C++ encoder's 10% margin, and for `UChar`/`Char`
 /// data with `max_z_error == 0.5`, also tries byte Huffman. The smallest valid
-/// blob is returned.
+/// byte or tiled blob is returned, while floating-point Huffman follows the C++
+/// margin.
 pub fn encode_lerc2_auto(
     spec: EncodeSpec,
     data: &[u8],
@@ -1270,12 +1308,28 @@ pub fn encode_lerc2_auto(
     version: i32,
 ) -> Result<Vec<u8>> {
     let mut best = encode_lerc2_uncompressed(spec, data, max_z_error, masks, version)?;
+    let mut float_huffman_margin_len = None;
     if version >= 2 {
-        match encode_lerc2_tiled_lut_bands(spec, data, max_z_error, masks, version, 8) {
-            Ok(tiled) if tiled.len() < best.len() => best = tiled,
-            Ok(_) => {}
-            Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
-            Err(err) => return Err(err),
+        for micro_block_size in [8, 16] {
+            match encode_lerc2_tiled_lut_bands(
+                spec,
+                data,
+                max_z_error,
+                masks,
+                version,
+                micro_block_size,
+            ) {
+                Ok(tiled) => {
+                    if float_huffman_margin_len.is_none() {
+                        float_huffman_margin_len = Some(tiled.len());
+                    }
+                    if tiled.len() < best.len() {
+                        best = tiled;
+                    }
+                }
+                Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
+                Err(err) => return Err(err),
+            }
         }
     }
     if matches!(spec.data_type, DataType::Float | DataType::Double)
@@ -1283,7 +1337,14 @@ pub fn encode_lerc2_auto(
         && max_z_error == 0.0
     {
         match encode_lerc2_float_huffman_bands(spec, data, masks, version) {
-            Ok(huffman) if huffman.len() < best.len() => best = huffman,
+            Ok(huffman)
+                if floating_point_huffman_beats_non_huffman_like_cpp(
+                    huffman.len(),
+                    float_huffman_margin_len.unwrap_or(best.len()),
+                ) =>
+            {
+                best = huffman;
+            }
             Ok(_) => {}
             Err(LercError::WrongParam(_)) | Err(LercError::Unsupported(_)) => {}
             Err(err) => return Err(err),
@@ -1332,6 +1393,16 @@ pub fn encode_lerc2_auto(
         }
         Err(LercError::WrongParam("byte Huffman encode requires at least two symbols")) => Ok(best),
         Err(err) => Err(err),
+    }
+}
+
+fn floating_point_huffman_beats_non_huffman_like_cpp(
+    huffman_len: usize,
+    non_huffman_len: usize,
+) -> bool {
+    match (huffman_len.checked_mul(10), non_huffman_len.checked_mul(9)) {
+        (Some(huffman_scaled), Some(non_huffman_scaled)) => huffman_scaled < non_huffman_scaled,
+        _ => false,
     }
 }
 
@@ -1449,6 +1520,34 @@ pub fn encode_lerc2_float_huffman_bands(
     masks: Option<&[u8]>,
     version: i32,
 ) -> Result<Vec<u8>> {
+    encode_lerc2_float_huffman_bands_impl(spec, data, masks, None, None, version)
+}
+
+/// Encodes band-major floating-point data as FP-Huffman blobs with no-data metadata.
+///
+/// This version 6 helper expects source values for active bands to already use
+/// the declared no-data sentinel. Single-depth all-sentinel pixels are moved to
+/// the mask only; multi-depth mixed sentinel samples are remapped to an internal
+/// sentinel when needed and restored during decode.
+pub fn encode_lerc2_float_huffman_bands_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
+    encode_lerc2_float_huffman_bands_impl(spec, data, masks, uses_no_data, no_data_values, version)
+}
+
+fn encode_lerc2_float_huffman_bands_impl(
+    spec: EncodeSpec,
+    data: &[u8],
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+) -> Result<Vec<u8>> {
     validate_encode_bands_inputs(
         spec,
         data,
@@ -1465,6 +1564,7 @@ pub fn encode_lerc2_float_huffman_bands(
             "floating-point Huffman Lerc2 encode requires Float or Double data",
         ));
     }
+    validate_encode_no_data_inputs(spec, uses_no_data, no_data_values, version)?;
 
     let band_spec = EncodeSpec {
         n_bands: 1,
@@ -1509,32 +1609,57 @@ pub fn encode_lerc2_float_huffman_bands(
             }
             None => None,
         };
+        let no_data = uses_no_data
+            .and_then(|uses| uses.get(band).copied())
+            .filter(|&uses| uses != 0)
+            .and_then(|_| no_data_values.and_then(|values| values.get(band).copied()))
+            .map(|value| (value, value));
+        let prepared = if let Some((_, no_data_orig)) = no_data {
+            Some(prepare_no_data_band_for_encode(
+                band_spec,
+                band_data,
+                mask.as_ref(),
+                no_data_orig,
+                0.0,
+            )?)
+        } else {
+            None
+        };
+        let prepared_data = prepared
+            .as_ref()
+            .map(|prepared| prepared.data.as_slice())
+            .unwrap_or(band_data);
+        let prepared_mask = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.mask.as_ref())
+            .or(mask.as_ref());
+        let prepared_no_data = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.no_data)
+            .or_else(|| (spec.n_depth > 1).then_some(no_data).flatten());
         let encode_mask = if band == 0 {
             true
-        } else if spec.n_masks == 1 {
+        } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (mask.as_ref(), &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(prepared_mask, previous_mask.as_ref())
         };
         let n_blobs_more = i32::try_from(spec.n_bands - 1 - band)
             .map_err(|_| LercError::WrongParam("Lerc2 band count overflow"))?;
         let band_blob = encode_lerc2_float_huffman_band(
             EncodeSpec {
-                n_masks: usize::from(mask.is_some()),
+                n_masks: usize::from(prepared_mask.is_some()),
                 ..band_spec
             },
-            band_data,
-            mask.as_ref(),
+            prepared_data,
+            prepared_mask,
             version,
             n_blobs_more,
             encode_mask,
+            prepared_no_data,
         )?;
         blob.extend_from_slice(&band_blob);
-        previous_mask = mask;
+        previous_mask = prepared_mask.cloned();
     }
 
     Ok(blob)
@@ -1561,7 +1686,66 @@ pub fn encode_lerc2_float_huffman(
         )?;
         return encode_lerc2_float_huffman_bands(spec, data, mask_bytes.as_deref(), version);
     }
-    encode_lerc2_float_huffman_band(spec, data, mask, version, 0, true)
+    encode_lerc2_float_huffman_band(spec, data, mask, version, 0, true, None)
+}
+
+/// Encodes one or more floating-point Lerc2 bands as FP-Huffman with no-data metadata.
+///
+/// Multi-band input supports no mask or one shared mask. The source data should
+/// contain `no_data_value` for samples that should be treated as no-data.
+pub fn encode_lerc2_float_huffman_with_no_data(
+    spec: EncodeSpec,
+    data: &[u8],
+    mask: Option<&BitMask>,
+    no_data_value: f64,
+    version: i32,
+) -> Result<Vec<u8>> {
+    if spec.n_bands > 1 {
+        let mask_bytes = shared_mask_bytes_for_convenience_encode(
+            spec,
+            mask,
+            "floating-point Huffman Lerc2 no-data encode helper supports at most one shared mask",
+        )?;
+        let (uses_no_data, no_data_values) = repeated_no_data_vectors(spec.n_bands, no_data_value);
+        return encode_lerc2_float_huffman_bands_with_no_data(
+            spec,
+            data,
+            mask_bytes.as_deref(),
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            version,
+        );
+    }
+    validate_single_band_encode_inputs(spec, data, mask, "floating-point Huffman no-data encode")?;
+    if version != 6 {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires version 6",
+        ));
+    }
+    if !matches!(spec.data_type, DataType::Float | DataType::Double) {
+        return Err(LercError::WrongParam(
+            "floating-point Huffman Lerc2 encode requires Float or Double data",
+        ));
+    }
+    let prepared = prepare_no_data_band_for_encode(spec, data, mask, no_data_value, 0.0)?;
+    let prepared_data = prepared.data.as_slice();
+    let prepared_mask = prepared.mask.as_ref().or(mask);
+    encode_lerc2_float_huffman_band(
+        EncodeSpec {
+            n_masks: usize::from(prepared_mask.is_some()),
+            ..spec
+        },
+        prepared_data,
+        prepared_mask,
+        version,
+        0,
+        true,
+        if spec.n_depth > 1 {
+            prepared.no_data.or(Some((no_data_value, no_data_value)))
+        } else {
+            None
+        },
+    )
 }
 
 fn encode_lerc2_byte_huffman_bands_impl(
@@ -1667,11 +1851,7 @@ fn encode_lerc2_byte_huffman_bands_impl(
         } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (prepared_mask, &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(prepared_mask, previous_mask.as_ref())
         };
         let band_blob = encode_lerc2_byte_huffman_band(
             EncodeSpec {
@@ -2307,6 +2487,7 @@ fn encode_lerc2_float_huffman_band(
     version: i32,
     n_blobs_more: i32,
     encode_partial_mask: bool,
+    no_data: Option<(f64, f64)>,
 ) -> Result<Vec<u8>> {
     validate_single_band_encode_inputs(spec, data, mask, "floating-point Huffman Lerc2 encode")?;
     if version != 6 {
@@ -2351,7 +2532,7 @@ fn encode_lerc2_float_huffman_band(
         micro_block_size: 8,
         blob_size: 1,
         n_blobs_more,
-        b_pass_no_data_values: 0,
+        b_pass_no_data_values: u8::from(no_data.is_some()),
         b_is_int: 0,
         b_reserved_3: 0,
         b_reserved_4: 0,
@@ -2359,8 +2540,8 @@ fn encode_lerc2_float_huffman_band(
         max_z_error: 0.0,
         z_min,
         z_max,
-        no_data_val: 0.0,
-        no_data_val_orig: 0.0,
+        no_data_val: no_data.map(|values| values.0).unwrap_or(0.0),
+        no_data_val_orig: no_data.map(|values| values.1).unwrap_or(0.0),
         header_size,
     };
 
@@ -2742,11 +2923,7 @@ pub fn encode_lerc2_tiled_simple_bands(
         } else if spec.n_masks == 1 {
             false
         } else {
-            match (mask.as_ref(), &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(mask.as_ref(), previous_mask.as_ref())
         };
         let band_blob = encode_lerc2_tiled_simple_band(
             EncodeSpec {
@@ -2851,11 +3028,7 @@ pub fn encode_lerc2_tiled_lut_bands(
         } else if spec.n_masks == 1 {
             false
         } else {
-            match (mask.as_ref(), &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(mask.as_ref(), previous_mask.as_ref())
         };
         let band_blob = encode_lerc2_tiled_simple_band(
             EncodeSpec {
@@ -2997,11 +3170,7 @@ pub fn encode_lerc2_tiled_lut_bands_with_no_data(
         } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (prepared_mask, &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(prepared_mask, previous_mask.as_ref())
         };
         let band_blob = encode_lerc2_tiled_simple_band(
             EncodeSpec {
@@ -3143,11 +3312,7 @@ pub fn encode_lerc2_tiled_simple_bands_with_no_data(
         } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (prepared_mask, &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(prepared_mask, previous_mask.as_ref())
         };
         let band_blob = encode_lerc2_tiled_simple_band(
             EncodeSpec {
@@ -3289,11 +3454,7 @@ pub fn encode_lerc2_tiled_raw_bands_with_no_data(
         } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (prepared_mask, &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(prepared_mask, previous_mask.as_ref())
         };
         let band_blob = encode_lerc2_tiled_raw_band(
             EncodeSpec {
@@ -3548,11 +3709,7 @@ pub fn encode_lerc2_one_sweep_bands_with_no_data(
         } else if spec.n_masks == 1 && prepared.is_none() {
             false
         } else {
-            match (prepared_mask, &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(prepared_mask, previous_mask.as_ref())
         };
         let encode_band_spec = EncodeSpec {
             n_masks: usize::from(prepared_mask.is_some()),
@@ -3657,11 +3814,7 @@ pub fn encode_lerc2_constant_bands(
         } else if spec.n_masks == 1 {
             false
         } else {
-            match (mask.as_ref(), &previous_mask) {
-                (Some(mask), Some(previous)) => mask != previous,
-                (Some(_), None) => true,
-                _ => false,
-            }
+            encode_masks_differ(mask.as_ref(), previous_mask.as_ref())
         };
         let n_blobs_more = if version >= 6 {
             i32::try_from(spec.n_bands - 1 - band)
@@ -5095,6 +5248,10 @@ fn effective_encode_mask(spec: EncodeSpec, mask: Option<&BitMask>) -> Result<Bit
     let mut mask = BitMask::new(spec.n_cols, spec.n_rows)?;
     mask.set_all_valid();
     Ok(mask)
+}
+
+fn encode_masks_differ(current: Option<&BitMask>, previous: Option<&BitMask>) -> bool {
+    crate::bit_mask::optional_masks_differ(current, previous)
 }
 
 fn validate_negative_max_z_error_for_encode(data_type: DataType, max_z_error: f64) -> Result<()> {
@@ -8340,9 +8497,10 @@ mod tests {
         encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
         encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
         encode_lerc2_constant, encode_lerc2_constant_bands, encode_lerc2_float_huffman,
-        encode_lerc2_float_huffman_bands, encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
-        encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
-        encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
+        encode_lerc2_float_huffman_bands, encode_lerc2_float_huffman_bands_with_no_data,
+        encode_lerc2_float_huffman_with_no_data, encode_lerc2_one_sweep,
+        encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_bands_with_no_data,
+        encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
         encode_lerc2_tiled_lut_bands_with_no_data, encode_lerc2_tiled_lut_with_no_data,
         encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
         encode_lerc2_tiled_raw_bands_with_no_data, encode_lerc2_tiled_raw_with_no_data,
@@ -8350,9 +8508,10 @@ mod tests {
         encode_lerc2_tiled_simple_bands_with_no_data, encode_lerc2_tiled_simple_with_no_data,
         encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data,
         extract_fpl_compressed_buffer, extract_fpl_packbits, finalize_lerc2_checksum,
-        get_lerc2_blob_info_arrays, get_lerc2_data_ranges, get_lerc2_header_info,
-        get_lerc2_no_data_info, get_lerc_info, read_fp_huffman_slice, read_lerc2_data_one_sweep,
-        read_lerc2_mask, read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
+        floating_point_huffman_beats_non_huffman_like_cpp, get_lerc2_blob_info_arrays,
+        get_lerc2_data_ranges, get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info,
+        read_fp_huffman_slice, read_lerc2_data_one_sweep, read_lerc2_mask,
+        read_lerc2_mask_with_previous, read_lerc2_min_max_ranges,
         read_lerc2_min_max_ranges_with_previous, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
         restore_fp_byte_delta_sequence, restore_fp_bytes_from_planes,
         transform_fp_huffman_input_bytes, try_lerc2_bit_plane_max_z_error,
@@ -9916,6 +10075,160 @@ mod tests {
     }
 
     #[test]
+    fn encodes_float_huffman_with_no_data_metadata_and_auto_selection() {
+        let spec = EncodeSpec {
+            n_cols: 128,
+            n_rows: 64,
+            n_depth: 2,
+            n_bands: 1,
+            n_masks: 0,
+            data_type: DataType::Float,
+        };
+        let mut data = Vec::with_capacity(spec.n_cols * spec.n_rows * spec.n_depth * 4);
+        let mut expected = Vec::with_capacity(spec.n_cols * spec.n_rows * spec.n_depth);
+        for pixel in 0..(spec.n_cols * spec.n_rows) {
+            if pixel % 97 == 0 {
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected.extend_from_slice(&[-9999.0, -9999.0]);
+            } else if pixel % 89 == 0 {
+                data.extend_from_slice(&((pixel % 32) as f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected.extend_from_slice(&[(pixel % 32) as f32, -9999.0]);
+            } else {
+                let value = ((pixel % 32) as f32) * 0.25;
+                data.extend_from_slice(&value.to_le_bytes());
+                data.extend_from_slice(&(value + 1.0).to_le_bytes());
+                expected.extend_from_slice(&[value, value + 1.0]);
+            }
+        }
+
+        let baseline = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&[1]),
+            Some(&[-9999.0]),
+            6,
+        )
+        .unwrap();
+        let explicit =
+            encode_lerc2_float_huffman_with_no_data(spec, &data, None, -9999.0, 6).unwrap();
+        let band_explicit = encode_lerc2_float_huffman_bands_with_no_data(
+            spec,
+            &data,
+            None,
+            Some(&[1]),
+            Some(&[-9999.0]),
+            6,
+        )
+        .unwrap();
+        let auto =
+            encode_lerc2_auto_with_no_data(spec, &data, 0.0, None, Some(&[1]), Some(&[-9999.0]), 6)
+                .unwrap();
+        let decoded = decode_lerc2_supported(&auto).unwrap();
+        let no_data = get_lerc2_no_data_info(&auto, 1).unwrap();
+
+        assert!(explicit.len() < baseline.len());
+        assert_eq!(explicit, band_explicit);
+        assert!(floating_point_huffman_beats_non_huffman_like_cpp(
+            explicit.len(),
+            baseline.len()
+        ));
+        assert_eq!(auto, explicit);
+        assert!(decoded.header.has_no_data_values());
+        assert!(!decoded.mask.is_valid(0).unwrap());
+        assert!(decoded.mask.is_valid(1).unwrap());
+        assert_eq!(no_data.uses_no_data, [1]);
+        assert_eq!(no_data.no_data_values, [-9999.0]);
+        assert_eq!(decoded.data, DecodedData::Float(expected));
+    }
+
+    #[test]
+    fn encodes_multi_band_float_huffman_with_per_band_no_data_metadata() {
+        let spec = EncodeSpec {
+            n_cols: 128,
+            n_rows: 64,
+            n_depth: 2,
+            n_bands: 2,
+            n_masks: 0,
+            data_type: DataType::Float,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth * spec.n_bands * 4);
+        let mut expected_band0 = Vec::with_capacity(n_pixels * spec.n_depth);
+        let mut expected_band1 = Vec::with_capacity(n_pixels * spec.n_depth);
+
+        for pixel in 0..n_pixels {
+            if pixel % 97 == 0 {
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected_band0.extend_from_slice(&[-9999.0, -9999.0]);
+            } else if pixel % 89 == 0 {
+                data.extend_from_slice(&((pixel % 32) as f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected_band0.extend_from_slice(&[(pixel % 32) as f32, -9999.0]);
+            } else {
+                let value = ((pixel % 32) as f32) * 0.25;
+                data.extend_from_slice(&value.to_le_bytes());
+                data.extend_from_slice(&(value + 1.0).to_le_bytes());
+                expected_band0.extend_from_slice(&[value, value + 1.0]);
+            }
+        }
+        for pixel in 0..n_pixels {
+            let value = 100.0 + ((pixel % 64) as f32) * 0.125;
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&(value + 2.0).to_le_bytes());
+            expected_band1.extend_from_slice(&[value, value + 2.0]);
+        }
+
+        let baseline = encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&[1, 0]),
+            Some(&[-9999.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let explicit = encode_lerc2_float_huffman_bands_with_no_data(
+            spec,
+            &data,
+            None,
+            Some(&[1, 0]),
+            Some(&[-9999.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let auto = encode_lerc2_auto_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&[1, 0]),
+            Some(&[-9999.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_bands_supported(&auto).unwrap();
+        let no_data = get_lerc2_no_data_info(&auto, 2).unwrap();
+
+        assert!(explicit.len() < baseline.len());
+        assert_eq!(auto, explicit);
+        assert_eq!(decoded.bands.len(), 2);
+        assert!(decoded.bands[0].header.has_no_data_values());
+        assert!(!decoded.bands[1].header.has_no_data_values());
+        assert!(!decoded.bands[0].mask.is_valid(0).unwrap());
+        assert!(decoded.bands[1].mask.is_valid(0).unwrap());
+        assert_eq!(no_data.uses_no_data, [1, 0]);
+        assert_eq!(no_data.no_data_values, [-9999.0, 0.0]);
+        assert_eq!(decoded.bands[0].data, DecodedData::Float(expected_band0));
+        assert_eq!(decoded.bands[1].data, DecodedData::Float(expected_band1));
+    }
+
+    #[test]
     fn rejects_invalid_float_huffman_encode_inputs() {
         let spec = EncodeSpec {
             n_cols: 2,
@@ -10617,12 +10930,23 @@ mod tests {
         }
 
         let baseline = encode_lerc2_uncompressed(spec, &data, 0.5, None, 6).unwrap();
-        let tiled = encode_lerc2_tiled_lut_bands(spec, &data, 0.5, None, 6, 8).unwrap();
+        let tiled8 = encode_lerc2_tiled_lut_bands(spec, &data, 0.5, None, 6, 8).unwrap();
+        let tiled16 = encode_lerc2_tiled_lut_bands(spec, &data, 0.5, None, 6, 16).unwrap();
+        let expected_micro_block_size = if tiled16.len() < tiled8.len() { 16 } else { 8 };
+        let tiled = if expected_micro_block_size == 16 {
+            tiled16
+        } else {
+            tiled8
+        };
         let auto = encode_lerc2_auto(spec, &data, 0.5, None, 6).unwrap();
         let decoded = decode_lerc2_bands_supported(&auto).unwrap();
 
         assert!(tiled.len() < baseline.len());
         assert_eq!(auto, tiled);
+        assert_eq!(
+            decoded.bands[0].header.micro_block_size,
+            expected_micro_block_size
+        );
         assert_eq!(decoded.bands.len(), 1);
         assert_eq!(decoded.bands[0].data, DecodedData::UShort(expected));
     }
@@ -10679,6 +11003,23 @@ mod tests {
             8,
         )
         .unwrap();
+        let tiled16 = encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[u16::MAX as f64]),
+            6,
+            16,
+        )
+        .unwrap();
+        let expected_micro_block_size = if tiled16.len() < tiled.len() { 16 } else { 8 };
+        let tiled = if expected_micro_block_size == 16 {
+            tiled16
+        } else {
+            tiled
+        };
         let auto = encode_lerc2_auto_with_no_data(
             spec,
             &data,
@@ -10694,6 +11035,10 @@ mod tests {
 
         assert!(tiled.len() < baseline.len());
         assert_eq!(auto, tiled);
+        assert_eq!(
+            decoded.bands[0].header.micro_block_size,
+            expected_micro_block_size
+        );
         assert_eq!(no_data.uses_no_data, [1]);
         assert_eq!(no_data.no_data_values, [u16::MAX as f64]);
         assert_eq!(decoded.bands.len(), 1);
@@ -10734,6 +11079,45 @@ mod tests {
             decoded.data,
             DecodedData::UShort(vec![1, 0, 3, 4, 5, 0, 7, 8])
         );
+    }
+
+    #[test]
+    fn no_data_band_encode_writes_all_valid_mask_after_partial_previous_mask() {
+        let spec = EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 2,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let band_len = spec.n_cols * spec.n_rows * spec.n_depth;
+        let band0 = [1u8, 2, 255, 255, 3, 4, 5, 6, 7, 8, 255, 9];
+        let band1 = [10u8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        let mut data = Vec::with_capacity(band_len * 2);
+        data.extend_from_slice(&band0);
+        data.extend_from_slice(&band1);
+
+        let blob = encode_lerc2_one_sweep_bands_with_no_data(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1, 0]),
+            Some(&[255.0, 0.0]),
+            6,
+        )
+        .unwrap();
+        let decoded = decode_lerc2_bands_supported(&blob).unwrap();
+
+        assert_eq!(decoded.bands.len(), 2);
+        assert_eq!(decoded.bands[0].mask.to_byte_mask(), [1, 0, 1, 1, 1, 1]);
+        assert!(decoded.bands[1].mask.is_all_valid());
+        assert_eq!(
+            decoded.bands[0].data,
+            DecodedData::UChar(vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 255, 9])
+        );
+        assert_eq!(decoded.bands[1].data, DecodedData::UChar(band1.to_vec()));
     }
 
     #[test]
@@ -10886,6 +11270,17 @@ mod tests {
     }
 
     #[test]
+    fn floating_point_huffman_selector_uses_cpp_ten_percent_margin() {
+        assert!(floating_point_huffman_beats_non_huffman_like_cpp(89, 100));
+        assert!(!floating_point_huffman_beats_non_huffman_like_cpp(90, 100));
+        assert!(!floating_point_huffman_beats_non_huffman_like_cpp(91, 100));
+        assert!(!floating_point_huffman_beats_non_huffman_like_cpp(
+            usize::MAX,
+            usize::MAX
+        ));
+    }
+
+    #[test]
     fn auto_encode_selects_float_huffman_when_smaller() {
         let spec = EncodeSpec {
             data_type: DataType::Float,
@@ -10909,6 +11304,10 @@ mod tests {
         let decoded = decode_lerc2_supported(&auto).unwrap();
 
         assert!(huffman.len() < uncompressed.len());
+        assert!(floating_point_huffman_beats_non_huffman_like_cpp(
+            huffman.len(),
+            uncompressed.len()
+        ));
         assert_eq!(auto, huffman);
         assert_eq!(decoded.data, DecodedData::Float(expected));
         assert_eq!(decoded.bytes_consumed, auto.len());

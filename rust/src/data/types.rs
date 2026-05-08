@@ -12,6 +12,12 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 use core::fmt;
 
+/// Status integer type used by the public LERC C API.
+///
+/// This mirrors the `typedef unsigned int lerc_status` declaration in
+/// `Lerc_c_api.h`.
+pub type LercStatus = u32;
+
 /// Status codes matching the public LERC C API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -50,6 +56,69 @@ pub enum DataType {
     Float = 6,
     /// 64-bit floating point.
     Double = 7,
+}
+
+/// Index order for the C API-style blob info array.
+///
+/// These values mirror `LercNS::InfoArrOrder` from `Lerc_types.h` and can be
+/// used to index arrays filled by `lerc_getBlobInfo`-compatible helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum InfoArrOrder {
+    /// Codec version.
+    Version = 0,
+    /// Scalar data type.
+    DataType = 1,
+    /// Legacy name for number of values per pixel; equal to [`Self::Depth`].
+    Dim = 2,
+    /// Number of columns.
+    Cols = 3,
+    /// Number of rows.
+    Rows = 4,
+    /// Number of bands.
+    Bands = 5,
+    /// Number of valid pixels in the first band.
+    ValidPixels = 6,
+    /// Total blob byte count.
+    BlobSize = 7,
+    /// Number of masks represented by the blob.
+    Masks = 8,
+    /// Number of values per pixel.
+    Depth = 9,
+    /// Number of per-band no-data values required by 4D decode APIs.
+    UsesNoDataValue = 10,
+    /// Sentinel equal to the current number of blob-info array entries.
+    Last = 11,
+}
+
+impl InfoArrOrder {
+    /// Returns this array-order value as a `usize` index.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Index order for the C API-style data range summary array.
+///
+/// These values mirror `LercNS::DataRangeArrOrder` from `Lerc_types.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum DataRangeArrOrder {
+    /// Minimum data value.
+    Min = 0,
+    /// Maximum data value.
+    Max = 1,
+    /// Maximum z error stored in the blob.
+    MaxZErrorUsed = 2,
+    /// Sentinel equal to the current number of data-range array entries.
+    Last = 3,
+}
+
+impl DataRangeArrOrder {
+    /// Returns this array-order value as a `usize` index.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// Caller-provided shape for encode and compute-size operations.
@@ -138,6 +207,32 @@ impl LercError {
     }
 }
 
+impl TryFrom<i32> for ErrCode {
+    type Error = LercError;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::Failed),
+            2 => Ok(Self::WrongParam),
+            3 => Ok(Self::BufferTooSmall),
+            4 => Ok(Self::NaN),
+            5 => Ok(Self::HasNoData),
+            _ => Err(LercError::CorruptInput("invalid Lerc status code")),
+        }
+    }
+}
+
+impl TryFrom<LercStatus> for ErrCode {
+    type Error = LercError;
+
+    fn try_from(value: LercStatus) -> Result<Self> {
+        i32::try_from(value)
+            .map_err(|_| LercError::CorruptInput("invalid Lerc status code"))
+            .and_then(Self::try_from)
+    }
+}
+
 impl fmt::Display for LercError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -174,6 +269,16 @@ impl TryFrom<i32> for DataType {
     }
 }
 
+impl TryFrom<u32> for DataType {
+    type Error = LercError;
+
+    fn try_from(value: u32) -> Result<Self> {
+        i32::try_from(value)
+            .map_err(|_| LercError::CorruptInput("invalid Lerc data type"))
+            .and_then(Self::try_from)
+    }
+}
+
 impl DataType {
     /// Returns the scalar size in bytes for this LERC data type.
     pub fn size_in_bytes(self) -> usize {
@@ -188,7 +293,9 @@ impl DataType {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataType, EncodeSpec, LercError};
+    use super::{
+        DataRangeArrOrder, DataType, EncodeSpec, ErrCode, InfoArrOrder, LercError, LercStatus,
+    };
 
     #[test]
     fn encode_spec_validates_shape_and_reports_lengths() {
@@ -242,6 +349,108 @@ mod tests {
         assert_eq!(
             mask_overflow.mask_byte_len().unwrap_err(),
             LercError::WrongParam("encode mask byte count overflow")
+        );
+    }
+
+    #[test]
+    fn c_api_array_order_enums_match_public_header() {
+        assert_eq!(InfoArrOrder::Version.index(), 0);
+        assert_eq!(InfoArrOrder::DataType.index(), 1);
+        assert_eq!(InfoArrOrder::Dim.index(), 2);
+        assert_eq!(InfoArrOrder::Cols.index(), 3);
+        assert_eq!(InfoArrOrder::Rows.index(), 4);
+        assert_eq!(InfoArrOrder::Bands.index(), 5);
+        assert_eq!(InfoArrOrder::ValidPixels.index(), 6);
+        assert_eq!(InfoArrOrder::BlobSize.index(), 7);
+        assert_eq!(InfoArrOrder::Masks.index(), 8);
+        assert_eq!(InfoArrOrder::Depth.index(), 9);
+        assert_eq!(InfoArrOrder::UsesNoDataValue.index(), 10);
+        assert_eq!(InfoArrOrder::Last.index(), 11);
+
+        assert_eq!(DataRangeArrOrder::Min.index(), 0);
+        assert_eq!(DataRangeArrOrder::Max.index(), 1);
+        assert_eq!(DataRangeArrOrder::MaxZErrorUsed.index(), 2);
+        assert_eq!(DataRangeArrOrder::Last.index(), 3);
+    }
+
+    #[test]
+    fn public_status_and_data_type_values_match_public_header() {
+        assert_eq!(ErrCode::Ok as i32, 0);
+        assert_eq!(ErrCode::Failed as i32, 1);
+        assert_eq!(ErrCode::WrongParam as i32, 2);
+        assert_eq!(ErrCode::BufferTooSmall as i32, 3);
+        assert_eq!(ErrCode::NaN as i32, 4);
+        assert_eq!(ErrCode::HasNoData as i32, 5);
+        assert_eq!(
+            core::mem::size_of::<LercStatus>(),
+            core::mem::size_of::<u32>()
+        );
+
+        assert_eq!(DataType::Char as i32, 0);
+        assert_eq!(DataType::UChar as i32, 1);
+        assert_eq!(DataType::Short as i32, 2);
+        assert_eq!(DataType::UShort as i32, 3);
+        assert_eq!(DataType::Int as i32, 4);
+        assert_eq!(DataType::UInt as i32, 5);
+        assert_eq!(DataType::Float as i32, 6);
+        assert_eq!(DataType::Double as i32, 7);
+    }
+
+    #[test]
+    fn status_code_converts_from_signed_and_unsigned_c_api_values() {
+        for (value, status) in [
+            (0u32, ErrCode::Ok),
+            (1, ErrCode::Failed),
+            (2, ErrCode::WrongParam),
+            (3, ErrCode::BufferTooSmall),
+            (4, ErrCode::NaN),
+            (5, ErrCode::HasNoData),
+        ] {
+            assert_eq!(ErrCode::try_from(value).unwrap(), status);
+            assert_eq!(ErrCode::try_from(value as i32).unwrap(), status);
+        }
+
+        assert_eq!(
+            ErrCode::try_from(6u32).unwrap_err(),
+            LercError::CorruptInput("invalid Lerc status code")
+        );
+        assert_eq!(
+            ErrCode::try_from(u32::MAX).unwrap_err(),
+            LercError::CorruptInput("invalid Lerc status code")
+        );
+        assert_eq!(
+            ErrCode::try_from(-1i32).unwrap_err(),
+            LercError::CorruptInput("invalid Lerc status code")
+        );
+    }
+
+    #[test]
+    fn data_type_converts_from_signed_and_unsigned_c_api_values() {
+        for (value, data_type) in [
+            (0u32, DataType::Char),
+            (1, DataType::UChar),
+            (2, DataType::Short),
+            (3, DataType::UShort),
+            (4, DataType::Int),
+            (5, DataType::UInt),
+            (6, DataType::Float),
+            (7, DataType::Double),
+        ] {
+            assert_eq!(DataType::try_from(value).unwrap(), data_type);
+            assert_eq!(DataType::try_from(value as i32).unwrap(), data_type);
+        }
+
+        assert_eq!(
+            DataType::try_from(8u32).unwrap_err(),
+            LercError::CorruptInput("invalid Lerc data type")
+        );
+        assert_eq!(
+            DataType::try_from(u32::MAX).unwrap_err(),
+            LercError::CorruptInput("invalid Lerc data type")
+        );
+        assert_eq!(
+            DataType::try_from(-1i32).unwrap_err(),
+            LercError::CorruptInput("invalid Lerc data type")
         );
     }
 }

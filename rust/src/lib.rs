@@ -22,6 +22,35 @@ limitations under the License.
 //! decoders and encoders, allocation-friendly safe workflow helpers, and C ABI
 //! entry points for the ported public surface.
 
+/// Major LERC library version mirrored from `Lerc_c_api.h`.
+pub const LERC_VERSION_MAJOR: u32 = 4;
+
+/// Minor LERC library version mirrored from `Lerc_c_api.h`.
+pub const LERC_VERSION_MINOR: u32 = 1;
+
+/// Patch LERC library version mirrored from `Lerc_c_api.h`.
+pub const LERC_VERSION_PATCH: u32 = 0;
+
+/// Computes a packed LERC version number from major, minor, and patch parts.
+///
+/// This mirrors the `LERC_COMPUTE_VERSION(maj, min, patch)` macro from the C
+/// API header.
+pub const fn lerc_compute_version(major: u32, minor: u32, patch: u32) -> u32 {
+    major * 10000 + minor * 100 + patch
+}
+
+/// Packed LERC library version mirrored from `Lerc_c_api.h`.
+pub const LERC_VERSION_NUMBER: u32 =
+    lerc_compute_version(LERC_VERSION_MAJOR, LERC_VERSION_MINOR, LERC_VERSION_PATCH);
+
+/// Returns true when this crate mirrors at least the requested LERC version.
+///
+/// This mirrors the `LERC_AT_LEAST_VERSION(maj, min, patch)` macro from the C
+/// API header.
+pub const fn lerc_at_least_version(major: u32, minor: u32, patch: u32) -> bool {
+    LERC_VERSION_NUMBER >= lerc_compute_version(major, minor, patch)
+}
+
 /// Safe Rust API facade modules.
 pub mod api;
 /// C ABI entry points.
@@ -36,10 +65,12 @@ mod support;
 
 pub use api::{
     blob_info, compute_compressed_size, compute_compressed_size_4d,
-    compute_compressed_size_4d_for_version, compute_compressed_size_for_version, data_ranges,
-    decode, decode_4d_into, decode_4d_to_f64, decode_into, decode_to_f64, encode, encode_4d,
-    encode_4d_for_version, encode_for_version, no_data_info, Decoded4DBuffer, DecodedBuffer,
-    DecodedLerc, DEFAULT_CODEC_VERSION,
+    compute_compressed_size_4d_for_version, compute_compressed_size_for_version, convert_to_double,
+    convert_to_double_into, data_ranges, decode, decode_4d_into, decode_4d_into_buffers,
+    decode_4d_to_f64, decode_4d_to_f64_into, decode_into, decode_into_buffers, decode_to_f64,
+    decode_to_f64_into, encode, encode_4d, encode_4d_for_version, encode_4d_into,
+    encode_4d_into_for_version, encode_for_version, encode_into, encode_into_for_version,
+    no_data_info, Decoded4DBuffer, DecodedBuffer, DecodedLerc, DEFAULT_CODEC_VERSION,
 };
 pub use c_api as ffi;
 pub use data::decoded;
@@ -62,6 +93,7 @@ pub use lerc2::{
     encode_lerc2_byte_huffman, encode_lerc2_byte_huffman_bands,
     encode_lerc2_byte_huffman_bands_with_no_data, encode_lerc2_byte_huffman_with_no_data,
     encode_lerc2_constant, encode_lerc2_float_huffman, encode_lerc2_float_huffman_bands,
+    encode_lerc2_float_huffman_bands_with_no_data, encode_lerc2_float_huffman_with_no_data,
     encode_lerc2_one_sweep, encode_lerc2_one_sweep_bands,
     encode_lerc2_one_sweep_bands_with_no_data, encode_lerc2_one_sweep_with_no_data,
     encode_lerc2_tiled_lut, encode_lerc2_tiled_lut_bands,
@@ -83,9 +115,37 @@ pub use lerc2::{
     BLOB_DATA_RANGE_ARRAY_LEN, BLOB_INFO_ARRAY_LEN,
 };
 pub use primitives::bit_mask;
-pub use primitives::bit_mask::BitMask;
+pub use primitives::bit_mask::{optional_masks_differ, BitMask};
 pub use primitives::bit_stuffer;
 pub use primitives::bit_stuffer::BitStuffer2;
 pub use primitives::rle;
 pub use primitives::rle::Rle;
-pub use types::{DataType, EncodeSpec, ErrCode, LercError, Result};
+pub use types::{
+    DataRangeArrOrder, DataType, EncodeSpec, ErrCode, InfoArrOrder, LercError, LercStatus, Result,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        lerc_at_least_version, lerc_compute_version, LERC_VERSION_MAJOR, LERC_VERSION_MINOR,
+        LERC_VERSION_NUMBER, LERC_VERSION_PATCH,
+    };
+
+    #[test]
+    fn public_version_constants_match_c_api_header() {
+        assert_eq!(LERC_VERSION_MAJOR, 4);
+        assert_eq!(LERC_VERSION_MINOR, 1);
+        assert_eq!(LERC_VERSION_PATCH, 0);
+        assert_eq!(LERC_VERSION_NUMBER, 40100);
+    }
+
+    #[test]
+    fn version_helpers_match_c_api_macros() {
+        assert_eq!(lerc_compute_version(4, 1, 0), LERC_VERSION_NUMBER);
+        assert_eq!(lerc_compute_version(3, 0, 12), 30012);
+        assert!(lerc_at_least_version(4, 0, 0));
+        assert!(lerc_at_least_version(4, 1, 0));
+        assert!(!lerc_at_least_version(4, 1, 1));
+        assert!(!lerc_at_least_version(5, 0, 0));
+    }
+}

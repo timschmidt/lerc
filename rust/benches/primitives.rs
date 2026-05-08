@@ -5,12 +5,14 @@ use lerc::{
     blob_info, compute_checksum_fletcher32, compute_compressed_size, compute_compressed_size_4d,
     compute_lerc2_header_byte_len, compute_lerc2_mask_byte_len,
     compute_lerc2_min_max_ranges_byte_len, compute_lerc2_one_sweep_byte_len,
-    compute_lerc2_tiled_raw_byte_len, convert_typed_bytes_to_f64, data_ranges, decode,
-    decode_4d_into, decode_4d_to_f64, decode_into, decode_lerc1, decode_lerc2_bands_supported,
-    decode_lerc2_supported, decode_lerc2_supported_into, decode_lerc_supported_into,
-    decode_lerc_supported_to_f64, decode_to_f64, decode_typed_values, encode, encode_4d,
-    encode_lerc2_auto, encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman,
-    encode_lerc2_constant, encode_lerc2_float_huffman, encode_lerc2_one_sweep,
+    compute_lerc2_tiled_raw_byte_len, convert_to_double_into, convert_typed_bytes_to_f64,
+    data_ranges, decode, decode_4d_into, decode_4d_into_buffers, decode_4d_to_f64,
+    decode_4d_to_f64_into, decode_into, decode_into_buffers, decode_lerc1,
+    decode_lerc2_bands_supported, decode_lerc2_supported, decode_lerc2_supported_into,
+    decode_lerc_supported_into, decode_lerc_supported_to_f64, decode_to_f64, decode_to_f64_into,
+    decode_typed_values, encode, encode_4d, encode_4d_into, encode_into, encode_lerc2_auto,
+    encode_lerc2_auto_with_no_data, encode_lerc2_byte_huffman, encode_lerc2_constant,
+    encode_lerc2_float_huffman, encode_lerc2_float_huffman_with_no_data, encode_lerc2_one_sweep,
     encode_lerc2_one_sweep_bands, encode_lerc2_one_sweep_with_no_data, encode_lerc2_tiled_lut,
     encode_lerc2_tiled_lut_bands, encode_lerc2_tiled_lut_bands_with_no_data,
     encode_lerc2_tiled_lut_with_no_data, encode_lerc2_tiled_raw, encode_lerc2_tiled_raw_bands,
@@ -20,8 +22,8 @@ use lerc::{
     encode_lerc2_uncompressed, encode_lerc2_uncompressed_with_no_data, finalize_lerc2_checksum,
     get_lerc1_header_info, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
     get_lerc2_header_info, get_lerc2_no_data_info, get_lerc_info, no_data_info,
-    read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep, read_lerc2_mask,
-    read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
+    optional_masks_differ, read_lerc1_count_mask, read_lerc1_z_stats, read_lerc2_data_one_sweep,
+    read_lerc2_mask, read_lerc2_min_max_ranges, read_lerc2_tiled_payload, read_lerc2_tiled_raw,
     validate_lerc2_checksum, write_lerc2_header, write_lerc2_mask, write_lerc2_min_max_ranges,
     write_lerc2_one_sweep, write_lerc2_tiled_raw, BitMask, BitStuffer2, DataType, DecodeIntoSpec,
     EncodeSpec, HeaderInfo, MinMaxRanges, Rle,
@@ -231,6 +233,14 @@ fn main() {
     let mut ffi_decode_double_data = vec![0.0f64; 24];
     let mut ffi_decode_double_mask = vec![0; 12];
     let one_sweep_no_data_blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+    let mut api_decode_4d_data = vec![0u8; 12];
+    let mut api_decode_4d_mask = vec![0; 6];
+    let mut api_decode_4d_uses_no_data = vec![0; 1];
+    let mut api_decode_4d_no_data_values = vec![0.0f64; 1];
+    let mut api_decode_4d_double_data = vec![0.0f64; 12];
+    let mut api_decode_4d_double_mask = vec![0; 6];
+    let mut api_decode_4d_double_uses_no_data = vec![0; 1];
+    let mut api_decode_4d_double_no_data_values = vec![0.0f64; 1];
     let mut ffi_decode_4d_data = vec![0u8; 12];
     let mut ffi_decode_4d_mask = vec![0; 6];
     let mut ffi_decode_4d_uses_no_data = vec![0; 1];
@@ -320,6 +330,22 @@ fn main() {
         6,
     )
     .unwrap();
+    let float_huffman_no_data_spec = EncodeSpec {
+        n_depth: 2,
+        ..float_huffman_encode_spec
+    };
+    let float_huffman_no_data_data = (0..(float_huffman_no_data_spec.n_cols
+        * float_huffman_no_data_spec.n_rows))
+        .flat_map(|idx| {
+            if idx % 97 == 0 {
+                [(-9999.0f32).to_le_bytes(), (-9999.0f32).to_le_bytes()]
+            } else {
+                let value = ((idx % 64) as f32) * 0.25;
+                [value.to_le_bytes(), (value + 1.0).to_le_bytes()]
+            }
+        })
+        .flatten()
+        .collect::<Vec<_>>();
     let ffi_constant_encode_mask = [1u8, 0, 1, 1, 1, 1];
     let mut ffi_constant_encode_size = 0u32;
     let mut ffi_constant_encode_out = [0u8; 128];
@@ -378,6 +404,19 @@ fn main() {
         .flat_map(|idx| ((idx as f32) * 0.25).to_le_bytes())
         .collect();
     let mut converted_float_values = vec![0.0f64; 250_000];
+    let api_encode_into_size =
+        compute_compressed_size(lut_encode_spec, &lut_encode_data, 0.5, None).unwrap();
+    let mut api_encode_into_output = vec![0u8; api_encode_into_size];
+    let api_encode_4d_into_size = compute_compressed_size_4d(
+        lut_diff_encode_spec,
+        &lut_no_data_encode_data,
+        0.5,
+        None,
+        Some(&lut_no_data_uses),
+        Some(&lut_no_data_values),
+    )
+    .unwrap();
+    let mut api_encode_4d_into_output = vec![0u8; api_encode_4d_into_size];
 
     bench("rle-compress-1mb", 50, || {
         black_box(Rle::compress(black_box(&byte_data)).unwrap());
@@ -414,6 +453,16 @@ fn main() {
     bench("typed-float-convert-to-f64-250k", 1000, || {
         black_box(
             convert_typed_bytes_to_f64(
+                DataType::Float,
+                black_box(&float_bytes),
+                black_box(&mut converted_float_values),
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-convert-to-double-into-float-250k", 1000, || {
+        black_box(
+            convert_to_double_into(
                 DataType::Float,
                 black_box(&float_bytes),
                 black_box(&mut converted_float_values),
@@ -609,6 +658,13 @@ fn main() {
                 .write_mask_bytes(black_box(&mut decoded_mask_bytes))
                 .unwrap(),
         );
+    });
+    bench("bit-mask-optional-difference", 1_000_000, || {
+        black_box(optional_masks_differ(Some(black_box(&encode_mask)), None));
+        black_box(optional_masks_differ(
+            Some(black_box(&encode_mask)),
+            Some(black_box(&encode_mask)),
+        ));
     });
     bench("decode-into-spec-byte-counts", 100_000, || {
         black_box(decode_into_spec.data_byte_len().unwrap());
@@ -894,6 +950,18 @@ fn main() {
             .unwrap(),
         );
     });
+    bench("lerc2-float-huffman-no-data-encode-v6", 1_000, || {
+        black_box(
+            encode_lerc2_float_huffman_with_no_data(
+                float_huffman_no_data_spec,
+                black_box(&float_huffman_no_data_data),
+                None,
+                -9999.0,
+                6,
+            )
+            .unwrap(),
+        );
+    });
     bench("lerc2-auto-byte-huffman-encode-v6", 100_000, || {
         black_box(
             encode_lerc2_auto(
@@ -920,6 +988,18 @@ fn main() {
     bench("api-encode-lut-tiled-v6", 100_000, || {
         black_box(encode(lut_encode_spec, black_box(&lut_encode_data), 0.5, None).unwrap());
     });
+    bench("api-encode-into-lut-tiled-v6", 100_000, || {
+        black_box(
+            encode_into(
+                lut_encode_spec,
+                black_box(&lut_encode_data),
+                0.5,
+                None,
+                black_box(&mut api_encode_into_output),
+            )
+            .unwrap(),
+        );
+    });
     bench("lerc2-auto-byte-huffman-bands-encode-v6", 10_000, || {
         black_box(
             encode_lerc2_auto(
@@ -941,6 +1021,20 @@ fn main() {
                 None,
                 Some(black_box(&[1])),
                 Some(black_box(&[255.0])),
+                6,
+            )
+            .unwrap(),
+        );
+    });
+    bench("lerc2-auto-float-huffman-no-data-encode-v6", 1_000, || {
+        black_box(
+            encode_lerc2_auto_with_no_data(
+                float_huffman_no_data_spec,
+                black_box(&float_huffman_no_data_data),
+                0.0,
+                None,
+                Some(black_box(&[1])),
+                Some(black_box(&[-9999.0])),
                 6,
             )
             .unwrap(),
@@ -982,6 +1076,20 @@ fn main() {
                 None,
                 Some(black_box(&lut_no_data_uses)),
                 Some(black_box(&lut_no_data_values)),
+            )
+            .unwrap(),
+        );
+    });
+    bench("api-encode-4d-into-no-data-v6", 100_000, || {
+        black_box(
+            encode_4d_into(
+                lut_diff_encode_spec,
+                black_box(&lut_no_data_encode_data),
+                0.5,
+                None,
+                Some(black_box(&lut_no_data_uses)),
+                Some(black_box(&lut_no_data_values)),
+                black_box(&mut api_encode_4d_into_output),
             )
             .unwrap(),
         );
@@ -1311,8 +1419,30 @@ fn main() {
     bench("api-decode-into-v4-synthetic", 100_000, || {
         black_box(decode_into(black_box(&one_sweep_bands_blob), decode_into_spec).unwrap());
     });
+    bench("api-decode-into-buffers-v4-synthetic", 100_000, || {
+        black_box(
+            decode_into_buffers(
+                black_box(&one_sweep_bands_blob),
+                decode_into_spec,
+                black_box(&mut decode_into_data),
+                Some(black_box(&mut decode_into_mask)),
+            )
+            .unwrap(),
+        );
+    });
     bench("api-decode-to-f64-v4-synthetic", 100_000, || {
         black_box(decode_to_f64(black_box(&one_sweep_bands_blob), decode_into_spec).unwrap());
+    });
+    bench("api-decode-to-f64-into-v4-synthetic", 100_000, || {
+        black_box(
+            decode_to_f64_into(
+                black_box(&one_sweep_bands_blob),
+                decode_into_spec,
+                black_box(&mut decode_to_f64_data),
+                Some(black_box(&mut decode_to_f64_mask)),
+            )
+            .unwrap(),
+        );
     });
     bench("api-decode-4d-into-v6-no-data-synthetic", 100_000, || {
         black_box(
@@ -1346,6 +1476,54 @@ fn main() {
             .unwrap(),
         );
     });
+    bench(
+        "api-decode-4d-into-buffers-v6-no-data-synthetic",
+        100_000,
+        || {
+            black_box(
+                decode_4d_into_buffers(
+                    black_box(&one_sweep_no_data_blob),
+                    DecodeIntoSpec {
+                        data_type: DataType::UChar,
+                        n_depth: 2,
+                        n_cols: 3,
+                        n_rows: 2,
+                        n_bands: 1,
+                        n_masks: 1,
+                    },
+                    black_box(&mut api_decode_4d_data),
+                    Some(black_box(&mut api_decode_4d_mask)),
+                    black_box(&mut api_decode_4d_uses_no_data),
+                    black_box(&mut api_decode_4d_no_data_values),
+                )
+                .unwrap(),
+            );
+        },
+    );
+    bench(
+        "api-decode-4d-to-f64-into-v6-no-data-synthetic",
+        100_000,
+        || {
+            black_box(
+                decode_4d_to_f64_into(
+                    black_box(&one_sweep_no_data_blob),
+                    DecodeIntoSpec {
+                        data_type: DataType::UChar,
+                        n_depth: 2,
+                        n_cols: 3,
+                        n_rows: 2,
+                        n_bands: 1,
+                        n_masks: 1,
+                    },
+                    black_box(&mut api_decode_4d_double_data),
+                    Some(black_box(&mut api_decode_4d_double_mask)),
+                    black_box(&mut api_decode_4d_double_uses_no_data),
+                    black_box(&mut api_decode_4d_double_no_data_values),
+                )
+                .unwrap(),
+            );
+        },
+    );
     bench("ffi-decode-v4-synthetic", 100_000, || {
         black_box(unsafe {
             lerc::ffi::lerc_decode(

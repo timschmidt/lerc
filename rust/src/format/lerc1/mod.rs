@@ -11,7 +11,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 //! Legacy Lerc1 metadata and float payload readers.
 
 use crate::types::{DataType, LercError, Result};
-use crate::{BitMask, BitStuffer2, Rle};
+use crate::{BitMask, Rle};
 
 /// ASCII type string that starts legacy Lerc1 `CntZImage` blobs.
 pub const CNT_Z_IMAGE_KEY: &[u8; 10] = b"CntZImage ";
@@ -268,7 +268,7 @@ fn read_lerc1_count_tile(
     let num_bytes = if bits67 == 0 { 4 } else { 3 - bits67 as usize };
     let offset = reader.read_lerc1_float(num_bytes)?;
     let tile_pixel_count = (i1 - i0) * (j1 - j0);
-    let (values, consumed) = BitStuffer2::decode(&reader.bytes[reader.pos..], tile_pixel_count, 2)?;
+    let (values, consumed) = read_lerc1_bit_stuffed(&reader.bytes[reader.pos..], tile_pixel_count)?;
     if values.len() < tile_pixel_count {
         return Err(LercError::CorruptInput("Lerc1 count tile value underrun"));
     }
@@ -602,10 +602,9 @@ fn read_z_tile(
     }
 
     let valid_count = valid_indexes(mask, info.n_cols as usize, i0, i1, j0, j1)?.len();
-    let (values, consumed) = BitStuffer2::decode(
+    let (values, consumed) = read_lerc1_bit_stuffed(
         &reader.bytes[reader.pos..],
         ((i1 - i0) * (j1 - j0)).max(valid_count),
-        2,
     )?;
     if values.len() < valid_count {
         return Err(LercError::CorruptInput("Lerc1 z tile value underrun"));
@@ -643,6 +642,127 @@ fn valid_indexes(
         }
     }
     Ok(indexes)
+}
+
+fn read_lerc1_bit_stuffed(encoded: &[u8], max_element_count: usize) -> Result<(Vec<u32>, usize)> {
+    if encoded.is_empty() {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut pos = 0usize;
+    let header = encoded[pos];
+    pos += 1;
+    let bits67 = header >> 6;
+    let count_bytes = if bits67 == 0 {
+        4
+    } else {
+        usize::from(3 - bits67)
+    };
+    let bits = header & 63;
+    let element_count = read_lerc1_packed_uint(encoded, &mut pos, count_bytes)? as usize;
+    if element_count > max_element_count {
+        return Err(LercError::CorruptInput(
+            "Lerc1 bit-stuffed element count exceeds limit",
+        ));
+    }
+    if bits >= 32 {
+        return Err(LercError::CorruptInput(
+            "invalid Lerc1 bit-stuffed bit width",
+        ));
+    }
+    if bits == 0 {
+        return Ok((vec![0; element_count], pos));
+    }
+
+    let num_words = (element_count * bits as usize).div_ceil(32);
+    let bytes_used = num_words
+        .checked_mul(4)
+        .and_then(|num_bytes| {
+            num_bytes.checked_sub(lerc1_bit_stuffer_tail_bytes_not_needed(element_count, bits))
+        })
+        .ok_or(LercError::CorruptInput(
+            "Lerc1 bit-stuffed byte count overflow",
+        ))?;
+    if encoded.len().saturating_sub(pos) < bytes_used {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let mut words = vec![0u32; num_words];
+    for (word, chunk) in words
+        .iter_mut()
+        .zip(encoded[pos..pos + bytes_used].chunks(4))
+    {
+        let mut word_bytes = [0u8; 4];
+        word_bytes[..chunk.len()].copy_from_slice(chunk);
+        *word = u32::from_le_bytes(word_bytes);
+    }
+    let tail_bytes = lerc1_bit_stuffer_tail_bytes_not_needed(element_count, bits);
+    if tail_bytes > 0 {
+        let last = words
+            .last_mut()
+            .expect("nonzero bit width should allocate at least one word");
+        for _ in 0..tail_bytes {
+            *last <<= 8;
+        }
+    }
+
+    let mut values = vec![0u32; element_count];
+    let mut word_idx = 0usize;
+    let mut bit_pos = 0i32;
+    let bits_i32 = i32::from(bits);
+    for value in &mut values {
+        if 32 - bit_pos >= bits_i32 {
+            let shifted = words[word_idx] << bit_pos;
+            *value = shifted >> (32 - bits_i32);
+            bit_pos += bits_i32;
+            if bit_pos == 32 {
+                bit_pos = 0;
+                word_idx += 1;
+            }
+        } else {
+            let shifted = words[word_idx] << bit_pos;
+            word_idx += 1;
+            *value = shifted >> (32 - bits_i32);
+            bit_pos -= 32 - bits_i32;
+            *value |= words[word_idx] >> (32 - bit_pos);
+        }
+    }
+
+    pos += bytes_used;
+    Ok((values, pos))
+}
+
+fn read_lerc1_packed_uint(encoded: &[u8], pos: &mut usize, num_bytes: usize) -> Result<u32> {
+    if encoded.len().saturating_sub(*pos) < num_bytes {
+        return Err(LercError::BufferTooSmall);
+    }
+    let value = match num_bytes {
+        1 => u32::from(encoded[*pos]),
+        2 => u32::from(u16::from_le_bytes([encoded[*pos], encoded[*pos + 1]])),
+        4 => u32::from_le_bytes([
+            encoded[*pos],
+            encoded[*pos + 1],
+            encoded[*pos + 2],
+            encoded[*pos + 3],
+        ]),
+        _ => {
+            return Err(LercError::CorruptInput(
+                "invalid Lerc1 packed integer width",
+            ))
+        }
+    };
+    *pos += num_bytes;
+    Ok(value)
+}
+
+fn lerc1_bit_stuffer_tail_bytes_not_needed(num_elements: usize, bits: u8) -> usize {
+    let tail_bits = (num_elements as u64 * u64::from(bits)) & 31;
+    let tail_bytes = (tail_bits + 7) >> 3;
+    if tail_bytes > 0 {
+        4 - tail_bytes as usize
+    } else {
+        0
+    }
 }
 
 #[derive(Default)]
@@ -758,8 +878,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_lerc1, decode_lerc1_bands, get_lerc1_header_info, read_lerc1_count_mask,
-        read_lerc1_z_stats,
+        decode_lerc1, decode_lerc1_bands, get_lerc1_header_info, read_lerc1_bit_stuffed,
+        read_lerc1_count_mask, read_lerc1_z_stats,
     };
     use crate::{
         decode_lerc_supported_into, get_lerc2_data_ranges, get_lerc_info, BitStuffer2, DataType,
@@ -941,6 +1061,32 @@ mod tests {
         assert_eq!(mask_info.mask.to_byte_mask(), [0, 1, 1, 0]);
         assert_eq!(mask_info.mask.count_valid_bits(), 2);
         assert!(!mask_info.all_valid);
+    }
+
+    #[test]
+    fn reads_legacy_lerc1_bit_stuffer_streams() {
+        let encoded = [0x83, 0x04, 0x80, 0x2b];
+        let (decoded, consumed) = read_lerc1_bit_stuffed(&encoded, 4).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, [1, 2, 7, 0]);
+
+        let encoded = [0x84, 0x08, 0x26, 0x59, 0x41, 0x31];
+        let (decoded, consumed) = read_lerc1_bit_stuffed(&encoded, 8).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, [3, 1, 4, 1, 5, 9, 2, 6]);
+
+        let encoded = [0x80, 0x04];
+        let (decoded, consumed) = read_lerc1_bit_stuffed(&encoded, 4).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_adversarial_legacy_lerc1_bit_stuffer_streams() {
+        assert!(read_lerc1_bit_stuffed(&[], 1).is_err());
+        assert!(read_lerc1_bit_stuffed(&[0x83], 4).is_err());
+        assert!(read_lerc1_bit_stuffed(&[0x83, 0x05, 0x80, 0x2b], 4).is_err());
+        assert!(read_lerc1_bit_stuffed(&[0x20, 0x01, 0xff, 0xff, 0xff, 0xff], 1).is_err());
     }
 
     #[test]

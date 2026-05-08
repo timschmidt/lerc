@@ -9,9 +9,10 @@ use crate::format::lerc1::{decode_lerc1_bands, DecodedLerc1Bands, CNT_Z_IMAGE_KE
 use crate::format::lerc2::{
     decode_lerc2_bands_supported, decode_lerc_supported_into, decode_lerc_supported_to_f64,
     encode_lerc2_auto, encode_lerc2_auto_with_no_data, get_lerc2_data_ranges,
-    get_lerc2_no_data_info, get_lerc_info, DataRanges, DecodeIntoSpec, LercInfo, NoDataInfo,
+    get_lerc2_no_data_info, get_lerc_info, DataRanges, DecodeIntoResult, DecodeIntoSpec,
+    DecodeToF64Result, LercInfo, NoDataInfo,
 };
-use crate::{EncodeSpec, LercError, Result};
+use crate::{convert_typed_bytes_to_f64, DataType, EncodeSpec, LercError, Result};
 
 /// Latest Lerc2 codec version supported by the Rust encoder facade.
 pub const DEFAULT_CODEC_VERSION: i32 = 6;
@@ -136,6 +137,27 @@ pub fn encode(
     encode_for_version(spec, data, max_z_error, masks, DEFAULT_CODEC_VERSION)
 }
 
+/// Encodes a Lerc2 blob into a caller-provided output buffer.
+///
+/// Returns the number of bytes written. This mirrors the public C++ `Lerc::Encode`
+/// buffer contract while using the default supported codec version.
+pub fn encode_into(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    output: &mut [u8],
+) -> Result<usize> {
+    encode_into_for_version(
+        spec,
+        data,
+        max_z_error,
+        masks,
+        DEFAULT_CODEC_VERSION,
+        output,
+    )
+}
+
 /// Encodes a Lerc2 blob using a specific codec version.
 pub fn encode_for_version(
     spec: EncodeSpec,
@@ -146,6 +168,25 @@ pub fn encode_for_version(
 ) -> Result<Vec<u8>> {
     validate_encode_version(version)?;
     encode_lerc2_auto(spec, data, max_z_error, masks, version)
+}
+
+/// Encodes a Lerc2 blob into a caller-provided output buffer using a specific version.
+///
+/// Returns the number of bytes written.
+pub fn encode_into_for_version(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    version: i32,
+    output: &mut [u8],
+) -> Result<usize> {
+    let blob = encode_for_version(spec, data, max_z_error, masks, version)?;
+    if output.len() < blob.len() {
+        return Err(LercError::BufferTooSmall);
+    }
+    output[..blob.len()].copy_from_slice(&blob);
+    Ok(blob.len())
 }
 
 /// Encodes a Lerc2 blob with optional 4D no-data metadata.
@@ -168,6 +209,31 @@ pub fn encode_4d(
         uses_no_data,
         no_data_values,
         DEFAULT_CODEC_VERSION,
+    )
+}
+
+/// Encodes a Lerc2 blob with optional 4D no-data metadata into `output`.
+///
+/// Returns the number of bytes written. This mirrors the public C++ `Lerc::Encode`
+/// buffer contract while using the default supported codec version.
+pub fn encode_4d_into(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    output: &mut [u8],
+) -> Result<usize> {
+    encode_4d_into_for_version(
+        spec,
+        data,
+        max_z_error,
+        masks,
+        uses_no_data,
+        no_data_values,
+        DEFAULT_CODEC_VERSION,
+        output,
     )
 }
 
@@ -196,6 +262,60 @@ pub fn encode_4d_for_version(
     } else {
         encode_lerc2_auto(spec, data, max_z_error, masks, version)
     }
+}
+
+/// Encodes a Lerc2 blob with optional 4D no-data metadata into `output`.
+///
+/// Returns the number of bytes written.
+pub fn encode_4d_into_for_version(
+    spec: EncodeSpec,
+    data: &[u8],
+    max_z_error: f64,
+    masks: Option<&[u8]>,
+    uses_no_data: Option<&[u8]>,
+    no_data_values: Option<&[f64]>,
+    version: i32,
+    output: &mut [u8],
+) -> Result<usize> {
+    let blob = encode_4d_for_version(
+        spec,
+        data,
+        max_z_error,
+        masks,
+        uses_no_data,
+        no_data_values,
+        version,
+    )?;
+    if output.len() < blob.len() {
+        return Err(LercError::BufferTooSmall);
+    }
+    output[..blob.len()].copy_from_slice(&blob);
+    Ok(blob.len())
+}
+
+/// Converts raw typed scalar bytes into allocated `f64` values.
+///
+/// This is the allocation-friendly equivalent of the C++ `Lerc::ConvertToDouble`
+/// helper. `data` must contain little-endian scalar values of `data_type`.
+/// Like the C++ helper, `Double` input is rejected because it is already double.
+pub fn convert_to_double(data_type: DataType, data: &[u8]) -> Result<Vec<f64>> {
+    let value_count = data.len() / data_type.size_in_bytes();
+    let mut output = vec![0.0; value_count];
+    let written = convert_to_double_into(data_type, data, &mut output)?;
+    output.truncate(written);
+    Ok(output)
+}
+
+/// Converts raw typed scalar bytes into caller-provided `f64` output.
+///
+/// Returns the number of values written. This mirrors the C++ `Lerc::ConvertToDouble`
+/// helper for non-empty non-`Double` input while avoiding allocation.
+pub fn convert_to_double_into(
+    data_type: DataType,
+    data: &[u8],
+    output: &mut [f64],
+) -> Result<usize> {
+    convert_typed_bytes_to_f64(data_type, data, output)
 }
 
 /// Decodes a supported LERC blob into native typed band data.
@@ -228,6 +348,20 @@ pub fn decode_into(blob: &[u8], spec: DecodeIntoSpec) -> Result<DecodedBuffer<u8
     })
 }
 
+/// Decodes a supported LERC blob into caller-provided little-endian scalar bytes.
+///
+/// `data` must have room for `spec.data_byte_len()` bytes. When `spec.n_masks`
+/// is nonzero, `masks` must have room for `spec.mask_byte_len()` bytes. The
+/// returned result reports how many data and mask bytes were written.
+pub fn decode_into_buffers(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data: &mut [u8],
+    masks: Option<&mut [u8]>,
+) -> Result<DecodeIntoResult> {
+    decode_lerc_supported_into(blob, spec, data, masks)
+}
+
 /// Decodes a supported LERC blob into allocated `f64` values.
 pub fn decode_to_f64(blob: &[u8], spec: DecodeIntoSpec) -> Result<DecodedBuffer<f64>> {
     let mut data = vec![0.0f64; spec.value_count()?];
@@ -249,6 +383,19 @@ pub fn decode_to_f64(blob: &[u8], spec: DecodeIntoSpec) -> Result<DecodedBuffer<
     })
 }
 
+/// Decodes a supported LERC blob into caller-provided `f64` values.
+///
+/// `data` must have room for `spec.value_count()` values. When `spec.n_masks`
+/// is nonzero, `masks` must have room for `spec.mask_byte_len()` bytes.
+pub fn decode_to_f64_into(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data: &mut [f64],
+    masks: Option<&mut [u8]>,
+) -> Result<DecodeToF64Result> {
+    decode_lerc_supported_to_f64(blob, spec, data, masks)
+}
+
 /// Decodes a supported LERC blob into allocated little-endian bytes and no-data metadata.
 pub fn decode_4d_into(blob: &[u8], spec: DecodeIntoSpec) -> Result<Decoded4DBuffer<u8>> {
     let decoded = decode_into(blob, spec)?;
@@ -262,6 +409,30 @@ pub fn decode_4d_into(blob: &[u8], spec: DecodeIntoSpec) -> Result<Decoded4DBuff
     })
 }
 
+/// Decodes a supported LERC blob into caller-provided bytes and no-data arrays.
+///
+/// The `uses_no_data` and `no_data_values` buffers must each have room for
+/// `spec.n_bands` entries. They are filled with per-band 4D no-data metadata
+/// using the same convention as the C++ public decode API.
+pub fn decode_4d_into_buffers(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data: &mut [u8],
+    masks: Option<&mut [u8]>,
+    uses_no_data: &mut [u8],
+    no_data_values: &mut [f64],
+) -> Result<DecodeIntoResult> {
+    let no_data = no_data_info(blob, spec.n_bands)?;
+    if uses_no_data.len() < spec.n_bands || no_data_values.len() < spec.n_bands {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let result = decode_lerc_supported_into(blob, spec, data, masks)?;
+    uses_no_data[..spec.n_bands].copy_from_slice(&no_data.uses_no_data[..spec.n_bands]);
+    no_data_values[..spec.n_bands].copy_from_slice(&no_data.no_data_values[..spec.n_bands]);
+    Ok(result)
+}
+
 /// Decodes a supported LERC blob into allocated `f64` values and no-data metadata.
 pub fn decode_4d_to_f64(blob: &[u8], spec: DecodeIntoSpec) -> Result<Decoded4DBuffer<f64>> {
     let decoded = decode_to_f64(blob, spec)?;
@@ -273,6 +444,28 @@ pub fn decode_4d_to_f64(blob: &[u8], spec: DecodeIntoSpec) -> Result<Decoded4DBu
         bytes_consumed: decoded.bytes_consumed,
         mask_bytes_written: decoded.mask_bytes_written,
     })
+}
+
+/// Decodes a supported LERC blob into caller-provided `f64` values and no-data arrays.
+///
+/// The no-data buffers must each have at least `spec.n_bands` entries.
+pub fn decode_4d_to_f64_into(
+    blob: &[u8],
+    spec: DecodeIntoSpec,
+    data: &mut [f64],
+    masks: Option<&mut [u8]>,
+    uses_no_data: &mut [u8],
+    no_data_values: &mut [f64],
+) -> Result<DecodeToF64Result> {
+    let no_data = no_data_info(blob, spec.n_bands)?;
+    if uses_no_data.len() < spec.n_bands || no_data_values.len() < spec.n_bands {
+        return Err(LercError::BufferTooSmall);
+    }
+
+    let result = decode_lerc_supported_to_f64(blob, spec, data, masks)?;
+    uses_no_data[..spec.n_bands].copy_from_slice(&no_data.uses_no_data[..spec.n_bands]);
+    no_data_values[..spec.n_bands].copy_from_slice(&no_data.no_data_values[..spec.n_bands]);
+    Ok(result)
 }
 
 /// Reads public blob metadata for supported LERC blobs.
@@ -346,6 +539,15 @@ mod tests {
         let size = compute_compressed_size(spec, &data, 0.5, Some(&mask)).unwrap();
         let blob = encode(spec, &data, 0.5, Some(&mask)).unwrap();
         assert_eq!(size, blob.len());
+        let mut output = vec![0u8; size];
+        let written = encode_into(spec, &data, 0.5, Some(&mask), &mut output).unwrap();
+        assert_eq!(written, blob.len());
+        assert_eq!(output, blob);
+        let mut too_small = vec![0u8; size.saturating_sub(1)];
+        assert_eq!(
+            encode_into(spec, &data, 0.5, Some(&mask), &mut too_small).unwrap_err(),
+            LercError::BufferTooSmall
+        );
 
         let info = blob_info(&blob).unwrap();
         assert_eq!(info.n_cols, 4);
@@ -379,6 +581,27 @@ mod tests {
         assert_eq!(output.data, vec![1, 2, 0, 4, 5, 0, 7, 8]);
         assert_eq!(output.masks, Some(mask.to_vec()));
 
+        let mut direct_data = [0u8; 8];
+        let mut direct_mask = [0u8; 8];
+        let direct = decode_into_buffers(
+            &blob,
+            DecodeIntoSpec {
+                data_type: DataType::UChar,
+                n_depth: 1,
+                n_cols: 4,
+                n_rows: 2,
+                n_bands: 1,
+                n_masks: 1,
+            },
+            &mut direct_data,
+            Some(&mut direct_mask),
+        )
+        .unwrap();
+        assert_eq!(direct.data_bytes_written, 8);
+        assert_eq!(direct.mask_bytes_written, 8);
+        assert_eq!(direct_data, [1, 2, 0, 4, 5, 0, 7, 8]);
+        assert_eq!(direct_mask, mask);
+
         let doubles = decode_to_f64(
             &blob,
             DecodeIntoSpec {
@@ -392,6 +615,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doubles.data, vec![1.0, 2.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0]);
+
+        let mut direct_doubles = [0.0f64; 8];
+        let mut direct_double_mask = [0u8; 8];
+        let direct = decode_to_f64_into(
+            &blob,
+            DecodeIntoSpec {
+                data_type: DataType::UChar,
+                n_depth: 1,
+                n_cols: 4,
+                n_rows: 2,
+                n_bands: 1,
+                n_masks: 1,
+            },
+            &mut direct_doubles,
+            Some(&mut direct_double_mask),
+        )
+        .unwrap();
+        assert_eq!(direct.values_written, 8);
+        assert_eq!(direct.mask_bytes_written, 8);
+        assert_eq!(direct_doubles, [1.0, 2.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0]);
+        assert_eq!(direct_double_mask, mask);
     }
 
     #[test]
@@ -424,6 +668,33 @@ mod tests {
             .unwrap(),
             blob.len()
         );
+        let mut output = vec![0u8; blob.len()];
+        let written = encode_4d_into(
+            spec,
+            &data,
+            0.5,
+            None,
+            Some(&[1]),
+            Some(&[u16::MAX as f64]),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(written, blob.len());
+        assert_eq!(output, blob);
+        let mut too_small = vec![0u8; blob.len() - 1];
+        assert_eq!(
+            encode_4d_into(
+                spec,
+                &data,
+                0.5,
+                None,
+                Some(&[1]),
+                Some(&[u16::MAX as f64]),
+                &mut too_small,
+            )
+            .unwrap_err(),
+            LercError::BufferTooSmall
+        );
         let no_data = no_data_info(&blob, 1).unwrap();
         assert_eq!(no_data.uses_no_data, [1]);
         assert_eq!(no_data.no_data_values, [u16::MAX as f64]);
@@ -444,6 +715,33 @@ mod tests {
         assert_eq!(decoded_bytes.no_data, no_data);
         assert_eq!(decoded_bytes.masks, Some(vec![1, 0, 1]));
 
+        let mut direct_data = [0u8; 12];
+        let mut direct_mask = [0u8; 3];
+        let mut direct_uses_no_data = [0u8; 1];
+        let mut direct_no_data_values = [0.0f64; 1];
+        let direct = decode_4d_into_buffers(
+            &blob,
+            DecodeIntoSpec {
+                data_type: DataType::UShort,
+                n_depth: 2,
+                n_cols: 3,
+                n_rows: 1,
+                n_bands: 1,
+                n_masks: 1,
+            },
+            &mut direct_data,
+            Some(&mut direct_mask),
+            &mut direct_uses_no_data,
+            &mut direct_no_data_values,
+        )
+        .unwrap();
+        assert_eq!(direct.data_bytes_written, 12);
+        assert_eq!(direct.mask_bytes_written, 3);
+        assert_eq!(direct_mask, [1, 0, 1]);
+        assert_eq!(direct_uses_no_data, [1]);
+        assert_eq!(direct_no_data_values, [u16::MAX as f64]);
+        assert_eq!(direct_data, [1, 0, 2, 0, 0, 0, 0, 0, 255, 255, 3, 0]);
+
         let decoded_doubles = decode_4d_to_f64(
             &blob,
             DecodeIntoSpec {
@@ -463,6 +761,33 @@ mod tests {
         assert_eq!(decoded_doubles.no_data, no_data);
         assert_eq!(decoded_doubles.masks, Some(vec![1, 0, 1]));
 
+        let mut direct_doubles = [0.0f64; 6];
+        let mut direct_double_mask = [0u8; 3];
+        let mut direct_double_uses_no_data = [0u8; 1];
+        let mut direct_double_no_data_values = [0.0f64; 1];
+        let direct = decode_4d_to_f64_into(
+            &blob,
+            DecodeIntoSpec {
+                data_type: DataType::UShort,
+                n_depth: 2,
+                n_cols: 3,
+                n_rows: 1,
+                n_bands: 1,
+                n_masks: 1,
+            },
+            &mut direct_doubles,
+            Some(&mut direct_double_mask),
+            &mut direct_double_uses_no_data,
+            &mut direct_double_no_data_values,
+        )
+        .unwrap();
+        assert_eq!(direct.values_written, 6);
+        assert_eq!(direct.mask_bytes_written, 3);
+        assert_eq!(direct_doubles, [1.0, 2.0, 0.0, 0.0, u16::MAX as f64, 3.0]);
+        assert_eq!(direct_double_mask, [1, 0, 1]);
+        assert_eq!(direct_double_uses_no_data, [1]);
+        assert_eq!(direct_double_no_data_values, [u16::MAX as f64]);
+
         let decoded = decode(&blob).unwrap();
         match decoded {
             DecodedLerc::Lerc2(decoded) => {
@@ -474,6 +799,52 @@ mod tests {
             }
             DecodedLerc::Lerc1(_) => panic!("expected Lerc2 decode"),
         }
+    }
+
+    #[test]
+    fn api_buffer_decode_validates_output_capacity_before_writing_no_data() {
+        let spec = EncodeSpec {
+            data_type: DataType::UShort,
+            n_depth: 2,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let values = [1u16, 2, u16::MAX, 4];
+        let data = values
+            .iter()
+            .copied()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let blob = encode_4d(spec, &data, 0.5, None, Some(&[1]), Some(&[u16::MAX as f64])).unwrap();
+        let decode_spec = DecodeIntoSpec {
+            data_type: DataType::UShort,
+            n_depth: 2,
+            n_cols: 2,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 1,
+        };
+
+        let mut output = [99u8; 8];
+        let mut mask = [99u8; 2];
+        let mut no_data_values = [99.0f64; 1];
+        assert_eq!(
+            decode_4d_into_buffers(
+                &blob,
+                decode_spec,
+                &mut output,
+                Some(&mut mask),
+                &mut [],
+                &mut no_data_values,
+            )
+            .unwrap_err(),
+            LercError::BufferTooSmall
+        );
+        assert_eq!(output, [99; 8]);
+        assert_eq!(mask, [99; 2]);
+        assert_eq!(no_data_values, [99.0]);
     }
 
     #[test]
@@ -495,6 +866,51 @@ mod tests {
         assert_eq!(
             no_data_info(&blob, 2).unwrap_err(),
             LercError::BufferTooSmall
+        );
+    }
+
+    #[test]
+    fn api_convert_to_double_matches_cpp_helper_contract() {
+        let short_bytes = [-2i16, 0, 17]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            convert_to_double(DataType::Short, &short_bytes).unwrap(),
+            vec![-2.0, 0.0, 17.0]
+        );
+        let mut direct = [0.0f64; 3];
+        assert_eq!(
+            convert_to_double_into(DataType::Short, &short_bytes, &mut direct).unwrap(),
+            3
+        );
+        assert_eq!(direct, [-2.0, 0.0, 17.0]);
+
+        let float_bytes = [1.25f32, -3.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            convert_to_double(DataType::Float, &float_bytes).unwrap(),
+            vec![1.25, -3.5]
+        );
+        let mut short_output = [0.0f64; 1];
+        assert_eq!(
+            convert_to_double_into(DataType::Float, &float_bytes, &mut short_output).unwrap_err(),
+            LercError::BufferTooSmall
+        );
+
+        assert_eq!(
+            convert_to_double(DataType::Double, &1.0f64.to_le_bytes()).unwrap_err(),
+            LercError::WrongParam("ConvertToDouble requires non-empty non-double input")
+        );
+        assert_eq!(
+            convert_to_double(DataType::UShort, &[1]).unwrap_err(),
+            LercError::WrongParam("decoded byte length is not a multiple of the data type size")
+        );
+        assert_eq!(
+            convert_to_double(DataType::UChar, &[]).unwrap_err(),
+            LercError::WrongParam("ConvertToDouble requires non-empty non-double input")
         );
     }
 

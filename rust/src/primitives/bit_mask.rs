@@ -154,6 +154,47 @@ impl BitMask {
         sum
     }
 
+    /// Returns true when every represented pixel is valid.
+    pub fn is_all_valid(&self) -> bool {
+        self.count_valid_bits() == self.pixel_count()
+    }
+
+    /// Returns true when every represented pixel is invalid.
+    pub fn is_all_invalid(&self) -> bool {
+        self.count_valid_bits() == 0
+    }
+
+    /// Compares two optional masks using the C++ `Lerc::MasksDiffer` semantics.
+    ///
+    /// A missing mask means every pixel is valid. Therefore `None` and an
+    /// explicit all-valid mask are considered equivalent.
+    pub fn differs_from_optional(&self, other: Option<&Self>) -> bool {
+        optional_masks_differ(Some(self), other)
+    }
+
+    /// Returns true when both masks represent the same pixel validity pattern.
+    ///
+    /// Padding bits in the final packed byte are ignored.
+    pub fn same_valid_pixels(&self, other: &Self) -> bool {
+        if self.cols != other.cols || self.rows != other.rows {
+            return false;
+        }
+
+        let pixels = self.pixel_count();
+        let full_bytes = pixels / 8;
+        if self.bits[..full_bytes] != other.bits[..full_bytes] {
+            return false;
+        }
+
+        let tail_bits = pixels & 7;
+        if tail_bits == 0 {
+            return true;
+        }
+
+        let tail_mask = 0xff << (8 - tail_bits);
+        (self.bits[full_bytes] & tail_mask) == (other.bits[full_bytes] & tail_mask)
+    }
+
     /// Converts this mask to one byte per pixel, using `1` for valid and `0` for invalid.
     pub fn to_byte_mask(&self) -> Vec<u8> {
         let mut bytes = vec![0; self.pixel_count()];
@@ -185,9 +226,22 @@ impl BitMask {
     }
 }
 
+/// Compares two optional packed masks using the C++ `Lerc::MasksDiffer` semantics.
+///
+/// A missing mask represents an all-valid mask. Explicit all-valid masks are
+/// therefore equivalent to `None`; otherwise packed mask bytes are compared
+/// directly.
+pub fn optional_masks_differ(left: Option<&BitMask>, right: Option<&BitMask>) -> bool {
+    match (left, right) {
+        (None, None) => false,
+        (None, Some(mask)) | (Some(mask), None) => !mask.is_all_valid(),
+        (Some(left), Some(right)) => !left.same_valid_pixels(right),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BitMask;
+    use super::{optional_masks_differ, BitMask};
 
     #[test]
     fn uses_msb_first_bit_order() {
@@ -212,6 +266,41 @@ mod tests {
 
         mask.bits_mut()[1] |= 0b0011_1111;
         assert_eq!(mask.count_valid_bits(), 8);
+    }
+
+    #[test]
+    fn compares_valid_pixels_while_ignoring_padding_bits() {
+        let mut left = BitMask::from_byte_mask(&[1, 0, 1, 1, 0, 1, 1, 0, 1, 1], 5, 2).unwrap();
+        let mut right = BitMask::from_byte_mask(&[1, 0, 1, 1, 0, 1, 1, 0, 1, 1], 5, 2).unwrap();
+        right.bits_mut()[1] ^= 0b0011_1111;
+
+        assert!(left.same_valid_pixels(&right));
+        assert!(!optional_masks_differ(Some(&left), Some(&right)));
+
+        left.set_invalid(9).unwrap();
+        assert!(!left.same_valid_pixels(&right));
+        assert!(optional_masks_differ(Some(&left), Some(&right)));
+
+        let wrong_shape = BitMask::from_byte_mask(&[1, 0, 1, 1, 0, 1, 1, 0, 1, 1], 2, 5).unwrap();
+        assert!(!left.same_valid_pixels(&wrong_shape));
+    }
+
+    #[test]
+    fn reports_all_valid_and_all_invalid_masks() {
+        let mut mask = BitMask::new(5, 2).unwrap();
+        assert!(mask.is_all_invalid());
+        assert!(!mask.is_all_valid());
+
+        mask.set_all_valid();
+        assert!(mask.is_all_valid());
+        assert!(!mask.is_all_invalid());
+
+        mask.bits_mut()[1] |= 0b0011_1111;
+        assert!(mask.is_all_valid());
+
+        mask.set_invalid(9).unwrap();
+        assert!(!mask.is_all_valid());
+        assert!(!mask.is_all_invalid());
     }
 
     #[test]
@@ -262,6 +351,23 @@ mod tests {
             raw.to_byte_mask(),
             [1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn optional_mask_difference_matches_cpp_null_means_all_valid_semantics() {
+        let mut all_valid = BitMask::new(3, 2).unwrap();
+        all_valid.set_all_valid();
+        let partial = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let same_partial = BitMask::from_byte_mask(&[1, 0, 1, 1, 1, 0], 3, 2).unwrap();
+        let other_partial = BitMask::from_byte_mask(&[1, 1, 1, 1, 1, 0], 3, 2).unwrap();
+
+        assert!(!optional_masks_differ(None, None));
+        assert!(!optional_masks_differ(None, Some(&all_valid)));
+        assert!(!optional_masks_differ(Some(&all_valid), None));
+        assert!(optional_masks_differ(None, Some(&partial)));
+        assert!(partial.differs_from_optional(None));
+        assert!(!partial.differs_from_optional(Some(&same_partial)));
+        assert!(partial.differs_from_optional(Some(&other_partial)));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::{
     decode_lerc_supported_into, decode_lerc_supported_to_f64, encode_lerc2_auto,
     encode_lerc2_auto_with_no_data, get_lerc2_blob_info_arrays, get_lerc2_data_ranges,
     get_lerc2_no_data_info, get_lerc_info, DataType, DecodeIntoSpec, EncodeSpec, ErrCode,
-    LercError,
+    LercError, LercInfo, LercStatus,
 };
 use core::ffi::c_void;
 use core::slice;
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn lerc_computeCompressedSize(
     p_valid_bytes: *const u8,
     max_z_err: f64,
     num_bytes: *mut u32,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_compute_compressed_size_impl(
             p_data,
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn lerc_computeCompressedSizeForVersion(
     p_valid_bytes: *const u8,
     max_z_err: f64,
     num_bytes: *mut u32,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_compute_compressed_size_impl(
             p_data,
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn lerc_encode(
     p_out_buffer: *mut u8,
     out_buffer_size: u32,
     n_bytes_written: *mut u32,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_encode_impl(
             p_data,
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn lerc_encodeForVersion(
     p_out_buffer: *mut u8,
     out_buffer_size: u32,
     n_bytes_written: *mut u32,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_encode_impl(
             p_data,
@@ -227,7 +227,7 @@ pub unsafe extern "C" fn lerc_computeCompressedSize_4D(
     num_bytes: *mut u32,
     p_uses_no_data: *const u8,
     no_data_values: *const f64,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_compute_compressed_size_impl(
             p_data,
@@ -274,7 +274,7 @@ pub unsafe extern "C" fn lerc_encode_4D(
     n_bytes_written: *mut u32,
     p_uses_no_data: *const u8,
     no_data_values: *const f64,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_encode_impl(
             p_data,
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn lerc_getBlobInfo(
     data_range_array: *mut f64,
     info_array_size: i32,
     data_range_array_size: i32,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_get_blob_info_impl(
             p_lerc_blob,
@@ -350,7 +350,7 @@ pub unsafe extern "C" fn lerc_getDataRanges(
     n_bands: i32,
     p_mins: *mut f64,
     p_maxs: *mut f64,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_get_data_ranges_impl(p_lerc_blob, blob_size, n_depth, n_bands, p_mins, p_maxs)
     }))
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn lerc_decode(
     n_bands: i32,
     data_type: u32,
     p_data: *mut c_void,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_decode_impl(
             p_lerc_blob,
@@ -420,7 +420,7 @@ pub unsafe extern "C" fn lerc_decodeToDouble(
     n_rows: i32,
     n_bands: i32,
     p_data: *mut f64,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_decode_to_double_impl(
             p_lerc_blob,
@@ -461,7 +461,7 @@ pub unsafe extern "C" fn lerc_decode_4D(
     p_data: *mut c_void,
     p_uses_no_data: *mut u8,
     no_data_values: *mut f64,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_decode_4d_impl(
             p_lerc_blob,
@@ -505,7 +505,7 @@ pub unsafe extern "C" fn lerc_decodeToDouble_4D(
     p_data: *mut f64,
     p_uses_no_data: *mut u8,
     no_data_values: *mut f64,
-) -> u32 {
+) -> LercStatus {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         lerc_decode_to_double_4d_impl(
             p_lerc_blob,
@@ -632,6 +632,9 @@ unsafe fn lerc_encode_impl(
     if p_out_buffer.is_null() || out_buffer_size == 0 {
         return ErrCode::WrongParam as u32;
     }
+    unsafe {
+        slice::from_raw_parts_mut(p_out_buffer, out_buffer_size as usize).fill(0);
+    }
     if !validate_no_data_inputs(p_uses_no_data, no_data_values) {
         return ErrCode::WrongParam as u32;
     }
@@ -686,15 +689,7 @@ fn validate_encode_shape(
         return Err(ErrCode::WrongParam);
     }
 
-    let parsed_type = DataType::try_from(data_type as i32)
-        .map_err(|_| ErrCode::WrongParam)
-        .and_then(|parsed| {
-            if parsed as u32 == data_type {
-                Ok(parsed)
-            } else {
-                Err(ErrCode::WrongParam)
-            }
-        })?;
+    let parsed_type = DataType::try_from(data_type).map_err(|_| ErrCode::WrongParam)?;
     let spec = EncodeSpec {
         data_type: parsed_type,
         n_depth: n_depth as usize,
@@ -1114,6 +1109,17 @@ unsafe fn lerc_get_data_ranges_impl(
         None => return ErrCode::BufferTooSmall as u32,
     };
     let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
+    let info = match get_lerc_info(blob) {
+        Ok(info) => info,
+        Err(err) => return err.err_code() as u32,
+    };
+    let required_capacity = match (info.n_depth as usize).checked_mul(info.n_bands as usize) {
+        Some(capacity) => capacity,
+        None => return ErrCode::BufferTooSmall as u32,
+    };
+    if capacity < required_capacity {
+        return ErrCode::BufferTooSmall as u32;
+    }
 
     match get_lerc2_data_ranges(blob) {
         Ok(ranges) => {
@@ -1156,9 +1162,8 @@ unsafe fn lerc_decode_impl(
         return ErrCode::WrongParam as u32;
     }
 
-    let data_type_id = data_type;
-    let data_type = match DataType::try_from(data_type_id as i32) {
-        Ok(data_type) if data_type as u32 == data_type_id => data_type,
+    let data_type = match DataType::try_from(data_type) {
+        Ok(data_type) => data_type,
         _ => return ErrCode::WrongParam as u32,
     };
     let spec = DecodeIntoSpec {
@@ -1181,10 +1186,17 @@ unsafe fn lerc_decode_impl(
 
     let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
     match get_lerc_info(blob) {
-        Ok(info) if info.n_uses_no_data_value > 0 && n_depth > 1 => {
-            return ErrCode::HasNoData as u32;
+        Ok(info) => {
+            if let Some(status) = validate_decode_request_capacity(&info, spec) {
+                return status;
+            }
+            if info.n_uses_no_data_value > 0 && n_depth > 1 {
+                return ErrCode::HasNoData as u32;
+            }
+            if let Some(status) = validate_decode_request_shape(&info, spec) {
+                return status;
+            }
         }
-        Ok(_) => {}
         Err(err) => return err.err_code() as u32,
     }
 
@@ -1198,6 +1210,25 @@ unsafe fn lerc_decode_impl(
     match decode_lerc_supported_into(blob, spec, data_output, mask_output.as_deref_mut()) {
         Ok(_) => ErrCode::Ok as u32,
         Err(err) => err.err_code() as u32,
+    }
+}
+
+fn validate_decode_request_capacity(info: &LercInfo, spec: DecodeIntoSpec) -> Option<u32> {
+    if spec.n_masks < info.n_masks as usize || spec.n_bands > info.n_bands as usize {
+        Some(ErrCode::WrongParam as u32)
+    } else {
+        None
+    }
+}
+
+fn validate_decode_request_shape(info: &LercInfo, spec: DecodeIntoSpec) -> Option<u32> {
+    if spec.n_depth != info.n_depth as usize
+        || spec.n_cols != info.n_cols as usize
+        || spec.n_rows != info.n_rows as usize
+    {
+        Some(ErrCode::Failed as u32)
+    } else {
+        None
     }
 }
 
@@ -1228,9 +1259,8 @@ unsafe fn lerc_decode_4d_impl(
         return ErrCode::WrongParam as u32;
     }
 
-    let data_type_id = data_type;
-    let data_type = match DataType::try_from(data_type_id as i32) {
-        Ok(data_type) if data_type as u32 == data_type_id => data_type,
+    let data_type = match DataType::try_from(data_type) {
+        Ok(data_type) => data_type,
         _ => return ErrCode::WrongParam as u32,
     };
     let spec = DecodeIntoSpec {
@@ -1254,11 +1284,23 @@ unsafe fn lerc_decode_4d_impl(
         Ok(info) => info,
         Err(err) => return err.err_code() as u32,
     };
+    if let Some(status) = validate_decode_request_capacity(&info, spec) {
+        return status;
+    }
     if info.n_uses_no_data_value > 0
         && n_depth > 1
         && (p_uses_no_data.is_null() || no_data_values.is_null())
     {
         return ErrCode::HasNoData as u32;
+    }
+    if info.n_uses_no_data_value > 0 && n_depth > 1 {
+        unsafe {
+            slice::from_raw_parts_mut(p_uses_no_data, n_bands as usize).fill(0);
+            slice::from_raw_parts_mut(no_data_values, n_bands as usize).fill(0.0);
+        }
+    }
+    if let Some(status) = validate_decode_request_shape(&info, spec) {
+        return status;
     }
 
     let data_output = unsafe { slice::from_raw_parts_mut(p_data.cast::<u8>(), data_len) };
@@ -1315,9 +1357,6 @@ unsafe fn lerc_decode_to_double_impl(
 
     let blob = unsafe { slice::from_raw_parts(p_lerc_blob, blob_size as usize) };
     let info = match get_lerc_info(blob) {
-        Ok(info) if info.n_uses_no_data_value > 0 && n_depth > 1 => {
-            return ErrCode::HasNoData as u32;
-        }
         Ok(info) => info,
         Err(err) => return err.err_code() as u32,
     };
@@ -1329,6 +1368,15 @@ unsafe fn lerc_decode_to_double_impl(
         n_bands: n_bands as usize,
         n_masks: n_masks as usize,
     };
+    if let Some(status) = validate_decode_request_capacity(&info, spec) {
+        return status;
+    }
+    if info.n_uses_no_data_value > 0 && n_depth > 1 {
+        return ErrCode::HasNoData as u32;
+    }
+    if let Some(status) = validate_decode_request_shape(&info, spec) {
+        return status;
+    }
 
     let value_count = match spec.value_count() {
         Ok(len) => len,
@@ -1382,12 +1430,6 @@ unsafe fn lerc_decode_to_double_4d_impl(
         Ok(info) => info,
         Err(err) => return err.err_code() as u32,
     };
-    if info.n_uses_no_data_value > 0
-        && n_depth > 1
-        && (p_uses_no_data.is_null() || no_data_values.is_null())
-    {
-        return ErrCode::HasNoData as u32;
-    }
     let spec = DecodeIntoSpec {
         data_type: info.data_type,
         n_depth: n_depth as usize,
@@ -1396,6 +1438,24 @@ unsafe fn lerc_decode_to_double_4d_impl(
         n_bands: n_bands as usize,
         n_masks: n_masks as usize,
     };
+    if let Some(status) = validate_decode_request_capacity(&info, spec) {
+        return status;
+    }
+    if info.n_uses_no_data_value > 0
+        && n_depth > 1
+        && (p_uses_no_data.is_null() || no_data_values.is_null())
+    {
+        return ErrCode::HasNoData as u32;
+    }
+    if info.n_uses_no_data_value > 0 && n_depth > 1 {
+        unsafe {
+            slice::from_raw_parts_mut(p_uses_no_data, n_bands as usize).fill(0);
+            slice::from_raw_parts_mut(no_data_values, n_bands as usize).fill(0.0);
+        }
+    }
+    if let Some(status) = validate_decode_request_shape(&info, spec) {
+        return status;
+    }
 
     let value_count = match spec.value_count() {
         Ok(len) => len,
@@ -1852,6 +1912,39 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_get_data_ranges_validates_capacity_before_no_data_status() {
+        let blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let mut mins = [123.0f64; 2];
+        let mut maxs = [123.0f64; 2];
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                1,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::BufferTooSmall as u32);
+        assert_eq!(mins, [123.0, 123.0]);
+        assert_eq!(maxs, [123.0, 123.0]);
+
+        let status = unsafe {
+            lerc_getDataRanges(
+                blob.as_ptr(),
+                blob.len() as u32,
+                2,
+                1,
+                mins.as_mut_ptr(),
+                maxs.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::HasNoData as u32);
+    }
+
+    #[test]
     fn c_abi_encode_supports_pre_v4_one_sweep_version() {
         let data = [1u8, 2, 3, 4, 5, 6];
         let mut num_bytes = 123u32;
@@ -1907,9 +2000,10 @@ mod tests {
     #[test]
     fn c_abi_versioned_encode_rejects_invalid_codec_versions() {
         let data = [1u8, 2, 3, 4, 5, 6];
-        let mut out = [0u8; 128];
+        let mut out = [99u8; 128];
 
         for version in [0, 1, 7] {
+            out.fill(99);
             let mut num_bytes = 123u32;
             let status = unsafe {
                 lerc_computeCompressedSizeForVersion(
@@ -1949,6 +2043,7 @@ mod tests {
             };
             assert_eq!(status, ErrCode::WrongParam as u32);
             assert_eq!(written, 0);
+            assert_eq!(out, [0; 128]);
         }
     }
 
@@ -2243,6 +2338,220 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_4d_encode_selects_float_huffman_with_no_data_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 128,
+            n_rows: 64,
+            n_bands: 1,
+            n_masks: 0,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth * 4);
+        let mut expected = Vec::with_capacity(n_pixels * spec.n_depth);
+        for pixel in 0..n_pixels {
+            if pixel % 97 == 0 {
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected.extend_from_slice(&[-9999.0, -9999.0]);
+            } else if pixel % 89 == 0 {
+                data.extend_from_slice(&((pixel % 32) as f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected.extend_from_slice(&[(pixel % 32) as f32, -9999.0]);
+            } else {
+                let value = ((pixel % 32) as f32) * 0.25;
+                data.extend_from_slice(&value.to_le_bytes());
+                data.extend_from_slice(&(value + 1.0).to_le_bytes());
+                expected.extend_from_slice(&[value, value + 1.0]);
+            }
+        }
+        let uses_no_data = [1u8];
+        let no_data_values = [-9999.0f64];
+        let uncompressed = crate::encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        let selected = crate::encode_lerc2_auto_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                spec.n_bands as i32,
+                0,
+                ptr::null(),
+                0.0,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                spec.n_bands as i32,
+                0,
+                ptr::null(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size as usize, selected.len());
+        assert_eq!(written as usize, selected.len());
+        assert!((written as usize) < uncompressed.len());
+        assert_eq!(&out[..written as usize], selected.as_slice());
+        let decoded = decode_lerc2_supported(&out[..written as usize]).unwrap();
+        assert!(decoded.header.has_no_data_values());
+        assert_eq!(decoded.header.no_data_val_orig, -9999.0);
+        assert!(!decoded.mask.is_valid(0).unwrap());
+        assert_eq!(decoded.data, DecodedData::Float(expected));
+    }
+
+    #[test]
+    fn c_abi_4d_encode_selects_multi_band_float_huffman_with_no_data_when_smaller() {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::Float,
+            n_depth: 2,
+            n_cols: 128,
+            n_rows: 64,
+            n_bands: 2,
+            n_masks: 0,
+        };
+        let n_pixels = spec.n_cols * spec.n_rows;
+        let mut data = Vec::with_capacity(n_pixels * spec.n_depth * spec.n_bands * 4);
+        let mut expected_band0 = Vec::with_capacity(n_pixels * spec.n_depth);
+        let mut expected_band1 = Vec::with_capacity(n_pixels * spec.n_depth);
+        for pixel in 0..n_pixels {
+            if pixel % 97 == 0 {
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected_band0.extend_from_slice(&[-9999.0, -9999.0]);
+            } else if pixel % 89 == 0 {
+                data.extend_from_slice(&((pixel % 32) as f32).to_le_bytes());
+                data.extend_from_slice(&(-9999.0f32).to_le_bytes());
+                expected_band0.extend_from_slice(&[(pixel % 32) as f32, -9999.0]);
+            } else {
+                let value = ((pixel % 32) as f32) * 0.25;
+                data.extend_from_slice(&value.to_le_bytes());
+                data.extend_from_slice(&(value + 1.0).to_le_bytes());
+                expected_band0.extend_from_slice(&[value, value + 1.0]);
+            }
+        }
+        for pixel in 0..n_pixels {
+            let value = 100.0 + ((pixel % 64) as f32) * 0.125;
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&(value + 2.0).to_le_bytes());
+            expected_band1.extend_from_slice(&[value, value + 2.0]);
+        }
+        let uses_no_data = [1u8, 0];
+        let no_data_values = [-9999.0f64, 0.0];
+        let uncompressed = crate::encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        let selected = crate::encode_lerc2_auto_with_no_data(
+            spec,
+            &data,
+            0.0,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+        )
+        .unwrap();
+        let mut out = vec![0u8; uncompressed.len()];
+        let mut written = 0u32;
+        let mut computed_size = 0u32;
+
+        let size_status = unsafe {
+            lerc_computeCompressedSize_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                spec.n_bands as i32,
+                0,
+                ptr::null(),
+                0.0,
+                &mut computed_size,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+        let encode_status = unsafe {
+            lerc_encode_4D(
+                data.as_ptr().cast(),
+                DataType::Float as u32,
+                spec.n_depth as i32,
+                spec.n_cols as i32,
+                spec.n_rows as i32,
+                spec.n_bands as i32,
+                0,
+                ptr::null(),
+                0.0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut written,
+                uses_no_data.as_ptr(),
+                no_data_values.as_ptr(),
+            )
+        };
+
+        assert_eq!(size_status, ErrCode::Ok as u32);
+        assert_eq!(encode_status, ErrCode::Ok as u32);
+        assert_eq!(computed_size as usize, selected.len());
+        assert_eq!(written as usize, selected.len());
+        assert!((written as usize) < uncompressed.len());
+        assert_eq!(&out[..written as usize], selected.as_slice());
+        let decoded = decode_lerc2_bands_supported(&out[..written as usize]).unwrap();
+        assert!(decoded.bands[0].header.has_no_data_values());
+        assert!(!decoded.bands[1].header.has_no_data_values());
+        assert!(!decoded.bands[0].mask.is_valid(0).unwrap());
+        assert_eq!(decoded.bands[0].data, DecodedData::Float(expected_band0));
+        assert_eq!(decoded.bands[1].data, DecodedData::Float(expected_band1));
+    }
+
+    #[test]
     fn c_abi_encode_selects_byte_huffman_bands_when_smaller() {
         let spec = crate::EncodeSpec {
             data_type: DataType::UChar,
@@ -2516,6 +2825,22 @@ mod tests {
             8,
         )
         .unwrap();
+        let tiled16 = encode_lerc2_tiled_lut_bands_with_no_data(
+            spec,
+            &data_bytes,
+            0.5,
+            None,
+            Some(&uses_no_data),
+            Some(&no_data_values),
+            6,
+            16,
+        )
+        .unwrap();
+        let tiled = if tiled16.len() < tiled.len() {
+            tiled16
+        } else {
+            tiled
+        };
         let mut out = vec![0u8; uncompressed.len()];
         let mut written = 0u32;
         let mut computed_size = 0u32;
@@ -2831,7 +3156,7 @@ mod tests {
     #[test]
     fn c_abi_encode_constant_reports_buffer_too_small() {
         let data = [7u8; 6];
-        let mut out = [0u8; 8];
+        let mut out = [99u8; 8];
         let mut written = 123u32;
 
         let status = unsafe {
@@ -2853,6 +3178,7 @@ mod tests {
 
         assert_eq!(status, ErrCode::BufferTooSmall as u32);
         assert_eq!(written, 0);
+        assert_eq!(out, [0; 8]);
     }
 
     #[test]
@@ -3512,6 +3838,47 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_decode_shape_mismatch_returns_failed_like_cpp() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0u8; 4];
+        let mut mask = [0u8; 4];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                2,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                2,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+    }
+
+    #[test]
     fn c_abi_decode_to_double_writes_data_and_mask() {
         let blob = synthetic_v4_const_blob();
         let mut data = [0.0f64; 6];
@@ -3586,6 +3953,45 @@ mod tests {
             )
         };
         assert_eq!(status, ErrCode::WrongParam as u32);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_shape_mismatch_returns_failed_like_cpp() {
+        let blob = synthetic_v4_const_blob();
+        let mut data = [0.0f64; 4];
+        let mut mask = [0u8; 4];
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                2,
+                2,
+                1,
+                data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
+
+        let status = unsafe {
+            lerc_decodeToDouble_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                1,
+                2,
+                2,
+                1,
+                data.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ErrCode::Failed as u32);
     }
 
     #[test]
@@ -3933,6 +4339,69 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_decode_4d_clears_no_data_outputs_before_decode_failure() {
+        let mut blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x80;
+        let mut data = [77u8; 12];
+        let mut mask = [77u8; 6];
+        let mut uses_no_data = [123u8; 1];
+        let mut no_data_values = [123.0f64; 1];
+
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                2,
+                3,
+                2,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+                uses_no_data.as_mut_ptr(),
+                no_data_values.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(uses_no_data, [0]);
+        assert_eq!(no_data_values, [0.0]);
+    }
+
+    #[test]
+    fn c_abi_decode_to_double_4d_clears_no_data_outputs_before_decode_failure() {
+        let mut blob = synthetic_v6_uchar_one_sweep_no_data_blob();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x80;
+        let mut data = [77.0f64; 12];
+        let mut mask = [77u8; 6];
+        let mut uses_no_data = [123u8; 1];
+        let mut no_data_values = [123.0f64; 1];
+
+        let status = unsafe {
+            lerc_decodeToDouble_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                2,
+                3,
+                2,
+                1,
+                data.as_mut_ptr(),
+                uses_no_data.as_mut_ptr(),
+                no_data_values.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(status, ErrCode::Failed as u32);
+        assert_eq!(uses_no_data, [0]);
+        assert_eq!(no_data_values, [0.0]);
+    }
+
+    #[test]
     fn c_abi_decode_to_double_4d_legacy_lerc1_writes_data_and_mask() {
         let blob = fixture("world.lerc1");
         let mut data = vec![123.0f64; 257 * 257];
@@ -3990,6 +4459,86 @@ mod tests {
         };
 
         assert_eq!(status, ErrCode::HasNoData as u32);
+    }
+
+    #[test]
+    fn c_abi_decode_validates_capacity_before_no_data_status() {
+        let blob = synthetic_v6_uchar_no_data_with_mask_blob();
+        let info = get_lerc_info(&blob).unwrap();
+        assert_eq!(info.n_masks, 1);
+        assert_eq!(info.n_uses_no_data_value, 1);
+
+        let mut data = [0u8; 12];
+        let mut doubles = [0.0f64; 12];
+        let mut mask = [0u8; 3];
+        let mut uses_no_data = [0u8; 1];
+        let mut no_data_values = [0.0f64; 1];
+
+        let status = unsafe {
+            lerc_decode(
+                blob.as_ptr(),
+                blob.len() as u32,
+                0,
+                ptr::null_mut(),
+                2,
+                3,
+                1,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decodeToDouble(
+                blob.as_ptr(),
+                blob.len() as u32,
+                0,
+                ptr::null_mut(),
+                2,
+                3,
+                1,
+                1,
+                doubles.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decode_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                0,
+                ptr::null_mut(),
+                2,
+                3,
+                1,
+                1,
+                DataType::UChar as u32,
+                data.as_mut_ptr().cast(),
+                uses_no_data.as_mut_ptr(),
+                no_data_values.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
+
+        let status = unsafe {
+            lerc_decodeToDouble_4D(
+                blob.as_ptr(),
+                blob.len() as u32,
+                1,
+                mask.as_mut_ptr(),
+                2,
+                3,
+                1,
+                2,
+                doubles.as_mut_ptr(),
+                uses_no_data.as_mut_ptr(),
+                no_data_values.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, ErrCode::WrongParam as u32);
     }
 
     #[test]
@@ -4686,5 +5235,28 @@ mod tests {
         let checksum = compute_checksum_fletcher32(&blob[14..]);
         blob[10..14].copy_from_slice(&checksum.to_le_bytes());
         blob
+    }
+
+    fn synthetic_v6_uchar_no_data_with_mask_blob() -> Vec<u8> {
+        let spec = crate::EncodeSpec {
+            data_type: DataType::UChar,
+            n_depth: 2,
+            n_cols: 3,
+            n_rows: 1,
+            n_bands: 1,
+            n_masks: 1,
+        };
+        let data = [255u8, 2, 7, 8, 3, 4];
+        let mask = [1u8, 0, 1];
+        encode_lerc2_uncompressed_with_no_data(
+            spec,
+            &data,
+            0.5,
+            Some(&mask),
+            Some(&[1]),
+            Some(&[255.0]),
+            6,
+        )
+        .unwrap()
     }
 }
